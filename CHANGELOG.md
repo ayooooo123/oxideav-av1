@@ -4,6 +4,14 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+- The registry decoder implements `Decoder::output_video_dimensions` /
+  `output_pixel_format`: the `UpscaledWidth` × `FrameHeight` and the
+  plane layout (gray / 4:2:0 / 4:2:2 / 4:4:4 at 8, 10 and 12 bits) of
+  the frame `receive_frame` last returned; before the first, the next
+  queued frame.
+
 ## [0.1.20](https://github.com/OxideAV/oxideav-av1/compare/v0.1.19...v0.1.20) - 2026-10-01
 
 ### Other

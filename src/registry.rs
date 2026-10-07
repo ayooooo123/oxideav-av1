@@ -122,6 +122,7 @@ pub fn make_decoder(params: &CodecParameters) -> CoreResult<Box<dyn Decoder>> {
         codec_id: params.codec_id.clone(),
         session,
         queue: std::collections::VecDeque::new(),
+        last_output: None,
         eof: false,
     }))
 }
@@ -148,9 +149,47 @@ struct Av1Decoder {
     /// The cross-packet §7.20 session-state stack.
     session: SpecDecodeSession,
     /// Frames recovered from already-decoded packets, awaiting drain by
-    /// `receive_frame`. Held as `VideoFrame` in output order.
-    queue: std::collections::VecDeque<VideoFrame>,
+    /// `receive_frame`, in output order, each with its [`Layout`].
+    queue: std::collections::VecDeque<(VideoFrame, Layout)>,
+    /// The [`Layout`] of the frame `receive_frame` last returned.
+    last_output: Option<Layout>,
     eof: bool,
+}
+
+/// The visible size and pixel layout of a decoded frame.
+type Layout = ((u32, u32), Option<PixelFormat>);
+
+/// The [`Layout`] of `frame`: its post-superres `UpscaledWidth` ×
+/// `FrameHeight` (the size FFmpeg's AV1 decoders output; the render size
+/// only sets the aspect ratio), and the layout of its packed planes. The
+/// chroma subsampling is read off the plane sizes (§5.5.2 allows no 4:4:0).
+/// At a one-sample width or height two layouts give the same plane sizes;
+/// the one picked then packs exactly the planes the frame holds.
+fn frame_layout(frame: &SpecFrame) -> Layout {
+    use PixelFormat::*;
+    let (w, h) = (frame.width, frame.height);
+    let family = match frame.plane_dims.get(1) {
+        None => [Gray8, Gray10Le, Gray12Le],
+        Some(&(_, ch)) if ch != h => [Yuv420P, Yuv420P10Le, Yuv420P12Le],
+        Some(&(cw, _)) if cw != w => [Yuv422P, Yuv422P10Le, Yuv422P12Le],
+        Some(_) => [Yuv444P, Yuv444P10Le, Yuv444P12Le],
+    };
+    let format = match frame.bit_depth {
+        8 => Some(family[0]),
+        10 => Some(family[1]),
+        12 => Some(family[2]),
+        _ => None,
+    };
+    ((w, h), format)
+}
+
+impl Av1Decoder {
+    /// The [`Layout`] `output_*` report: the frame last returned, or before
+    /// the first one the next queued frame.
+    fn reported_layout(&self) -> Option<Layout> {
+        self.last_output
+            .or_else(|| self.queue.front().map(|(_, layout)| *layout))
+    }
 }
 
 impl std::fmt::Debug for Av1Decoder {
@@ -175,8 +214,10 @@ impl Decoder for Av1Decoder {
     fn send_packet(&mut self, packet: &Packet) -> CoreResult<()> {
         let mut push = |frames: Vec<SpecFrame>| {
             for frame in &frames {
-                self.queue
-                    .push_back(spec_frame_to_video_frame(frame, packet.pts));
+                self.queue.push_back((
+                    spec_frame_to_video_frame(frame, packet.pts),
+                    frame_layout(frame),
+                ));
             }
         };
         if packet.data.len() >= 4 && &packet.data[..4] == IVF_MAGIC {
@@ -210,7 +251,10 @@ impl Decoder for Av1Decoder {
 
     fn receive_frame(&mut self) -> CoreResult<CoreFrame> {
         match self.queue.pop_front() {
-            Some(vf) => Ok(CoreFrame::Video(vf)),
+            Some((vf, layout)) => {
+                self.last_output = Some(layout);
+                Ok(CoreFrame::Video(vf))
+            }
             None => {
                 if self.eof {
                     Err(CoreError::Eof)
@@ -219,6 +263,16 @@ impl Decoder for Av1Decoder {
                 }
             }
         }
+    }
+
+    fn output_video_dimensions(&self) -> Option<(u32, u32)> {
+        self.reported_layout()
+            .map(|(size, _)| size)
+            .filter(|&(w, h)| w > 0 && h > 0)
+    }
+
+    fn output_pixel_format(&self) -> Option<PixelFormat> {
+        self.reported_layout().and_then(|(_, format)| format)
     }
 
     fn flush(&mut self) -> CoreResult<()> {
@@ -232,6 +286,7 @@ impl Decoder for Av1Decoder {
         // which rebuilds every slot); keep the cached sequence header
         // (containers need not repeat it mid-stream).
         self.queue.clear();
+        self.last_output = None;
         self.session.reset_references();
         self.eof = false;
         Ok(())
