@@ -792,8 +792,8 @@ pub fn inverse_transform_2d(
     let mut residual = vec![0i64; w * h];
     // Row transforms.
     let mut tbuf_arr = [0i64; 64];
-    let tbuf = &mut tbuf_arr[..w];
     for i in 0..h {
+        let tbuf = &mut tbuf_arr[..w];
         // Populate T[j] from Dequant[i][j], zero for j or i >= 32.
         for j in 0..w {
             tbuf[j] = if i < 32 && j < 32 {
@@ -812,9 +812,9 @@ pub fn inverse_transform_2d(
             // §7.13.3 Lossless row pass: inverse WHT, shift = 2.
             // Only reachable for TX_4X4 (the spec's Lossless
             // constraint).
-            inverse_wht4(&mut tbuf, 2);
+            inverse_wht4(tbuf, 2);
         } else {
-            apply_row_kernel(&mut tbuf, tx_type, log2_w, row_clamp_range);
+            apply_row_kernel(tbuf, tx_type, log2_w, row_clamp_range);
         }
         for j in 0..w {
             residual[i * w + j] = round2(tbuf[j], row_shift);
@@ -828,15 +828,15 @@ pub fn inverse_transform_2d(
     }
     // Column transforms.
     let mut tbuf_arr = [0i64; 64];
-    let tbuf = &mut tbuf_arr[..h];
     for j in 0..w {
+        let tbuf = &mut tbuf_arr[..h];
         for i in 0..h {
             tbuf[i] = residual[i * w + j];
         }
         if lossless {
-            inverse_wht4(&mut tbuf, 0);
+            inverse_wht4(tbuf, 0);
         } else {
-            apply_col_kernel(&mut tbuf, tx_type, log2_h, col_clamp_range);
+            apply_col_kernel(tbuf, tx_type, log2_h, col_clamp_range);
         }
         for i in 0..h {
             residual[i * w + j] = round2(tbuf[i], col_shift);
