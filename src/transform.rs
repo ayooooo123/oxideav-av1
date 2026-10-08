@@ -145,12 +145,11 @@ pub fn clip3(low: i64, high: i64, x: i64) -> i64 {
 /// the low `num_bits` of `x`.
 #[inline]
 pub fn brev(num_bits: u32, x: u32) -> u32 {
-    let mut t = 0u32;
-    for i in 0..num_bits {
-        let bit = (x >> i) & 1;
-        t += bit << (num_bits - 1 - i);
+    if num_bits == 0 {
+        0
+    } else {
+        x.reverse_bits() >> (32 - num_bits)
     }
-    t
 }
 
 /// §7.13.2.1 `cos128( angle )` (av1-spec p.296). Implements
@@ -222,11 +221,277 @@ pub fn butterfly_h(t: &mut [i64], a: usize, b: usize, flip: u8, r: u32) {
 /// length-`2^n` array `T` in place via `T[i] = copyT[brev(n, i)]`.
 pub fn inverse_dct_permute(t: &mut [i64], n: u32) {
     let len = 1usize << n;
-    let copy: Vec<i64> = t[..len].to_vec();
+    let slice = &mut t[..len];
     for i in 0..len {
-        t[i] = copy[brev(n, i as u32) as usize];
+        let j = ((i as u32).reverse_bits() >> (32 - n)) as usize;
+        if i < j {
+            slice.swap(i, j);
+        }
     }
 }
+
+#[inline]
+pub fn inverse_dct_4(t: &mut [i64], r: u32) {
+    t.swap(1, 2);
+    butterfly_b(t, 0, 1, 32, 1, r);
+    butterfly_b(t, 2, 3, 48, 0, r);
+    butterfly_h(t, 0, 3, 0, r);
+    butterfly_h(t, 1, 2, 0, r);
+}
+
+#[inline]
+pub fn inverse_dct_8(t: &mut [i64], r: u32) {
+    t.swap(1, 4);
+    t.swap(3, 6);
+    butterfly_b(t, 4, 7, 56, 0, r);
+    butterfly_b(t, 5, 6, 24, 0, r);
+    butterfly_b(t, 0, 1, 32, 1, r);
+    butterfly_b(t, 2, 3, 48, 0, r);
+    butterfly_h(t, 4, 5, 0, r);
+    butterfly_h(t, 6, 7, 1, r);
+    butterfly_h(t, 0, 3, 0, r);
+    butterfly_h(t, 1, 2, 0, r);
+    butterfly_b(t, 6, 5, 32, 1, r);
+    butterfly_h(t, 0, 7, 0, r);
+    butterfly_h(t, 1, 6, 0, r);
+    butterfly_h(t, 2, 5, 0, r);
+    butterfly_h(t, 3, 4, 0, r);
+}
+
+#[inline]
+pub fn inverse_dct_16(t: &mut [i64], r: u32) {
+    t.swap(1, 8);
+    t.swap(2, 4);
+    t.swap(3, 12);
+    t.swap(5, 10);
+    t.swap(7, 14);
+    t.swap(11, 13);
+    butterfly_b(t, 8, 15, 60, 0, r);
+    butterfly_b(t, 9, 14, 28, 0, r);
+    butterfly_b(t, 10, 13, 44, 0, r);
+    butterfly_b(t, 11, 12, 12, 0, r);
+    butterfly_b(t, 4, 7, 56, 0, r);
+    butterfly_b(t, 5, 6, 24, 0, r);
+    butterfly_h(t, 8, 9, 0, r);
+    butterfly_h(t, 10, 11, 1, r);
+    butterfly_h(t, 12, 13, 0, r);
+    butterfly_h(t, 14, 15, 1, r);
+    butterfly_b(t, 0, 1, 32, 1, r);
+    butterfly_b(t, 2, 3, 48, 0, r);
+    butterfly_h(t, 4, 5, 0, r);
+    butterfly_h(t, 6, 7, 1, r);
+    butterfly_b(t, 14, 9, 48, 1, r);
+    butterfly_b(t, 13, 10, 112, 1, r);
+    butterfly_h(t, 0, 3, 0, r);
+    butterfly_h(t, 1, 2, 0, r);
+    butterfly_b(t, 6, 5, 32, 1, r);
+    butterfly_h(t, 8, 11, 0, r);
+    butterfly_h(t, 9, 10, 0, r);
+    butterfly_h(t, 12, 15, 1, r);
+    butterfly_h(t, 13, 14, 1, r);
+    for i in 0..4 {
+        butterfly_h(t, i, 7 - i, 0, r);
+    }
+    butterfly_b(t, 13, 10, 32, 1, r);
+    butterfly_b(t, 12, 11, 32, 1, r);
+    for i in 0..8 {
+        butterfly_h(t, i, 15 - i, 0, r);
+    }
+}
+
+#[inline]
+pub fn inverse_dct_32(t: &mut [i64], r: u32) {
+    inverse_dct_permute(t, 5);
+    const STEP3_ANGLES: [i32; 8] = [62, 30, 46, 14, 54, 22, 38, 6];
+    for i in 0..8 {
+        butterfly_b(t, 16 + i, 31 - i, STEP3_ANGLES[i], 0, r);
+    }
+    butterfly_b(t, 8, 15, 60, 0, r);
+    butterfly_b(t, 9, 14, 28, 0, r);
+    butterfly_b(t, 10, 13, 44, 0, r);
+    butterfly_b(t, 11, 12, 12, 0, r);
+    for i in 0..8 {
+        butterfly_h(t, 16 + 2 * i, 17 + 2 * i, (i & 1) as u8, r);
+    }
+    butterfly_b(t, 4, 7, 56, 0, r);
+    butterfly_b(t, 5, 6, 24, 0, r);
+    butterfly_h(t, 8, 9, 0, r);
+    butterfly_h(t, 10, 11, 1, r);
+    butterfly_h(t, 12, 13, 0, r);
+    butterfly_h(t, 14, 15, 1, r);
+    for i in 0..2 {
+        for j in 0..2 {
+            let a = 30 - 4 * i - j;
+            let b = 17 + 4 * i + j;
+            let angle = 24 + ((j as i32) << 6) + (((1 - i) as i32) << 5);
+            butterfly_b(t, a, b, angle, 1, r);
+        }
+    }
+    butterfly_b(t, 0, 1, 32, 1, r);
+    butterfly_b(t, 2, 3, 48, 0, r);
+    butterfly_h(t, 4, 5, 0, r);
+    butterfly_h(t, 6, 7, 1, r);
+    butterfly_b(t, 14, 9, 48, 1, r);
+    butterfly_b(t, 13, 10, 112, 1, r);
+    for i in 0..4 {
+        for j in 0..2 {
+            let a = 16 + 4 * i + j;
+            let b = 19 + 4 * i - j;
+            butterfly_h(t, a, b, (i & 1) as u8, r);
+        }
+    }
+    butterfly_h(t, 0, 3, 0, r);
+    butterfly_h(t, 1, 2, 0, r);
+    butterfly_b(t, 6, 5, 32, 1, r);
+    butterfly_h(t, 8, 11, 0, r);
+    butterfly_h(t, 9, 10, 0, r);
+    butterfly_h(t, 12, 15, 1, r);
+    butterfly_h(t, 13, 14, 1, r);
+    for i in 0..4 {
+        butterfly_b(t, 29 - i, 18 + i, 48 + ((i >> 1) as i32) * 64, 1, r);
+    }
+    for i in 0..4 {
+        butterfly_h(t, i, 7 - i, 0, r);
+    }
+    butterfly_b(t, 13, 10, 32, 1, r);
+    butterfly_b(t, 12, 11, 32, 1, r);
+    for i in 0..2 {
+        for j in 0..4 {
+            let a = 16 + i * 8 + j;
+            let b = 23 + i * 8 - j;
+            butterfly_h(t, a, b, i as u8, r);
+        }
+    }
+    for i in 0..8 {
+        butterfly_h(t, i, 15 - i, 0, r);
+    }
+    for i in 0..4 {
+        butterfly_b(t, 27 - i, 20 + i, 32, 1, r);
+    }
+    for i in 0..16 {
+        butterfly_h(t, i, 31 - i, 0, r);
+    }
+}
+
+#[inline]
+pub fn inverse_dct_64(t: &mut [i64], r: u32) {
+    inverse_dct_permute(t, 6);
+    const STEP2_ANGLES: [i32; 16] = [63, 31, 47, 15, 55, 23, 39, 7, 59, 27, 43, 11, 51, 19, 35, 3];
+    for i in 0..16 {
+        butterfly_b(t, 32 + i, 63 - i, STEP2_ANGLES[i], 0, r);
+    }
+    const STEP3_ANGLES: [i32; 8] = [62, 30, 46, 14, 54, 22, 38, 6];
+    for i in 0..8 {
+        butterfly_b(t, 16 + i, 31 - i, STEP3_ANGLES[i], 0, r);
+    }
+    for i in 0..16 {
+        butterfly_h(t, 32 + i * 2, 33 + i * 2, (i & 1) as u8, r);
+    }
+    butterfly_b(t, 8, 15, 60, 0, r);
+    butterfly_b(t, 9, 14, 28, 0, r);
+    butterfly_b(t, 10, 13, 44, 0, r);
+    butterfly_b(t, 11, 12, 12, 0, r);
+    for i in 0..8 {
+        butterfly_h(t, 16 + 2 * i, 17 + 2 * i, (i & 1) as u8, r);
+    }
+    const STEP7_ANGLES: [i32; 4] = [60, 28, 44, 12];
+    for i in 0..4 {
+        for j in 0..2 {
+            butterfly_b(t, 62 - i * 4 - j, 33 + i * 4 + j, STEP7_ANGLES[i] + 64 * (j as i32), 1, r);
+        }
+    }
+    butterfly_b(t, 4, 7, 56, 0, r);
+    butterfly_b(t, 5, 6, 24, 0, r);
+    butterfly_h(t, 8, 9, 0, r);
+    butterfly_h(t, 10, 11, 1, r);
+    butterfly_h(t, 12, 13, 0, r);
+    butterfly_h(t, 14, 15, 1, r);
+    for i in 0..2 {
+        for j in 0..2 {
+            let a = 30 - 4 * i - j;
+            let b = 17 + 4 * i + j;
+            let angle = 24 + ((j as i32) << 6) + (((1 - i) as i32) << 5);
+            butterfly_b(t, a, b, angle, 1, r);
+        }
+    }
+    for i in 0..8 {
+        for j in 0..2 {
+            butterfly_h(t, 32 + i * 4 + j, 35 + i * 4 - j, (i & 1) as u8, r);
+        }
+    }
+    butterfly_b(t, 0, 1, 32, 1, r);
+    butterfly_b(t, 2, 3, 48, 0, r);
+    butterfly_h(t, 4, 5, 0, r);
+    butterfly_h(t, 6, 7, 1, r);
+    butterfly_b(t, 14, 9, 48, 1, r);
+    butterfly_b(t, 13, 10, 112, 1, r);
+    for i in 0..4 {
+        for j in 0..2 {
+            let a = 16 + 4 * i + j;
+            let b = 19 + 4 * i - j;
+            butterfly_h(t, a, b, (i & 1) as u8, r);
+        }
+    }
+    for i in 0..2usize {
+        for j in 0..4usize {
+            let a = 61 - i * 8 - j;
+            let b = 34 + i * 8 + j;
+            let angle: i32 = 56 - (i as i32) * 32 + ((j >> 1) as i32) * 64;
+            butterfly_b(t, a, b, angle, 1, r);
+        }
+    }
+    butterfly_h(t, 0, 3, 0, r);
+    butterfly_h(t, 1, 2, 0, r);
+    butterfly_b(t, 6, 5, 32, 1, r);
+    butterfly_h(t, 8, 11, 0, r);
+    butterfly_h(t, 9, 10, 0, r);
+    butterfly_h(t, 12, 15, 1, r);
+    butterfly_h(t, 13, 14, 1, r);
+    for i in 0..4 {
+        butterfly_b(t, 29 - i, 18 + i, 48 + ((i >> 1) as i32) * 64, 1, r);
+    }
+    for i in 0..4 {
+        for j in 0..4 {
+            butterfly_h(t, 32 + 8 * i + j, 39 + 8 * i - j, (i & 1) as u8, r);
+        }
+    }
+    for i in 0..4 {
+        butterfly_h(t, i, 7 - i, 0, r);
+    }
+    butterfly_b(t, 13, 10, 32, 1, r);
+    butterfly_b(t, 12, 11, 32, 1, r);
+    for i in 0..2 {
+        for j in 0..4 {
+            let a = 16 + i * 8 + j;
+            let b = 23 + i * 8 - j;
+            butterfly_h(t, a, b, i as u8, r);
+        }
+    }
+    for i in 0..8 {
+        let angle = if i < 4 { 48 } else { 112 };
+        butterfly_b(t, 59 - i, 36 + i, angle, 1, r);
+    }
+    for i in 0..8 {
+        butterfly_h(t, i, 15 - i, 0, r);
+    }
+    for i in 0..4 {
+        butterfly_b(t, 27 - i, 20 + i, 32, 1, r);
+    }
+    for i in 0..8 {
+        butterfly_h(t, 32 + i, 47 - i, 0, r);
+        butterfly_h(t, 48 + i, 63 - i, 1, r);
+    }
+    for i in 0..16 {
+        butterfly_h(t, i, 31 - i, 0, r);
+    }
+    for i in 0..8 {
+        butterfly_b(t, 55 - i, 40 + i, 32, 1, r);
+    }
+    for i in 0..32 {
+        butterfly_h(t, i, 63 - i, 0, r);
+    }
+}
+
 
 /// §7.13.2.3 inverse DCT process for arrays of length `2^n` with
 /// `2 <= n <= 6` (av1-spec p.297-300). Performs the §7.13.2.2
@@ -237,225 +502,13 @@ pub fn inverse_dct_permute(t: &mut [i64], n: u32) {
 #[allow(clippy::too_many_arguments)]
 pub fn inverse_dct(t: &mut [i64], n: u32, r: u32) {
     debug_assert!((2..=6).contains(&n));
-    // Step 1: permutation.
-    inverse_dct_permute(t, n);
-    // Step 2: n == 6 only.
-    if n == 6 {
-        for i in 0..16 {
-            let a = 32 + i;
-            let b = 63 - i;
-            let angle = 63 - 4 * (brev(4, i as u32) as i32);
-            butterfly_b(t, a, b, angle, 0, r);
-        }
-    }
-    // Step 3: n >= 5.
-    if n >= 5 {
-        for i in 0..8 {
-            let a = 16 + i;
-            let b = 31 - i;
-            let angle = 6 + ((brev(3, (7 - i) as u32) as i32) << 3);
-            butterfly_b(t, a, b, angle, 0, r);
-        }
-    }
-    // Step 4: n == 6.
-    if n == 6 {
-        for i in 0..16 {
-            butterfly_h(t, 32 + i * 2, 33 + i * 2, (i & 1) as u8, r);
-        }
-    }
-    // Step 5: n >= 4.
-    if n >= 4 {
-        for i in 0..4 {
-            let a = 8 + i;
-            let b = 15 - i;
-            let angle = 12 + ((brev(2, (3 - i) as u32) as i32) << 4);
-            butterfly_b(t, a, b, angle, 0, r);
-        }
-    }
-    // Step 6: n >= 5.
-    if n >= 5 {
-        for i in 0..8 {
-            butterfly_h(t, 16 + 2 * i, 17 + 2 * i, (i & 1) as u8, r);
-        }
-    }
-    // Step 7: n == 6.
-    if n == 6 {
-        for i in 0..4 {
-            for j in 0..2 {
-                let a = 62 - i * 4 - j;
-                let b = 33 + i * 4 + j;
-                let angle = 60 - 16 * (brev(2, i as u32) as i32) + 64 * (j as i32);
-                butterfly_b(t, a, b, angle, 1, r);
-            }
-        }
-    }
-    // Step 8: n >= 3.
-    if n >= 3 {
-        for i in 0..2 {
-            butterfly_b(t, 4 + i, 7 - i, 56 - 32 * (i as i32), 0, r);
-        }
-    }
-    // Step 9: n >= 4.
-    if n >= 4 {
-        for i in 0..4 {
-            butterfly_h(t, 8 + 2 * i, 9 + 2 * i, (i & 1) as u8, r);
-        }
-    }
-    // Step 10: n >= 5.
-    if n >= 5 {
-        for i in 0..2 {
-            for j in 0..2 {
-                let a = 30 - 4 * i - j;
-                let b = 17 + 4 * i + j;
-                let angle = 24 + ((j as i32) << 6) + (((1 - i) as i32) << 5);
-                butterfly_b(t, a, b, angle, 1, r);
-            }
-        }
-    }
-    // Step 11: n == 6.
-    if n == 6 {
-        for i in 0..8 {
-            for j in 0..2 {
-                let a = 32 + i * 4 + j;
-                let b = 35 + i * 4 - j;
-                butterfly_h(t, a, b, (i & 1) as u8, r);
-            }
-        }
-    }
-    // Step 12: always.
-    for i in 0..2 {
-        butterfly_b(t, 2 * i, 2 * i + 1, 32 + 16 * (i as i32), (1 - i) as u8, r);
-    }
-    // Step 13: n >= 3.
-    if n >= 3 {
-        for i in 0..2 {
-            butterfly_h(t, 4 + 2 * i, 5 + 2 * i, i as u8, r);
-        }
-    }
-    // Step 14: n >= 4.
-    if n >= 4 {
-        for i in 0..2 {
-            butterfly_b(t, 14 - i, 9 + i, 48 + 64 * (i as i32), 1, r);
-        }
-    }
-    // Step 15: n >= 5.
-    if n >= 5 {
-        for i in 0..4 {
-            for j in 0..2 {
-                let a = 16 + 4 * i + j;
-                let b = 19 + 4 * i - j;
-                butterfly_h(t, a, b, (i & 1) as u8, r);
-            }
-        }
-    }
-    // Step 16: n == 6.
-    if n == 6 {
-        for i in 0..2usize {
-            for j in 0..4usize {
-                let a = 61 - i * 8 - j;
-                let b = 34 + i * 8 + j;
-                let angle: i32 = 56 - (i as i32) * 32 + ((j >> 1) as i32) * 64;
-                butterfly_b(t, a, b, angle, 1, r);
-            }
-        }
-    }
-    // Step 17: always.
-    for i in 0..2 {
-        butterfly_h(t, i, 3 - i, 0, r);
-    }
-    // Step 18: n >= 3.
-    if n >= 3 {
-        butterfly_b(t, 6, 5, 32, 1, r);
-    }
-    // Step 19: n >= 4.
-    if n >= 4 {
-        for i in 0..2 {
-            for j in 0..2 {
-                butterfly_h(t, 8 + 4 * i + j, 11 + 4 * i - j, i as u8, r);
-            }
-        }
-    }
-    // Step 20: n >= 5.
-    if n >= 5 {
-        for i in 0..4 {
-            butterfly_b(t, 29 - i, 18 + i, 48 + ((i >> 1) as i32) * 64, 1, r);
-        }
-    }
-    // Step 21: n == 6.
-    if n == 6 {
-        for i in 0..4 {
-            for j in 0..4 {
-                let a = 32 + 8 * i + j;
-                let b = 39 + 8 * i - j;
-                butterfly_h(t, a, b, (i & 1) as u8, r);
-            }
-        }
-    }
-    // Step 22: n >= 3.
-    if n >= 3 {
-        for i in 0..4 {
-            butterfly_h(t, i, 7 - i, 0, r);
-        }
-    }
-    // Step 23: n >= 4.
-    if n >= 4 {
-        for i in 0..2 {
-            butterfly_b(t, 13 - i, 10 + i, 32, 1, r);
-        }
-    }
-    // Step 24: n >= 5.
-    if n >= 5 {
-        for i in 0..2 {
-            for j in 0..4 {
-                let a = 16 + i * 8 + j;
-                let b = 23 + i * 8 - j;
-                butterfly_h(t, a, b, i as u8, r);
-            }
-        }
-    }
-    // Step 25: n == 6.
-    if n == 6 {
-        for i in 0..8 {
-            let angle = if i < 4 { 48 } else { 112 };
-            butterfly_b(t, 59 - i, 36 + i, angle, 1, r);
-        }
-    }
-    // Step 26: n >= 4.
-    if n >= 4 {
-        for i in 0..8 {
-            butterfly_h(t, i, 15 - i, 0, r);
-        }
-    }
-    // Step 27: n >= 5.
-    if n >= 5 {
-        for i in 0..4 {
-            butterfly_b(t, 27 - i, 20 + i, 32, 1, r);
-        }
-    }
-    // Step 28: n == 6.
-    if n == 6 {
-        for i in 0..8 {
-            butterfly_h(t, 32 + i, 47 - i, 0, r);
-            butterfly_h(t, 48 + i, 63 - i, 1, r);
-        }
-    }
-    // Step 29: n >= 5.
-    if n >= 5 {
-        for i in 0..16 {
-            butterfly_h(t, i, 31 - i, 0, r);
-        }
-    }
-    // Step 30: n == 6.
-    if n == 6 {
-        for i in 0..8 {
-            butterfly_b(t, 55 - i, 40 + i, 32, 1, r);
-        }
-    }
-    // Step 31: n == 6.
-    if n == 6 {
-        for i in 0..32 {
-            butterfly_h(t, i, 63 - i, 0, r);
-        }
+    match n {
+        2 => inverse_dct_4(t, r),
+        3 => inverse_dct_8(t, r),
+        4 => inverse_dct_16(t, r),
+        5 => inverse_dct_32(t, r),
+        6 => inverse_dct_64(t, r),
+        _ => panic!("oxideav-av1 §7.13.2.3: inverse_dct expects n in 2..=6, got {n}"),
     }
 }
 
@@ -464,7 +517,8 @@ pub fn inverse_dct(t: &mut [i64], n: u32, r: u32) {
 /// for `i in 0..n0` where `n0 = 1 << n`. `3 <= n <= 4`.
 pub fn inverse_adst_input_permute(t: &mut [i64], n: u32) {
     let n0 = 1usize << n;
-    let copy: Vec<i64> = t[..n0].to_vec();
+    let mut copy = [0i64; 16];
+    copy[..n0].copy_from_slice(&t[..n0]);
     for (i, slot) in t[..n0].iter_mut().enumerate() {
         let idx = if i & 1 == 1 { i - 1 } else { n0 - i - 1 };
         *slot = copy[idx];
@@ -476,7 +530,8 @@ pub fn inverse_adst_input_permute(t: &mut [i64], n: u32) {
 /// reads `copyT[idx]`; odd `i` values negate the result.
 pub fn inverse_adst_output_permute(t: &mut [i64], n: u32) {
     let n0 = 1usize << n;
-    let copy: Vec<i64> = t[..n0].to_vec();
+    let mut copy = [0i64; 16];
+    copy[..n0].copy_from_slice(&t[..n0]);
     for (i, slot) in t[..n0].iter_mut().enumerate() {
         let a = ((i >> 3) & 1) as u32;
         let b = (((i >> 2) & 1) ^ ((i >> 3) & 1)) as u32;
@@ -736,7 +791,8 @@ pub fn inverse_transform_2d(
 
     let mut residual = vec![0i64; w * h];
     // Row transforms.
-    let mut tbuf = vec![0i64; w];
+    let mut tbuf_arr = [0i64; 64];
+    let tbuf = &mut tbuf_arr[..w];
     for i in 0..h {
         // Populate T[j] from Dequant[i][j], zero for j or i >= 32.
         for j in 0..w {
@@ -771,7 +827,8 @@ pub fn inverse_transform_2d(
         *cell = clip3(lo, hi, *cell);
     }
     // Column transforms.
-    let mut tbuf = vec![0i64; h];
+    let mut tbuf_arr = [0i64; 64];
+    let tbuf = &mut tbuf_arr[..h];
     for j in 0..w {
         for i in 0..h {
             tbuf[i] = residual[i * w + j];
