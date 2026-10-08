@@ -19448,8 +19448,11 @@ impl PartitionWalker {
             };
             let scratch = &mut self.inter_pred_scratch[r.plane];
             for y in r.y0..r.y0 + r.h {
-                for x in r.x0..r.x0 + r.w {
-                    scratch[y * r.stride + x] = cp.samples[y * r.stride + x] as u16;
+                let start = y * r.stride + r.x0;
+                let src_row = &cp.samples[start..start + r.w];
+                let dst_row = &mut scratch[start..start + r.w];
+                for (dst, &src) in dst_row.iter_mut().zip(src_row.iter()) {
+                    *dst = src as u16;
                 }
             }
         }
@@ -19558,8 +19561,11 @@ impl PartitionWalker {
                 return Err(crate::Error::PartitionWalkOutOfRange);
             };
             for y in r.y0..r.y0 + r.h {
-                for x in r.x0..r.x0 + r.w {
-                    cp.samples[y * r.stride + x] = scratch[y * r.stride + x] as i32;
+                let start = y * r.stride + r.x0;
+                let src_row = &scratch[start..start + r.w];
+                let dst_row = &mut cp.samples[start..start + r.w];
+                for (dst, &src) in dst_row.iter_mut().zip(src_row.iter()) {
+                    *dst = src as i32;
                 }
             }
         }
@@ -20720,27 +20726,31 @@ impl PartitionWalker {
         dst_planes: &mut [crate::loop_filter::PlaneBuffer<'_>],
     ) {
         use crate::cdef::{cdef_frame, CdefFrameContext};
+        let mi_rows = self.mi_rows;
+        let mi_cols = self.mi_cols;
+        let skips = &self.skips;
+        let cdef_idx = &self.cdef_idx;
         let ctx = CdefFrameContext {
-            mi_rows: self.mi_rows,
-            mi_cols: self.mi_cols,
+            mi_rows,
+            mi_cols,
             num_planes,
             bit_depth,
             subsampling_x,
             subsampling_y,
             cdef_params,
-            // §7.15.1 reads `cdef_idx[ baseR ][ baseC ]` at the 64×64
-            // anchor; the persisted grid carries `-1` for any untouched
-            // anchor, which the driver treats as "copy only".
             cdef_idx: &|r, c| {
-                if r >= self.mi_rows || c >= self.mi_cols {
+                if r >= mi_rows || c >= mi_cols {
                     return -1;
                 }
-                self.cdef_idx[(r * self.mi_cols + c) as usize]
+                cdef_idx[(r * mi_cols + c) as usize]
             },
-            // §7.15.1 `skip` is the conjunction over the four 4×4 cells
-            // of the 8×8 block; the driver evaluates each cell, so this
-            // closure answers the per-cell `Skips[ r ][ c ]`.
-            skip: &|r, c| self.skip_at(r as i32, c as i32) != 0,
+            skip: &|r, c| {
+                if r < mi_rows && c < mi_cols {
+                    skips[(r * mi_cols + c) as usize] != 0
+                } else {
+                    false
+                }
+            },
         };
         cdef_frame(&ctx, src_planes, dst_planes);
     }
@@ -20768,27 +20778,35 @@ impl PartitionWalker {
         dst_planes: &mut [crate::loop_filter::PlaneBuffer<'_>],
     ) {
         use crate::cdef::{cdef_frame, CdefFrameContext};
+        let mi_rows = self.mi_rows;
+        let mi_cols = self.mi_cols;
+        let skips = &self.skips;
         let sb_cols = self.mi_cols.div_ceil(16);
         let ctx = CdefFrameContext {
-            mi_rows: self.mi_rows,
-            mi_cols: self.mi_cols,
+            mi_rows,
+            mi_cols,
             num_planes,
             bit_depth,
             subsampling_x,
             subsampling_y,
             cdef_params,
             cdef_idx: &|r, c| {
-                if r >= self.mi_rows || c >= self.mi_cols {
+                if r >= mi_rows || c >= mi_cols {
                     return -1;
                 }
                 let unit = (r / 16) * sb_cols + (c / 16);
                 unit_idx.get(unit as usize).copied().unwrap_or(-1)
             },
-            skip: &|r, c| self.skip_at(r as i32, c as i32) != 0,
+            skip: &|r, c| {
+                if r < mi_rows && c < mi_cols {
+                    skips[(r * mi_cols + c) as usize] != 0
+                } else {
+                    false
+                }
+            },
         };
         cdef_frame(&ctx, src_planes, dst_planes);
     }
-
     /// §7.14 in-loop deblocking filter over the persisted §5.11 decode
     /// grids — av1-spec p.307-313.
     ///

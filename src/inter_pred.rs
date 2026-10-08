@@ -587,6 +587,279 @@ fn clip3_i32(low: i32, high: i32, v: i32) -> i32 {
     }
 }
 
+thread_local! {
+    static INTERMEDIATE_SCRATCH: std::cell::RefCell<Vec<i32>> = const { std::cell::RefCell::new(Vec::new()) };
+    static PRED_SCRATCH_0: std::cell::RefCell<Vec<i32>> = const { std::cell::RefCell::new(Vec::new()) };
+    static PRED_SCRATCH_1: std::cell::RefCell<Vec<i32>> = const { std::cell::RefCell::new(Vec::new()) };
+    static PRED_U16_SCRATCH: std::cell::RefCell<Vec<u16>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn filter_8tap_h_neon(
+    src: &[u16],
+    coeffs: &[i32; 8],
+    inter_round0: u32,
+    dst: &mut [i32],
+    w: usize,
+) {
+    use core::arch::aarch64::*;
+    let c0 = coeffs[0] as i16;
+    let c1 = coeffs[1] as i16;
+    let c2 = coeffs[2] as i16;
+    let c3 = coeffs[3] as i16;
+    let c4 = coeffs[4] as i16;
+    let c5 = coeffs[5] as i16;
+    let c6 = coeffs[6] as i16;
+    let c7 = coeffs[7] as i16;
+
+    let round_offset = vdupq_n_s32(1i32 << (inter_round0 - 1));
+    let shift_vec = vdupq_n_s32(-(inter_round0 as i32));
+
+    let mut c = 0;
+    while c + 4 <= w {
+        let ptr = src.as_ptr().add(c);
+        let s0 = vreinterpret_s16_u16(vld1_u16(ptr));
+        let s1 = vreinterpret_s16_u16(vld1_u16(ptr.add(1)));
+        let s2 = vreinterpret_s16_u16(vld1_u16(ptr.add(2)));
+        let s3 = vreinterpret_s16_u16(vld1_u16(ptr.add(3)));
+        let s4 = vreinterpret_s16_u16(vld1_u16(ptr.add(4)));
+        let s5 = vreinterpret_s16_u16(vld1_u16(ptr.add(5)));
+        let s6 = vreinterpret_s16_u16(vld1_u16(ptr.add(6)));
+        let s7 = vreinterpret_s16_u16(vld1_u16(ptr.add(7)));
+
+        let mut acc = vmull_n_s16(s0, c0);
+        acc = vmlal_n_s16(acc, s1, c1);
+        acc = vmlal_n_s16(acc, s2, c2);
+        acc = vmlal_n_s16(acc, s3, c3);
+        acc = vmlal_n_s16(acc, s4, c4);
+        acc = vmlal_n_s16(acc, s5, c5);
+        acc = vmlal_n_s16(acc, s6, c6);
+        acc = vmlal_n_s16(acc, s7, c7);
+
+        acc = vaddq_s32(acc, round_offset);
+        acc = vshlq_s32(acc, shift_vec);
+
+        vst1q_s32(dst.as_mut_ptr().add(c), acc);
+        c += 4;
+    }
+    while c < w {
+        let s = coeffs[0] * (src[c] as i32)
+            + coeffs[1] * (src[c + 1] as i32)
+            + coeffs[2] * (src[c + 2] as i32)
+            + coeffs[3] * (src[c + 3] as i32)
+            + coeffs[4] * (src[c + 4] as i32)
+            + coeffs[5] * (src[c + 5] as i32)
+            + coeffs[6] * (src[c + 6] as i32)
+            + coeffs[7] * (src[c + 7] as i32);
+        dst[c] = (s + (1i32 << (inter_round0 - 1))) >> inter_round0;
+        c += 1;
+    }
+}
+
+#[allow(dead_code)]
+#[inline]
+fn filter_8tap_h_scalar(
+    src: &[u16],
+    coeffs: &[i32; 8],
+    inter_round0: u32,
+    dst: &mut [i32],
+    w: usize,
+) {
+    let round_offset = 1i32 << (inter_round0 - 1);
+    let c0 = coeffs[0];
+    let c1 = coeffs[1];
+    let c2 = coeffs[2];
+    let c3 = coeffs[3];
+    let c4 = coeffs[4];
+    let c5 = coeffs[5];
+    let c6 = coeffs[6];
+    let c7 = coeffs[7];
+    for c in 0..w {
+        let s = c0 * (src[c] as i32)
+            + c1 * (src[c + 1] as i32)
+            + c2 * (src[c + 2] as i32)
+            + c3 * (src[c + 3] as i32)
+            + c4 * (src[c + 4] as i32)
+            + c5 * (src[c + 5] as i32)
+            + c6 * (src[c + 6] as i32)
+            + c7 * (src[c + 7] as i32);
+        dst[c] = (s + round_offset) >> inter_round0;
+    }
+}
+
+#[inline(always)]
+fn filter_8tap_h(
+    src: &[u16],
+    coeffs: &[i32; 8],
+    inter_round0: u32,
+    dst: &mut [i32],
+    w: usize,
+) {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        filter_8tap_h_neon(src, coeffs, inter_round0, dst, w);
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    filter_8tap_h_scalar(src, coeffs, inter_round0, dst, w);
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn filter_8tap_v_neon(
+    intermediate: &[i32],
+    w: usize,
+    r: usize,
+    coeffs: &[i32; 8],
+    inter_round1: u32,
+    dst_row: &mut [i32],
+) {
+    use core::arch::aarch64::*;
+    let c0 = coeffs[0];
+    let c1 = coeffs[1];
+    let c2 = coeffs[2];
+    let c3 = coeffs[3];
+    let c4 = coeffs[4];
+    let c5 = coeffs[5];
+    let c6 = coeffs[6];
+    let c7 = coeffs[7];
+
+    let p0 = intermediate.as_ptr().add(r * w);
+    let p1 = intermediate.as_ptr().add((r + 1) * w);
+    let p2 = intermediate.as_ptr().add((r + 2) * w);
+    let p3 = intermediate.as_ptr().add((r + 3) * w);
+    let p4 = intermediate.as_ptr().add((r + 4) * w);
+    let p5 = intermediate.as_ptr().add((r + 5) * w);
+    let p6 = intermediate.as_ptr().add((r + 6) * w);
+    let p7 = intermediate.as_ptr().add((r + 7) * w);
+
+    let round_offset = vdupq_n_s32(1i32 << (inter_round1 - 1));
+    let shift_vec = vdupq_n_s32(-(inter_round1 as i32));
+
+    let mut c = 0;
+    while c + 4 <= w {
+        let v0 = vld1q_s32(p0.add(c));
+        let v1 = vld1q_s32(p1.add(c));
+        let v2 = vld1q_s32(p2.add(c));
+        let v3 = vld1q_s32(p3.add(c));
+        let v4 = vld1q_s32(p4.add(c));
+        let v5 = vld1q_s32(p5.add(c));
+        let v6 = vld1q_s32(p6.add(c));
+        let v7 = vld1q_s32(p7.add(c));
+
+        let mut acc = vmulq_n_s32(v0, c0);
+        acc = vmlaq_n_s32(acc, v1, c1);
+        acc = vmlaq_n_s32(acc, v2, c2);
+        acc = vmlaq_n_s32(acc, v3, c3);
+        acc = vmlaq_n_s32(acc, v4, c4);
+        acc = vmlaq_n_s32(acc, v5, c5);
+        acc = vmlaq_n_s32(acc, v6, c6);
+        acc = vmlaq_n_s32(acc, v7, c7);
+
+        acc = vaddq_s32(acc, round_offset);
+        acc = vshlq_s32(acc, shift_vec);
+
+        vst1q_s32(dst_row.as_mut_ptr().add(c), acc);
+        c += 4;
+    }
+    while c < w {
+        let s = c0 * *p0.add(c)
+            + c1 * *p1.add(c)
+            + c2 * *p2.add(c)
+            + c3 * *p3.add(c)
+            + c4 * *p4.add(c)
+            + c5 * *p5.add(c)
+            + c6 * *p6.add(c)
+            + c7 * *p7.add(c);
+        dst_row[c] = (s + (1i32 << (inter_round1 - 1))) >> inter_round1;
+        c += 1;
+    }
+}
+
+#[allow(dead_code)]
+#[inline]
+fn filter_8tap_v_scalar(
+    intermediate: &[i32],
+    w: usize,
+    r: usize,
+    coeffs: &[i32; 8],
+    inter_round1: u32,
+    dst_row: &mut [i32],
+) {
+    let round_offset = 1i32 << (inter_round1 - 1);
+    let c0 = coeffs[0];
+    let c1 = coeffs[1];
+    let c2 = coeffs[2];
+    let c3 = coeffs[3];
+    let c4 = coeffs[4];
+    let c5 = coeffs[5];
+    let c6 = coeffs[6];
+    let c7 = coeffs[7];
+
+    let row0 = &intermediate[r * w..];
+    let row1 = &intermediate[(r + 1) * w..];
+    let row2 = &intermediate[(r + 2) * w..];
+    let row3 = &intermediate[(r + 3) * w..];
+    let row4 = &intermediate[(r + 4) * w..];
+    let row5 = &intermediate[(r + 5) * w..];
+    let row6 = &intermediate[(r + 6) * w..];
+    let row7 = &intermediate[(r + 7) * w..];
+
+    for c in 0..w {
+        let s = c0 * row0[c]
+            + c1 * row1[c]
+            + c2 * row2[c]
+            + c3 * row3[c]
+            + c4 * row4[c]
+            + c5 * row5[c]
+            + c6 * row6[c]
+            + c7 * row7[c];
+        dst_row[c] = (s + round_offset) >> inter_round1;
+    }
+}
+
+#[inline(always)]
+fn filter_8tap_v(
+    intermediate: &[i32],
+    w: usize,
+    r: usize,
+    coeffs: &[i32; 8],
+    inter_round1: u32,
+    dst_row: &mut [i32],
+) {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        filter_8tap_v_neon(intermediate, w, r, coeffs, inter_round1, dst_row);
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    filter_8tap_v_scalar(intermediate, w, r, coeffs, inter_round1, dst_row);
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn clip1_single_ref_neon(bit_depth: u8, pred: &[i32], out: &mut [u16]) {
+    use core::arch::aarch64::*;
+    let max_val = (1i32 << bit_depth) - 1;
+    let zero = vdupq_n_s32(0);
+    let max_v = vdupq_n_s32(max_val);
+    let mut i = 0;
+    while i + 8 <= pred.len() {
+        let v0 = vld1q_s32(pred.as_ptr().add(i));
+        let v1 = vld1q_s32(pred.as_ptr().add(i + 4));
+        let c0 = vminq_s32(vmaxq_s32(v0, zero), max_v);
+        let c1 = vminq_s32(vmaxq_s32(v1, zero), max_v);
+        let n0 = vqmovun_s32(c0);
+        let n1 = vqmovun_s32(c1);
+        let combined = vcombine_u16(n0, n1);
+        vst1q_u16(out.as_mut_ptr().add(i), combined);
+        i += 8;
+    }
+    while i < pred.len() {
+        out[i] = clip3_i32(0, max_val, pred[i]) as u16;
+        i += 1;
+    }
+}
+
 /// §7.11.3.4 (av1-spec p.261-265): the translational 8-tap horizontal
 /// + vertical convolution kernel.
 ///
@@ -743,79 +1016,110 @@ pub fn block_inter_prediction(
         interp_filter_y as usize
     };
 
-    // §7.11.3.4 intermediate buffer. The post-Round2 value fits in
-    // ~14 bits for 8-bit content (sum of |coef| at one phase is at
-    // most 384, times max sample 255 = 97920, Round2 by 3 = 12240
-    // — well within i32). We use i32 for headroom across bit depths.
-    let mut intermediate: Vec<i32> = vec![0i32; intermediate_height * w];
-
-    // ---------- §7.11.3.4 step 1: horizontal filter ----------
-    //
-    //   for r in 0..intermediateHeight:
-    //     for c in 0..w:
-    //       s = 0
-    //       p = x + xStep * c
-    //       for t in 0..8:
-    //         s += Subpel_Filters[hFilter][(p >> 6) & SUBPEL_MASK][t]
-    //              * ref[Clip3(0, lastY, (y >> 10) + r - 3)]
-    //                   [Clip3(0, lastX, (p >> 10) + t - 3)]
-    //       intermediate[r][c] = Round2(s, InterRound0)
-    //
-    // (av1-spec p.262 lines 14609-14619.)
-    let y_base = (start_y >> SCALE_SUBPEL_BITS) - 3;
-    for r in 0..intermediate_height {
-        let ry = clip3_i32(0, last_y, y_base + (r as i32)) as usize;
-        let row_base = ry * ref_stride;
-        for c in 0..w {
-            let p: i32 = start_x + step_x * (c as i32);
-            // §7.11.3.4 phase index `(p >> 6) & SUBPEL_MASK` —
-            // `>> 6` reduces SCALE_SUBPEL_BITS=10 to SUBPEL_BITS=4
-            // (10 - 4 = 6) and the mask isolates the 4-bit phase.
-            let phase = ((p >> (SCALE_SUBPEL_BITS - SUBPEL_BITS)) as u32 & SUBPEL_MASK) as usize;
-            let p_int = p >> SCALE_SUBPEL_BITS;
-            let coeffs = &SUBPEL_FILTERS[h_filter][phase];
-            let mut s: i64 = 0;
-            for (t, coef) in coeffs.iter().enumerate() {
-                let rx = clip3_i32(0, last_x, p_int + (t as i32) - 3) as usize;
-                let sample = ref_plane[row_base + rx] as i64;
-                s += (*coef as i64) * sample;
-            }
-            intermediate[r * w + c] = round2(s, inter_round0) as i32;
+    let needed = intermediate_height * w;
+    INTERMEDIATE_SCRATCH.with(|cell| {
+        let mut buf = cell.borrow_mut();
+        if buf.len() < needed {
+            buf.resize(needed, 0);
         }
-    }
+        let intermediate = &mut buf[..needed];
 
-    // ---------- §7.11.3.4 step 2: vertical filter ----------
-    //
-    //   for r in 0..h:
-    //     for c in 0..w:
-    //       s = 0
-    //       p = (y & 1023) + yStep * r
-    //       for t in 0..8:
-    //         s += Subpel_Filters[vFilter][(p >> 6) & SUBPEL_MASK][t]
-    //              * intermediate[(p >> 10) + t][c]
-    //       pred[r][c] = Round2(s, InterRound1)
-    //
-    // (av1-spec p.262 lines 14633-14642.)
-    let y_frac_mask: i32 = (1i32 << SCALE_SUBPEL_BITS) - 1;
-    for r in 0..h {
-        let p: i32 = (start_y & y_frac_mask) + step_y * (r as i32);
-        let phase = ((p >> (SCALE_SUBPEL_BITS - SUBPEL_BITS)) as u32 & SUBPEL_MASK) as usize;
-        let p_int = (p >> SCALE_SUBPEL_BITS) as usize;
-        let coeffs = &SUBPEL_FILTERS[v_filter][phase];
-        for c in 0..w {
-            let mut s: i64 = 0;
-            for (t, coef) in coeffs.iter().enumerate() {
-                let interp_row = p_int + t;
-                // The intermediate-height derivation above guarantees
-                // `p_int + t < intermediate_height` for every legal
-                // (r, t) — `(h-1) * yStep < intermediateHeight - 7`
-                // after applying the `+8` margin from line 14582.
-                let v = intermediate[interp_row * w + c] as i64;
-                s += (*coef as i64) * v;
+        let is_unscaled = step_x == (1 << SCALE_SUBPEL_BITS) && step_y == (1 << SCALE_SUBPEL_BITS);
+        if is_unscaled {
+            let phase_x = ((start_x >> (SCALE_SUBPEL_BITS - SUBPEL_BITS)) as u32 & SUBPEL_MASK) as usize;
+            let y_frac_mask: i32 = (1i32 << SCALE_SUBPEL_BITS) - 1;
+            let phase_y = (((start_y & y_frac_mask) >> (SCALE_SUBPEL_BITS - SUBPEL_BITS)) as u32 & SUBPEL_MASK) as usize;
+            let coeffs_h = &SUBPEL_FILTERS[h_filter][phase_x];
+            let coeffs_v = &SUBPEL_FILTERS[v_filter][phase_y];
+
+            let start_x_int = start_x >> SCALE_SUBPEL_BITS;
+            let start_y_int = start_y >> SCALE_SUBPEL_BITS;
+            let y_base = start_y_int - 3;
+            let min_x = start_x_int - 3;
+            let max_x = start_x_int + (w as i32) + 3;
+            let min_y = y_base;
+            let max_y = y_base + (intermediate_height as i32) - 1;
+
+            if min_x >= 0 && max_x <= last_x && min_y >= 0 && max_y <= last_y {
+                let min_x = min_x as usize;
+                for r in 0..intermediate_height {
+                    let ry = (y_base + (r as i32)) as usize;
+                    let row_start = ry * ref_stride + min_x;
+                    let src_row = &ref_plane[row_start..row_start + w + 7];
+                    let dst_row = &mut intermediate[r * w..(r + 1) * w];
+                    filter_8tap_h(src_row, coeffs_h, inter_round0, dst_row, w);
+                }
+            } else {
+                let round_offset = 1i32 << (inter_round0 - 1);
+                let c0 = coeffs_h[0];
+                let c1 = coeffs_h[1];
+                let c2 = coeffs_h[2];
+                let c3 = coeffs_h[3];
+                let c4 = coeffs_h[4];
+                let c5 = coeffs_h[5];
+                let c6 = coeffs_h[6];
+                let c7 = coeffs_h[7];
+                for r in 0..intermediate_height {
+                    let ry = clip3_i32(0, last_y, y_base + (r as i32)) as usize;
+                    let row_base = ry * ref_stride;
+                    let dst_row = &mut intermediate[r * w..(r + 1) * w];
+                    for c in 0..w {
+                        let p_int = start_x_int + (c as i32);
+                        let s = c0 * (ref_plane[row_base + clip3_i32(0, last_x, p_int - 3) as usize] as i32)
+                            + c1 * (ref_plane[row_base + clip3_i32(0, last_x, p_int - 2) as usize] as i32)
+                            + c2 * (ref_plane[row_base + clip3_i32(0, last_x, p_int - 1) as usize] as i32)
+                            + c3 * (ref_plane[row_base + clip3_i32(0, last_x, p_int) as usize] as i32)
+                            + c4 * (ref_plane[row_base + clip3_i32(0, last_x, p_int + 1) as usize] as i32)
+                            + c5 * (ref_plane[row_base + clip3_i32(0, last_x, p_int + 2) as usize] as i32)
+                            + c6 * (ref_plane[row_base + clip3_i32(0, last_x, p_int + 3) as usize] as i32)
+                            + c7 * (ref_plane[row_base + clip3_i32(0, last_x, p_int + 4) as usize] as i32);
+                        dst_row[c] = (s + round_offset) >> inter_round0;
+                    }
+                }
             }
-            pred[r * w + c] = round2(s, inter_round1) as i32;
+
+            for r in 0..h {
+                let dst_row = &mut pred[r * w..(r + 1) * w];
+                filter_8tap_v(intermediate, w, r, coeffs_v, inter_round1, dst_row);
+            }
+        } else {
+            let y_base = (start_y >> SCALE_SUBPEL_BITS) - 3;
+            for r in 0..intermediate_height {
+                let ry = clip3_i32(0, last_y, y_base + (r as i32)) as usize;
+                let row_base = ry * ref_stride;
+                for c in 0..w {
+                    let p: i32 = start_x + step_x * (c as i32);
+                    let phase = ((p >> (SCALE_SUBPEL_BITS - SUBPEL_BITS)) as u32 & SUBPEL_MASK) as usize;
+                    let p_int = p >> SCALE_SUBPEL_BITS;
+                    let coeffs = &SUBPEL_FILTERS[h_filter][phase];
+                    let mut s: i64 = 0;
+                    for (t, coef) in coeffs.iter().enumerate() {
+                        let rx = clip3_i32(0, last_x, p_int + (t as i32) - 3) as usize;
+                        let sample = ref_plane[row_base + rx] as i64;
+                        s += (*coef as i64) * sample;
+                    }
+                    intermediate[r * w + c] = round2(s, inter_round0) as i32;
+                }
+            }
+            let y_frac_mask: i32 = (1i32 << SCALE_SUBPEL_BITS) - 1;
+            for r in 0..h {
+                let p: i32 = (start_y & y_frac_mask) + step_y * (r as i32);
+                let phase = ((p >> (SCALE_SUBPEL_BITS - SUBPEL_BITS)) as u32 & SUBPEL_MASK) as usize;
+                let p_int = (p >> SCALE_SUBPEL_BITS) as usize;
+                let coeffs = &SUBPEL_FILTERS[v_filter][phase];
+                for c in 0..w {
+                    let mut s: i64 = 0;
+                    for (t, coef) in coeffs.iter().enumerate() {
+                        let interp_row = p_int + t;
+                        let v = intermediate[interp_row * w + c] as i64;
+                        s += (*coef as i64) * v;
+                    }
+                    pred[r * w + c] = round2(s, inter_round1) as i32;
+                }
+            }
         }
-    }
+    });
+
 
     Ok(())
 }
@@ -835,9 +1139,16 @@ pub fn clip1_single_ref(bit_depth: u8, pred: &[i32], out: &mut [u16]) -> Result<
     if out.len() < pred.len() {
         return Err(crate::Error::PartitionWalkOutOfRange);
     }
-    let max = (1i32 << bit_depth) - 1;
-    for (dst, src) in out.iter_mut().zip(pred.iter().copied()) {
-        *dst = clip3_i32(0, max, src) as u16;
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        clip1_single_ref_neon(bit_depth, pred, out);
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let max = (1i32 << bit_depth) - 1;
+        for (dst, src) in out.iter_mut().zip(pred.iter().copied()) {
+            *dst = clip3_i32(0, max, src) as u16;
+        }
     }
     Ok(())
 }
@@ -1218,6 +1529,59 @@ pub struct WedgeInterIntraInfo<'a> {
 /// Allocates the `w * h` `i32` buffer fallibly (returns
 /// `Error::PartitionWalkOutOfRange` on alloc failure).
 #[allow(clippy::too_many_arguments)]
+fn predict_inter_per_ref_into(
+    r: &PredictInterRef<'_>,
+    plane: u8,
+    x: i32,
+    y: i32,
+    w: usize,
+    h: usize,
+    subsampling_x: u8,
+    subsampling_y: u8,
+    frame_width: u32,
+    frame_height: u32,
+    interp_filter_x: u8,
+    interp_filter_y: u8,
+    inter_round0: u32,
+    inter_round1: u32,
+    pred: &mut [i32],
+) -> Result<(), crate::Error> {
+    let mvs = motion_vector_scaling(
+        plane,
+        subsampling_x,
+        subsampling_y,
+        frame_width,
+        frame_height,
+        r.ref_upscaled_width,
+        r.ref_height,
+        x,
+        y,
+        r.mv,
+    )?;
+
+    block_inter_prediction(
+        plane,
+        subsampling_x,
+        subsampling_y,
+        r.ref_plane,
+        r.ref_stride,
+        r.ref_width,
+        r.ref_height,
+        mvs.start_x,
+        mvs.start_y,
+        mvs.step_x,
+        mvs.step_y,
+        w,
+        h,
+        interp_filter_x,
+        interp_filter_y,
+        inter_round0,
+        inter_round1,
+        pred,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn predict_inter_per_ref(
     r: &PredictInterRef<'_>,
     plane: u8,
@@ -1234,39 +1598,18 @@ fn predict_inter_per_ref(
     inter_round0: u32,
     inter_round1: u32,
 ) -> Result<Vec<i32>, crate::Error> {
-    let mvs = motion_vector_scaling(
+    let mut pred = vec![0i32; w * h];
+    predict_inter_per_ref_into(
+        r,
         plane,
+        x,
+        y,
+        w,
+        h,
         subsampling_x,
         subsampling_y,
         frame_width,
         frame_height,
-        r.ref_upscaled_width,
-        r.ref_height,
-        x,
-        y,
-        r.mv,
-    )?;
-
-    let mut pred: Vec<i32> = Vec::new();
-    if pred.try_reserve_exact(w * h).is_err() {
-        return Err(crate::Error::PartitionWalkOutOfRange);
-    }
-    pred.resize(w * h, 0);
-
-    block_inter_prediction(
-        plane,
-        subsampling_x,
-        subsampling_y,
-        r.ref_plane,
-        r.ref_stride,
-        r.ref_width,
-        r.ref_height,
-        mvs.start_x,
-        mvs.start_y,
-        mvs.step_x,
-        mvs.step_y,
-        w,
-        h,
         interp_filter_x,
         interp_filter_y,
         inter_round0,
@@ -1747,7 +2090,7 @@ fn predict_inter_per_ref_warp(
 /// caller-supplied `WarpDriverParams::local_valid` after the
 /// `plane == 0` re-check against `setup_shear(LocalWarpParams)`).
 #[allow(clippy::too_many_arguments)]
-fn predict_inter_one_ref(
+fn predict_inter_one_ref_into(
     r: &PredictInterRef<'_>,
     ref_list: usize,
     plane: u8,
@@ -1766,13 +2109,8 @@ fn predict_inter_one_ref(
     inter_round1: u32,
     warp: Option<&WarpDriverParams>,
     effective_local_valid: bool,
-) -> Result<Vec<i32>, crate::Error> {
-    // ---------- §7.11.3.1 step 6/7 — derive useWarp ----------
-    //
-    // Step 6 invokes §7.11.3.6 setup_shear on `gm_params[refFrame]`
-    // and assigns warpValid → globalValid; we run it lazily (only
-    // when YMode + GmType clear the rest of the step-7 gate, since
-    // the call costs an inverse-divisor that's pointless otherwise).
+    out: &mut [i32],
+) -> Result<(), crate::Error> {
     let decision = if let Some(wp) = warp {
         let y_mode = wp.y_mode[ref_list];
         let gm_type = wp.gm_type[ref_list];
@@ -1782,11 +2120,6 @@ fn predict_inter_one_ref(
             crate::cdf::MODE_GLOBALMV | crate::cdf::MODE_GLOBAL_GLOBALMV
         );
         let gm_is_warp = (gm_type as i32) > crate::cdf::GM_TYPE_TRANSLATION;
-        // Step 6 — only run setup_shear when the gate would consult
-        // globalValid. The other arms of step-7 either short-circuit
-        // before consulting it (`w/h < 8`, `force_integer_mv`,
-        // LOCALWARP+LocalValid) or short-circuit before the AND chain
-        // (`!(y_is_global && gm_is_warp)`).
         let global_valid = if y_is_global && gm_is_warp && !ref_is_scaled {
             matches!(setup_shear(wp.gm_params[ref_list]), Some(s) if s.warp_valid)
         } else {
@@ -1807,9 +2140,8 @@ fn predict_inter_one_ref(
         UseWarpDecision::Translational
     };
 
-    // ---------- §7.11.3.1 step 12 / 13 — dispatch ----------
     match decision {
-        UseWarpDecision::Translational => predict_inter_per_ref(
+        UseWarpDecision::Translational => predict_inter_per_ref_into(
             r,
             plane,
             x,
@@ -1824,14 +2156,11 @@ fn predict_inter_one_ref(
             interp_filter_y,
             inter_round0,
             inter_round1,
+            out,
         ),
         UseWarpDecision::Local => {
-            // av1-spec p.257 step-7 ◦ 3: LOCALWARP. `warp.is_some()`
-            // is guaranteed by `derive_use_warp` returning `Local`
-            // only when LocalValid && motion_mode == LOCALWARP, both
-            // of which require a non-None `warp`.
             let wp = warp.expect("Local requires WarpDriverParams");
-            predict_inter_per_ref_warp(
+            let v = predict_inter_per_ref_warp(
                 r,
                 USE_WARP_LOCAL,
                 plane,
@@ -1844,11 +2173,13 @@ fn predict_inter_one_ref(
                 wp.local_warp_params,
                 inter_round0,
                 inter_round1,
-            )
+            )?;
+            out[..v.len()].copy_from_slice(&v);
+            Ok(())
         }
         UseWarpDecision::Global => {
             let wp = warp.expect("Global requires WarpDriverParams");
-            predict_inter_per_ref_warp(
+            let v = predict_inter_per_ref_warp(
                 r,
                 USE_WARP_GLOBAL,
                 plane,
@@ -1861,9 +2192,57 @@ fn predict_inter_one_ref(
                 wp.gm_params[ref_list],
                 inter_round0,
                 inter_round1,
-            )
+            )?;
+            out[..v.len()].copy_from_slice(&v);
+            Ok(())
         }
     }
+}
+
+#[allow(clippy::too_many_arguments, dead_code)]
+fn predict_inter_one_ref(
+    r: &PredictInterRef<'_>,
+    ref_list: usize,
+    plane: u8,
+    x: i32,
+    y: i32,
+    w: usize,
+    h: usize,
+    motion_mode: u8,
+    subsampling_x: u8,
+    subsampling_y: u8,
+    frame_width: u32,
+    frame_height: u32,
+    interp_filter_x: u8,
+    interp_filter_y: u8,
+    inter_round0: u32,
+    inter_round1: u32,
+    warp: Option<&WarpDriverParams>,
+    effective_local_valid: bool,
+) -> Result<Vec<i32>, crate::Error> {
+    let mut out = vec![0i32; w * h];
+    predict_inter_one_ref_into(
+        r,
+        ref_list,
+        plane,
+        x,
+        y,
+        w,
+        h,
+        motion_mode,
+        subsampling_x,
+        subsampling_y,
+        frame_width,
+        frame_height,
+        interp_filter_x,
+        interp_filter_y,
+        inter_round0,
+        inter_round1,
+        warp,
+        effective_local_valid,
+        &mut out,
+    )?;
+    Ok(out)
 }
 
 /// §7.11.3.9 OBMC mi-grid neighbour walk + per-candidate
@@ -2248,7 +2627,16 @@ pub fn predict_inter(
     // `(startX, startY, stepX, stepY)` quadruple — or, on the WARP
     // arm, step 12 = `block_warp` per 8×8 sub-section. The compound
     // arm (step 14) repeats the same body for `refList = 1`.
-    let pred0 = predict_inter_one_ref(
+    let n_samples = w * h;
+    let mut pred0 = PRED_SCRATCH_0.with(|cell| {
+        let mut b = cell.borrow_mut();
+        if b.len() < n_samples {
+            b.resize(n_samples, 0);
+        }
+        std::mem::take(&mut *b)
+    });
+
+    let res0 = predict_inter_one_ref_into(
         &refs[0],
         /* ref_list */ 0,
         plane,
@@ -2267,86 +2655,61 @@ pub fn predict_inter(
         rv.inter_round1,
         warp,
         effective_local_valid,
-    )?;
+        &mut pred0[..n_samples],
+    );
+    if let Err(e) = res0 {
+        PRED_SCRATCH_0.with(|cell| *cell.borrow_mut() = pred0);
+        return Err(e);
+    }
 
     // ---------- §7.11.3.1 step 14 + final blend ----------
-    //
-    // av1-spec p.258 lines 14400-14412:
-    //   * `isCompound == 0 && IsInterIntra == 0` ⇒ `CurrFrame =
-    //     Clip1(preds[0])` (single-ref final-clip).
-    //   * `COMPOUND_AVERAGE` ⇒ `Clip1(Round2(preds[0] + preds[1],
-    //     1 + InterPostRound))`.
-    //   * `COMPOUND_DISTANCE` ⇒ `Clip1(Round2(FwdWeight * preds[0] +
-    //     BckWeight * preds[1], 4 + InterPostRound))`.
-    //   * `COMPOUND_WEDGE` / `COMPOUND_DIFFWTD` / `COMPOUND_INTRA` ⇒
-    //     `mask_blend(preds, plane, x, y, w, h)`.
-    //
-    // The inter-intra branch (`IsInterIntra == 1`, `isCompound == 0`)
-    // takes the §7.11.3.14 inter-intra body instead: `preds[0]` is the
-    // single inter prediction (pre-clip), `pred1` is the in-place intra
-    // prediction already in `pred_out`. The mask is the §7.11.3.13
-    // intra-variant mask on the non-wedge arm, or the §7.11.3.11
-    // luma-grid wedge mask on the `wedge_interintra == 1` arm. It is
-    // handled below the compound/single-ref split because it consumes
-    // `pred_out` on entry.
-    //
-    // SAFETY: the `is_inter_intra` guards above returned
-    // `PartitionWalkOutOfRange` unless `inter_intra.is_some()`.
     if is_inter_intra {
         let ii = inter_intra.expect("inter_intra checked above");
-        // `pred_out` holds the §7.11.2 intra prediction on entry
-        // (`pred1 = CurrFrame[plane][y+dstY][x+dstX]`); the blend reads
-        // it as `pred1` and overwrites it with the blended sample.
-        match ii.wedge {
+        let blend_res = match ii.wedge {
             None => {
-                // av1-spec p.258 line 14389-14390 + p.284 lines
-                // 15772-15787: the non-wedge interintra mask is the
-                // §7.11.3.13 per-plane `w × h` intra-variant mask; the
-                // §7.11.3.14 body reads it at `Mask[y][x]` directly via
-                // the `(interintra && !wedge_interintra)` predicate, so
-                // no chroma downsampling is applied (`sub_x = sub_y = 0`).
                 let mut mask = vec![0u8; w * h];
-                intra_mode_variant_mask(ii.interintra_mode, w, h, &mut mask)?;
-                mask_blend_interintra(
-                    bit_depth,
-                    rv.inter_post_round,
-                    /* sub_x */ 0,
-                    /* sub_y */ 0,
-                    &pred0,
-                    w,
-                    h,
-                    &mask,
-                    /* mask_stride */ 0,
-                    pred_out,
-                )?;
+                intra_mode_variant_mask(ii.interintra_mode, w, h, &mut mask)
+                    .and_then(|()| {
+                        mask_blend_interintra(
+                            bit_depth,
+                            rv.inter_post_round,
+                            /* sub_x */ 0,
+                            /* sub_y */ 0,
+                            &pred0[..n_samples],
+                            w,
+                            h,
+                            &mask,
+                            /* mask_stride */ 0,
+                            pred_out,
+                        )
+                    })
             }
             Some(wi) => {
-                // av1-spec p.258 line 14386 + p.80 line 5017: the
-                // wedge interintra arm sets `compound_type ==
-                // COMPOUND_WEDGE`, so the mask is the §7.11.3.11
-                // luma-grid wedge mask the caller built once at
-                // `plane == 0`. The §7.11.3.14 body reads it with the
-                // current plane's `(subX, subY)` averaging (av1-spec
-                // p.284 line 15772-15781) — the
-                // `(interintra && !wedge_interintra)` short-circuit does
-                // not fire here.
                 mask_blend_interintra(
                     bit_depth,
                     rv.inter_post_round,
                     subsampling_x,
                     subsampling_y,
-                    &pred0,
+                    &pred0[..n_samples],
                     w,
                     h,
                     wi.mask,
                     wi.mask_stride,
                     pred_out,
-                )?;
+                )
             }
-        }
+        };
+        PRED_SCRATCH_0.with(|cell| *cell.borrow_mut() = pred0);
+        blend_res?;
     } else if is_compound {
-        // step 14: build preds[1] from refs[1] with the same pipeline.
-        let pred1 = predict_inter_one_ref(
+        let mut pred1 = PRED_SCRATCH_1.with(|cell| {
+            let mut b = cell.borrow_mut();
+            if b.len() < n_samples {
+                b.resize(n_samples, 0);
+            }
+            std::mem::take(&mut *b)
+        });
+        let res1 = predict_inter_one_ref_into(
             &refs[1],
             /* ref_list */ 1,
             plane,
@@ -2365,11 +2728,15 @@ pub fn predict_inter(
             rv.inter_round1,
             warp,
             effective_local_valid,
-        )?;
-        // SAFETY: the `is_compound` arm guarded `compound.is_some()`
-        // above, so `unwrap` cannot panic.
+            &mut pred1[..n_samples],
+        );
+        if let Err(e) = res1 {
+            PRED_SCRATCH_0.with(|cell| *cell.borrow_mut() = pred0);
+            PRED_SCRATCH_1.with(|cell| *cell.borrow_mut() = pred1);
+            return Err(e);
+        }
         let cp = compound.expect("compound checked above");
-        predict_inter_compound_blend(
+        let blend_res = predict_inter_compound_blend(
             plane,
             bit_depth,
             rv.inter_post_round,
@@ -2377,19 +2744,18 @@ pub fn predict_inter(
             subsampling_y,
             w,
             h,
-            &pred0,
-            &pred1,
+            &pred0[..n_samples],
+            &pred1[..n_samples],
             cp,
             pred_out,
-        )?;
+        );
+        PRED_SCRATCH_0.with(|cell| *cell.borrow_mut() = pred0);
+        PRED_SCRATCH_1.with(|cell| *cell.borrow_mut() = pred1);
+        blend_res?;
     } else {
-        // av1-spec p.258 line 14402: `CurrFrame[plane][y + i][x + j] =
-        // Clip1( preds[0][i][j] )` for `(i, j) ∈ [0, h) × [0, w)`.
-        // We write into the caller-supplied per-block buffer; the merge
-        // into [`crate::PartitionWalker::curr_frame`] is the walker's
-        // responsibility (it owns the per-plane buffer and the (x, y)
-        // offsetting).
-        clip1_single_ref(bit_depth, &pred0, pred_out)?;
+        let clip_res = clip1_single_ref(bit_depth, &pred0[..n_samples], pred_out);
+        PRED_SCRATCH_0.with(|cell| *cell.borrow_mut() = pred0);
+        clip_res?;
     }
 
     // ---------- §7.11.3.1 post-step — OBMC overlap blend ---------
@@ -4934,8 +5300,15 @@ pub fn reconstruct_inter_block(
     }];
 
     // ---------- §7.11.3.1 steps 1-13 — prediction into scratch -----
-    let mut pred_out = vec![0u16; w * h];
-    predict_inter(
+    let n_samples = w * h;
+    let mut pred_out = PRED_U16_SCRATCH.with(|cell| {
+        let mut b = cell.borrow_mut();
+        if b.len() < n_samples {
+            b.resize(n_samples, 0);
+        }
+        std::mem::take(&mut *b)
+    });
+    let res = predict_inter(
         plane,
         x,
         y,
@@ -4956,32 +5329,25 @@ pub fn reconstruct_inter_block(
         /* inter_intra */ None,
         /* warp */ None,
         /* obmc */ None,
-        &mut pred_out,
-    )?;
+        &mut pred_out[..n_samples],
+    );
+    if let Err(e) = res {
+        PRED_U16_SCRATCH.with(|cell| *cell.borrow_mut() = pred_out);
+        return Err(e);
+    }
 
-    // ---------- §7.11.3.1 final step — CurrFrame[plane] stitch -----
-    //
-    // av1-spec p.258 line 14402: `CurrFrame[plane][y + i][x + j] =
-    // Clip1(preds[0][i][j])`. `predict_inter` already applied the
-    // `Clip1` (single-ref final-clip arm); here we copy the resulting
-    // `w × h` block into the plane buffer at plane coords `(x, y)`.
     if x < 0 || y < 0 {
+        PRED_U16_SCRATCH.with(|cell| *cell.borrow_mut() = pred_out);
         return Err(crate::Error::PartitionWalkOutOfRange);
     }
     let (px, py) = (x as usize, y as usize);
-    // The write region must fit the supplied plane buffer.
-    // §5.11.4 allows a leaf to OVERHANG the frame's bottom / right mi
-    // edge (only its on-frame cells are grid-stamped). The §7.11.3.1
-    // prediction still runs at the FULL block geometry — the wedge /
-    // OBMC-band / small-block-filter derivations depend on
-    // `Block_{Width,Height}` — but only the rows / columns inside the
-    // plane are stitched back (r394: the previous full-fit guard
-    // rejected every bottom-edge overhanging inter block).
     if curr_stride == 0 || px >= curr_stride {
+        PRED_U16_SCRATCH.with(|cell| *cell.borrow_mut() = pred_out);
         return Err(crate::Error::PartitionWalkOutOfRange);
     }
     let plane_rows = curr_plane.len() / curr_stride;
     if py >= plane_rows {
+        PRED_U16_SCRATCH.with(|cell| *cell.borrow_mut() = pred_out);
         return Err(crate::Error::PartitionWalkOutOfRange);
     }
     let fit_w = w.min(curr_stride - px);
@@ -4992,6 +5358,7 @@ pub fn reconstruct_inter_block(
         curr_plane[dst..dst + fit_w].copy_from_slice(&pred_out[src..src + fit_w]);
     }
 
+    PRED_U16_SCRATCH.with(|cell| *cell.borrow_mut() = pred_out);
     Ok(())
 }
 
@@ -5595,8 +5962,15 @@ pub fn reconstruct_inter_block_compound(
     };
 
     // ---------- §7.11.3.1 steps 1-14 — compound prediction ----------
-    let mut pred_out = vec![0u16; w * h];
-    predict_inter(
+    let n_samples = w * h;
+    let mut pred_out = PRED_U16_SCRATCH.with(|cell| {
+        let mut b = cell.borrow_mut();
+        if b.len() < n_samples {
+            b.resize(n_samples, 0);
+        }
+        std::mem::take(&mut *b)
+    });
+    let res = predict_inter(
         plane,
         x,
         y,
@@ -5617,32 +5991,25 @@ pub fn reconstruct_inter_block_compound(
         /* inter_intra */ None,
         warp,
         /* obmc */ None,
-        &mut pred_out,
-    )?;
+        &mut pred_out[..n_samples],
+    );
+    if let Err(e) = res {
+        PRED_U16_SCRATCH.with(|cell| *cell.borrow_mut() = pred_out);
+        return Err(e);
+    }
 
-    // ---------- §7.11.3.1 final step — CurrFrame[plane] stitch -------
-    //
-    // av1-spec p.258 line 14402: `CurrFrame[plane][y + i][x + j] =
-    // <combined>`. `predict_inter` already applied the step-14 combine
-    // + `Clip1` into `pred_out`; here we copy the `w × h` block into the
-    // plane buffer at plane coords `(x, y)` (same stitch as the
-    // single-ref arm).
     if x < 0 || y < 0 {
+        PRED_U16_SCRATCH.with(|cell| *cell.borrow_mut() = pred_out);
         return Err(crate::Error::PartitionWalkOutOfRange);
     }
     let (px, py) = (x as usize, y as usize);
-    // §5.11.4 allows a leaf to OVERHANG the frame's bottom / right mi
-    // edge (only its on-frame cells are grid-stamped). The §7.11.3.1
-    // prediction still runs at the FULL block geometry — the wedge /
-    // OBMC-band / small-block-filter derivations depend on
-    // `Block_{Width,Height}` — but only the rows / columns inside the
-    // plane are stitched back (r394: the previous full-fit guard
-    // rejected every bottom-edge overhanging inter block).
     if curr_stride == 0 || px >= curr_stride {
+        PRED_U16_SCRATCH.with(|cell| *cell.borrow_mut() = pred_out);
         return Err(crate::Error::PartitionWalkOutOfRange);
     }
     let plane_rows = curr_plane.len() / curr_stride;
     if py >= plane_rows {
+        PRED_U16_SCRATCH.with(|cell| *cell.borrow_mut() = pred_out);
         return Err(crate::Error::PartitionWalkOutOfRange);
     }
     let fit_w = w.min(curr_stride - px);
@@ -5653,6 +6020,7 @@ pub fn reconstruct_inter_block_compound(
         curr_plane[dst..dst + fit_w].copy_from_slice(&pred_out[src..src + fit_w]);
     }
 
+    PRED_U16_SCRATCH.with(|cell| *cell.borrow_mut() = pred_out);
     Ok(())
 }
 
@@ -5850,11 +6218,14 @@ pub fn reconstruct_inter_block_interintra(
     // as the second blend operand. We copy that `w × h` window out of
     // `curr_plane` into the scratch buffer `predict_inter` consumes (it
     // overwrites the scratch with the blended sample in place).
-    let mut pred_out = vec![0u16; w * h];
-    // Seed only the in-plane window (an overhanging block's off-plane
-    // rows / columns have no intra prediction to read; the §7.11.3.14
-    // blend is pointwise, so the kept samples are unaffected by the
-    // zero padding).
+    let n_samples = w * h;
+    let mut pred_out = PRED_U16_SCRATCH.with(|cell| {
+        let mut b = cell.borrow_mut();
+        if b.len() < n_samples {
+            b.resize(n_samples, 0);
+        }
+        std::mem::take(&mut *b)
+    });
     for i in 0..fit_h {
         let src = (py + i) * curr_stride + px;
         let dst = i * w;
@@ -5907,8 +6278,7 @@ pub fn reconstruct_inter_block_interintra(
         }
     };
 
-    // ---------- §7.11.3.1 steps 1-13 + §7.11.3.14 blend ----------
-    predict_inter(
+    let res = predict_inter(
         plane,
         x,
         y,
@@ -5929,19 +6299,20 @@ pub fn reconstruct_inter_block_interintra(
         wedge_params,
         warp,
         /* obmc */ None,
-        &mut pred_out,
-    )?;
+        &mut pred_out[..n_samples],
+    );
+    if let Err(e) = res {
+        PRED_U16_SCRATCH.with(|cell| *cell.borrow_mut() = pred_out);
+        return Err(e);
+    }
 
-    // ---------- §7.11.3.1 final step — CurrFrame[plane] stitch -----
-    //
-    // The §7.11.3.14 body wrote the blended `w × h` result into
-    // `pred_out`; copy it back into `curr_plane` at `(x, y)`.
     for i in 0..fit_h {
         let dst = (py + i) * curr_stride + px;
         let src = i * w;
         curr_plane[dst..dst + fit_w].copy_from_slice(&pred_out[src..src + fit_w]);
     }
 
+    PRED_U16_SCRATCH.with(|cell| *cell.borrow_mut() = pred_out);
     Ok(())
 }
 

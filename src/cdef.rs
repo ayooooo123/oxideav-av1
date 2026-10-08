@@ -165,6 +165,7 @@ const STEP_4: u32 = 2;
 /// `baseR/baseC = r & cdefMask4` anchors are snapped to this stride.
 const CDEF_SIZE_4: u32 = 16;
 /// `~(cdefSize4 - 1)` per §7.15.1.
+#[allow(dead_code)]
 const CDEF_MASK_4: u32 = !(CDEF_SIZE_4 - 1);
 
 /// §7.15 top-level driver — av1-spec p.319 lines 17601-17614.
@@ -186,17 +187,42 @@ pub fn cdef_frame(
         .num_planes
         .min(src_planes.len() as u8)
         .min(dst_planes.len() as u8);
-    let mut r = 0u32;
-    while r < ctx.mi_rows {
-        let mut c = 0u32;
-        while c < ctx.mi_cols {
-            let base_r = r & CDEF_MASK_4;
-            let base_c = c & CDEF_MASK_4;
-            let idx = (ctx.cdef_idx)(base_r, base_c);
-            cdef_block(ctx, src_planes, dst_planes, num_planes, r, c, idx);
-            c += STEP_4;
+    for p in 0..num_planes as usize {
+        let src = &src_planes[p];
+        let dst = &mut dst_planes[p];
+        let copy_len = (src.rows as usize * src.cols as usize)
+            .min(src.samples.len())
+            .min(dst.samples.len());
+        dst.samples[..copy_len].copy_from_slice(&src.samples[..copy_len]);
+    }
+    let mut sb_r = 0u32;
+    while sb_r < ctx.mi_rows {
+        let mut sb_c = 0u32;
+        while sb_c < ctx.mi_cols {
+            let idx = (ctx.cdef_idx)(sb_r, sb_c);
+            if idx >= 0 {
+                let max_r = (sb_r + CDEF_SIZE_4).min(ctx.mi_rows);
+                let max_c = (sb_c + CDEF_SIZE_4).min(ctx.mi_cols);
+                let mut r = sb_r;
+                while r < max_r {
+                    let mut c = sb_c;
+                    while c < max_c {
+                        let skip = (ctx.skip)(r, c)
+                            && (r + 1 >= ctx.mi_rows || (ctx.skip)(r + 1, c))
+                            && (c + 1 >= ctx.mi_cols || (ctx.skip)(r, c + 1))
+                            && (r + 1 >= ctx.mi_rows || c + 1 >= ctx.mi_cols || (ctx.skip)(r + 1, c + 1));
+                        if !skip {
+                            let dir = cdef_direction(ctx, src_planes, r, c);
+                            cdef_block_dir(ctx, src_planes, dst_planes, num_planes, r, c, idx, dir);
+                        }
+                        c += STEP_4;
+                    }
+                    r += STEP_4;
+                }
+            }
+            sb_c += CDEF_SIZE_4;
         }
-        r += STEP_4;
+        sb_r += CDEF_SIZE_4;
     }
 }
 
@@ -406,20 +432,43 @@ pub fn cdef_direction(
     let shift = ctx.bit_depth as i32 - 8;
     // av1-spec p.321 lines 17756-17768: per-pixel projection-sum
     // accumulator across the 8×8 luma block.
-    for i in 0..8i32 {
-        for j in 0..8i32 {
-            let sx = (x0 + j).clamp(0, plane0.cols as i32 - 1) as usize;
-            let sy = (y0 + i).clamp(0, plane0.rows as i32 - 1) as usize;
-            let raw = plane0.samples[sy * (plane0.cols as usize) + sx];
-            let x = (raw >> shift) - 128;
-            partial[0][(i + j) as usize] += x;
-            partial[1][(i + j / 2) as usize] += x;
-            partial[2][i as usize] += x;
-            partial[3][(3 + i - j / 2) as usize] += x;
-            partial[4][(7 + i - j) as usize] += x;
-            partial[5][(3 - i / 2 + j) as usize] += x;
-            partial[6][j as usize] += x;
-            partial[7][(i / 2 + j) as usize] += x;
+    let in_bounds = x0 >= 0 && x0 + 8 <= plane0.cols as i32 && y0 >= 0 && y0 + 8 <= plane0.rows as i32;
+    if in_bounds {
+        let stride = plane0.cols as usize;
+        let x0 = x0 as usize;
+        let y0 = y0 as usize;
+        for i in 0..8usize {
+            let row = &plane0.samples[(y0 + i) * stride + x0..][..8];
+            let i = i as i32;
+            for j in 0..8usize {
+                let x = (row[j] >> shift) - 128;
+                let j = j as i32;
+                partial[0][(i + j) as usize] += x;
+                partial[1][(i + j / 2) as usize] += x;
+                partial[2][i as usize] += x;
+                partial[3][(3 + i - j / 2) as usize] += x;
+                partial[4][(7 + i - j) as usize] += x;
+                partial[5][(3 - i / 2 + j) as usize] += x;
+                partial[6][j as usize] += x;
+                partial[7][(i / 2 + j) as usize] += x;
+            }
+        }
+    } else {
+        for i in 0..8i32 {
+            for j in 0..8i32 {
+                let sx = (x0 + j).clamp(0, plane0.cols as i32 - 1) as usize;
+                let sy = (y0 + i).clamp(0, plane0.rows as i32 - 1) as usize;
+                let raw = plane0.samples[sy * (plane0.cols as usize) + sx];
+                let x = (raw >> shift) - 128;
+                partial[0][(i + j) as usize] += x;
+                partial[1][(i + j / 2) as usize] += x;
+                partial[2][i as usize] += x;
+                partial[3][(3 + i - j / 2) as usize] += x;
+                partial[4][(7 + i - j) as usize] += x;
+                partial[5][(3 - i / 2 + j) as usize] += x;
+                partial[6][j as usize] += x;
+                partial[7][(i / 2 + j) as usize] += x;
+            }
         }
     }
     // av1-spec p.322 lines 17769-17774: directions 2 (vertical) and 6
@@ -555,51 +604,119 @@ pub fn cdef_filter_block(
     // the candidate position against `(0, 0)..(MiRows, MiCols)` in
     // 4×4 units. For the per-plane filter that's equivalent to
     // `(0, 0)..(plane_h, plane_w)` in samples after subsampling.
-    for i in 0..h {
-        let py = y0 + i;
-        if py < 0 || py >= plane_h {
-            continue;
-        }
-        for j in 0..w {
-            let px = x0 + j;
-            if px < 0 || px >= plane_w {
-                continue;
-            }
-            let x = src.samples[(py as usize) * src_cols + (px as usize)];
-            let mut sum = 0i32;
-            let mut max_v = x;
-            let mut min_v = x;
-            // av1-spec p.323-324 lines 17872-17891: primary +
-            // secondary tap accumulation over `k ∈ {0, 1}` × sign ∈
-            // {-1, +1}.
+    if pri_str == 0 && sec_str == 0 {
+        return;
+    }
+
+    let in_bounds = y0 >= 2 && y0 + h + 2 <= plane_h && x0 >= 2 && x0 + w + 2 <= plane_w;
+    if in_bounds {
+        let x0 = x0 as usize;
+        let y0 = y0 as usize;
+        let w = w as usize;
+        let h = h as usize;
+
+        let mut pri_offs = [(0isize, 0i32); 4];
+        if pri_str != 0 {
             for k in 0..2usize {
-                for sign in [-1i32, 1i32] {
-                    // Primary tap along `dir`.
-                    let (dy, dx) = (CDEF_DIRECTIONS[dir_p][k][0], CDEF_DIRECTIONS[dir_p][k][1]);
-                    let (ty, tx) = (py + sign * dy, px + sign * dx);
-                    if ty >= 0 && ty < plane_h && tx >= 0 && tx < plane_w {
-                        let p_val = src.samples[(ty as usize) * src_cols + (tx as usize)];
-                        sum += pri_taps[k] * constrain_adj(p_val - x, pri_str, pri_adj);
+                let dy = CDEF_DIRECTIONS[dir_p][k][0];
+                let dx = CDEF_DIRECTIONS[dir_p][k][1];
+                let off = (dy as isize) * (src_cols as isize) + (dx as isize);
+                pri_offs[k * 2] = (-off, pri_taps[k]);
+                pri_offs[k * 2 + 1] = (off, pri_taps[k]);
+            }
+        }
+
+        let mut sec_offs = [(0isize, 0i32); 8];
+        if sec_str != 0 {
+            let mut idx = 0;
+            for k in 0..2usize {
+                let tap = sec_taps[k];
+                for d2 in [dir_s0, dir_s1] {
+                    let dy = CDEF_DIRECTIONS[d2][k][0];
+                    let dx = CDEF_DIRECTIONS[d2][k][1];
+                    let off = (dy as isize) * (src_cols as isize) + (dx as isize);
+                    sec_offs[idx] = (-off, tap);
+                    sec_offs[idx + 1] = (off, tap);
+                    idx += 2;
+                }
+            }
+        }
+
+        for i in 0..h {
+            let py = y0 + i;
+            let src_row_base = py * src_cols + x0;
+            let dst_row_base = py * dst_cols + x0;
+            for j in 0..w {
+                let src_idx = src_row_base + j;
+                let x = src.samples[src_idx];
+                let mut sum = 0i32;
+                let mut max_v = x;
+                let mut min_v = x;
+
+                if pri_str != 0 {
+                    for &(off, tap) in &pri_offs {
+                        let p_val = src.samples[(src_idx as isize + off) as usize];
+                        sum += tap * constrain_adj(p_val - x, pri_str, pri_adj);
                         max_v = max_v.max(p_val);
                         min_v = min_v.min(p_val);
                     }
-                    // Secondary taps along `(dir ± 2) & 7`.
-                    for d2 in [dir_s0, dir_s1] {
-                        let (dy, dx) = (CDEF_DIRECTIONS[d2][k][0], CDEF_DIRECTIONS[d2][k][1]);
+                }
+
+                if sec_str != 0 {
+                    for &(off, tap) in &sec_offs {
+                        let s_val = src.samples[(src_idx as isize + off) as usize];
+                        sum += tap * constrain_adj(s_val - x, sec_str, sec_adj);
+                        max_v = max_v.max(s_val);
+                        min_v = min_v.min(s_val);
+                    }
+                }
+
+                let delta = (8 + sum - i32::from(sum < 0)) >> 4;
+                let out = clip3(min_v, max_v, x + delta);
+                dst.samples[dst_row_base + j] = out;
+            }
+        }
+    } else {
+        for i in 0..h {
+            let py = y0 + i;
+            if py < 0 || py >= plane_h {
+                continue;
+            }
+            for j in 0..w {
+                let px = x0 + j;
+                if px < 0 || px >= plane_w {
+                    continue;
+                }
+                let x = src.samples[(py as usize) * src_cols + (px as usize)];
+                let mut sum = 0i32;
+                let mut max_v = x;
+                let mut min_v = x;
+                for k in 0..2usize {
+                    for sign in [-1i32, 1i32] {
+                        let (dy, dx) = (CDEF_DIRECTIONS[dir_p][k][0], CDEF_DIRECTIONS[dir_p][k][1]);
                         let (ty, tx) = (py + sign * dy, px + sign * dx);
                         if ty >= 0 && ty < plane_h && tx >= 0 && tx < plane_w {
-                            let s_val = src.samples[(ty as usize) * src_cols + (tx as usize)];
-                            sum += sec_taps[k] * constrain_adj(s_val - x, sec_str, sec_adj);
-                            max_v = max_v.max(s_val);
-                            min_v = min_v.min(s_val);
+                            let p_val = src.samples[(ty as usize) * src_cols + (tx as usize)];
+                            sum += pri_taps[k] * constrain_adj(p_val - x, pri_str, pri_adj);
+                            max_v = max_v.max(p_val);
+                            min_v = min_v.min(p_val);
+                        }
+                        for d2 in [dir_s0, dir_s1] {
+                            let (dy, dx) = (CDEF_DIRECTIONS[d2][k][0], CDEF_DIRECTIONS[d2][k][1]);
+                            let (ty, tx) = (py + sign * dy, px + sign * dx);
+                            if ty >= 0 && ty < plane_h && tx >= 0 && tx < plane_w {
+                                let s_val = src.samples[(ty as usize) * src_cols + (tx as usize)];
+                                sum += sec_taps[k] * constrain_adj(s_val - x, sec_str, sec_adj);
+                                max_v = max_v.max(s_val);
+                                min_v = min_v.min(s_val);
+                            }
                         }
                     }
                 }
+                let delta = (8 + sum - i32::from(sum < 0)) >> 4;
+                let out = clip3(min_v, max_v, x + delta);
+                dst.samples[(py as usize) * dst_cols + (px as usize)] = out;
             }
-            // av1-spec p.324 line 17892.
-            let delta = (8 + sum - i32::from(sum < 0)) >> 4;
-            let out = clip3(min_v, max_v, x + delta);
-            dst.samples[(py as usize) * dst_cols + (px as usize)] = out;
         }
     }
 }
