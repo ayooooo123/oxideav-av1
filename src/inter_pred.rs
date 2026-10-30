@@ -1598,7 +1598,11 @@ fn predict_inter_per_ref(
     inter_round0: u32,
     inter_round1: u32,
 ) -> Result<Vec<i32>, crate::Error> {
-    let mut pred = vec![0i32; w * h];
+    let mut pred: Vec<i32> = Vec::new();
+    if pred.try_reserve_exact(w * h).is_err() {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    pred.resize(w * h, 0);
     predict_inter_per_ref_into(
         r,
         plane,
@@ -2631,10 +2635,13 @@ pub fn predict_inter(
     let mut pred0 = PRED_SCRATCH_0.with(|cell| {
         let mut b = cell.borrow_mut();
         if b.len() < n_samples {
+            let missing = n_samples - b.len();
+            b.try_reserve_exact(missing)
+                .map_err(|_| crate::Error::PartitionWalkOutOfRange)?;
             b.resize(n_samples, 0);
         }
-        std::mem::take(&mut *b)
-    });
+        Ok::<_, crate::Error>(std::mem::take(&mut *b))
+    })?;
 
     let res0 = predict_inter_one_ref_into(
         &refs[0],
@@ -2705,10 +2712,13 @@ pub fn predict_inter(
         let mut pred1 = PRED_SCRATCH_1.with(|cell| {
             let mut b = cell.borrow_mut();
             if b.len() < n_samples {
+                let missing = n_samples - b.len();
+                b.try_reserve_exact(missing)
+                    .map_err(|_| crate::Error::PartitionWalkOutOfRange)?;
                 b.resize(n_samples, 0);
             }
-            std::mem::take(&mut *b)
-        });
+            Ok::<_, crate::Error>(std::mem::take(&mut *b))
+        })?;
         let res1 = predict_inter_one_ref_into(
             &refs[1],
             /* ref_list */ 1,
