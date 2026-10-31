@@ -821,14 +821,25 @@ pub fn wide_filter(
     };
     let n2: i32 = if log2_size == 3 && plane == 0 { 0 } else { 1 };
     // av1-spec p.317 lines 17570-17578.
-    let mut f: Vec<i32> = vec![0; (2 * n) as usize];
+    let first = -(n + 1);
+    let count = (2 * n + 2) as usize;
+    let mut prefix = [0i64; 15];
+    for k in 0..count {
+        let p = first + k as i32;
+        prefix[k + 1] = prefix[k] + i64::from(plane_buf.get(y + p * dy, x + p * dx));
+    }
+    let left = prefix[1];
+    let right = prefix[count] - prefix[count - 1];
+    let mut f = [0i32; 12];
     for (idx, i) in (-n..n).enumerate() {
-        let mut t: i64 = 0;
-        for j in -n..=n {
-            let p = clip3_i32(-(n + 1), n, i + j);
-            let tap: i64 = if j.unsigned_abs() as i32 <= n2 { 2 } else { 1 };
-            t += plane_buf.get(y + p * dy, x + p * dx) as i64 * tap;
-        }
+        let lo = i - n;
+        let hi = i + n;
+        let a = lo.max(first);
+        let b = hi.min(n);
+        let mut t = prefix[(b - first + 1) as usize] - prefix[(a - first) as usize];
+        t += left * i64::from((first - lo).max(0));
+        t += right * i64::from((hi - n).max(0));
+        t += prefix[(i + n2 - first + 1) as usize] - prefix[(i - n2 - first) as usize];
         f[idx] = round2_i64(t, log2_size) as i32;
     }
     for (idx, i) in (-n..n).enumerate() {
@@ -925,6 +936,43 @@ fn filter4_clamp(value: i32, bit_depth: u8) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wide_filter_matches_direct_spec_taps() {
+        for bit_depth in [8u8, 10, 12] {
+            let mask = (1i32 << bit_depth) - 1;
+            let source: Vec<i32> = (0..20 * 19).map(|i| (i * 197 + i / 20 * 73) & mask).collect();
+            for plane in 0..3u8 {
+                for log2_size in [3u32, 4] {
+                    for (dx, dy) in [(1, 0), (0, 1)] {
+                        for (x, y) in [(0, 0), (1, 1), (10, 9), (19, 18)] {
+                            let mut expected = source.clone();
+                            let mut reference = PlaneBuffer { rows: 19, cols: 20, samples: &mut expected };
+                            let n = if log2_size == 4 { 6 } else if plane == 0 { 3 } else { 2 };
+                            let n2 = if log2_size == 3 && plane == 0 { 0 } else { 1 };
+                            let mut out = Vec::new();
+                            for i in -n..n {
+                                let mut sum = 0i64;
+                                for j in -n..=n {
+                                    let p = (i + j).clamp(-(n + 1), n);
+                                    let tap = if j >= -n2 && j <= n2 { 2 } else { 1 };
+                                    sum += i64::from(reference.get(y + p * dy, x + p * dx)) * tap;
+                                }
+                                out.push(round2_i64(sum, log2_size) as i32);
+                            }
+                            for (k, i) in (-n..n).enumerate() {
+                                reference.set(y + i * dy, x + i * dx, out[k]);
+                            }
+                            let mut actual = source.clone();
+                            let mut buffer = PlaneBuffer { rows: 19, cols: 20, samples: &mut actual };
+                            wide_filter(&mut buffer, x, y, plane, dx, dy, log2_size, bit_depth);
+                            assert_eq!(actual, expected);
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[allow(clippy::too_many_arguments)]
     fn make_ctx<'a>(

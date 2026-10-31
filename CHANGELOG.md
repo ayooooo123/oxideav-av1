@@ -18,6 +18,8 @@ All notable changes to `oxideav-av1` are recorded here.
 - Interior CDEF filtering accumulates taps over fixed-width contiguous rows;
   direction search shares adjacent-pixel sums for oblique projections. Boundary
   filtering and all constrain/clipping arithmetic remain exact.
+- Wide deblocking uses one gathered tap window and exact prefix sums instead of
+  refetching overlapping taps; its output staging uses a fixed stack array.
 
 ### Added
 
