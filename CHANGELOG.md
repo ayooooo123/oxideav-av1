@@ -6,6 +6,11 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Changed
 
+- Deblocking and CDEF plane views are monomorphized over clipped sample storage.
+  Scalar arithmetic retains the specification's signed widths; CDEF NEON loads
+  and stores native `u8`/`u16` rows without an `i32` conversion buffer. Differential
+  tests compare native storage with the original `i32` arithmetic at 8/10/12 bits.
+  Decoder reconstruction still uses its original storage during this first step.
 - AArch64 inverse transforms batch four rows and columns using explicit NEON
   DCT, ADST, and identity passes. Widened products, stage precision clamps,
   rectangular scaling, and both rounding stages remain bit-exact; lossless

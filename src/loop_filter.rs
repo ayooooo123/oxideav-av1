@@ -110,22 +110,60 @@ pub const SEG_LVL_ALT_LF_Y_V: usize = 1;
 // §7.14.1 / §7.14.2 — public top-level surface.
 // =====================================================================
 
+mod pixel_sealed {
+    pub trait Sealed {}
+    impl Sealed for u8 {}
+    impl Sealed for u16 {}
+    impl Sealed for i32 {}
+}
+
+/// Compile-time storage representation for clipped AV1 samples.
+///
+/// Arithmetic widens explicitly; narrowing is only valid after the caller's
+/// specification-defined clipping operation.
+pub trait Pixel: pixel_sealed::Sealed + Copy + Default + Send + Sync + std::fmt::Debug + PartialEq + 'static {
+    fn to_i32(self) -> i32;
+    fn from_i32(value: i32) -> Self;
+}
+
+impl Pixel for u8 {
+    #[inline(always)]
+    fn to_i32(self) -> i32 { self as i32 }
+    #[inline(always)]
+    fn from_i32(value: i32) -> Self { value as u8 }
+}
+
+impl Pixel for u16 {
+    #[inline(always)]
+    fn to_i32(self) -> i32 { self as i32 }
+    #[inline(always)]
+    fn from_i32(value: i32) -> Self { value as u16 }
+}
+
+// Retained while the reconstruction and encoder callers migrate.
+impl Pixel for i32 {
+    #[inline(always)]
+    fn to_i32(self) -> i32 { self }
+    #[inline(always)]
+    fn from_i32(value: i32) -> Self { value }
+}
+
 /// Mutable view of a single plane's `CurrFrame[plane]` sample buffer.
 ///
 /// The `samples` slice is row-major `rows * cols` `i32` post-`Clip1`
 /// per av1-spec §7.12.3 step-3 — same shape produced by
 /// [`crate::PartitionWalker`] for the lazy per-plane buffers.
 #[derive(Debug)]
-pub struct PlaneBuffer<'a> {
+pub struct PlaneBuffer<'a, P: Pixel = i32> {
     /// Per-plane row count: `(mi_rows * MI_SIZE) >> sub_y`.
     pub rows: u32,
     /// Per-plane column count: `(mi_cols * MI_SIZE) >> sub_x`.
     pub cols: u32,
     /// `rows * cols` row-major sample buffer.
-    pub samples: &'a mut [i32],
+    pub samples: &'a mut [P],
 }
 
-impl PlaneBuffer<'_> {
+impl<P: Pixel> PlaneBuffer<'_, P> {
     /// Bounds-checked load — returns `0` for out-of-bounds reads. The
     /// §7.14.6 filter mask process never indexes outside the on-screen
     /// region (the §7.14.2 `onScreen` gate prevents it), but a few
@@ -137,7 +175,7 @@ impl PlaneBuffer<'_> {
     fn get(&self, y: i32, x: i32) -> i32 {
         let yc = y.clamp(0, self.rows as i32 - 1) as usize;
         let xc = x.clamp(0, self.cols as i32 - 1) as usize;
-        self.samples[yc * (self.cols as usize) + xc]
+        self.samples[yc * (self.cols as usize) + xc].to_i32()
     }
 
     /// Bounds-checked store — silently drops out-of-bounds writes.
@@ -154,7 +192,7 @@ impl PlaneBuffer<'_> {
             return;
         }
         let idx = (y as usize) * (self.cols as usize) + (x as usize);
-        self.samples[idx] = v;
+        self.samples[idx] = P::from_i32(v);
     }
 }
 
@@ -268,7 +306,7 @@ impl std::fmt::Debug for LoopFilterFrameContext<'_> {
 /// actually move.
 ///
 /// Modifies the per-plane buffers in place.
-pub fn loop_filter_frame(ctx: &LoopFilterFrameContext<'_>, planes: &mut [PlaneBuffer<'_>]) {
+pub fn loop_filter_frame<P: Pixel>(ctx: &LoopFilterFrameContext<'_>, planes: &mut [PlaneBuffer<'_, P>]) {
     loop_filter_rows(ctx, planes, 0, ctx.mi_rows);
 }
 
@@ -277,9 +315,9 @@ pub fn loop_filter_frame(ctx: &LoopFilterFrameContext<'_>, planes: &mut [PlaneBu
 /// the whole range this IS the frame process; on a band it is the
 /// encoder's level-election probe (the band's first horizontal edge
 /// reads samples above the band as the band left them).
-pub fn loop_filter_rows(
+pub fn loop_filter_rows<P: Pixel>(
     ctx: &LoopFilterFrameContext<'_>,
-    planes: &mut [PlaneBuffer<'_>],
+    planes: &mut [PlaneBuffer<'_, P>],
     mi_row_start: u32,
     mi_row_end: u32,
 ) {
@@ -309,13 +347,13 @@ pub fn loop_filter_rows(
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn split_row_bands<'a>(
-    planes: &'a mut [PlaneBuffer<'_>],
+pub(crate) fn split_row_bands<'a, P: Pixel>(
+    planes: &'a mut [PlaneBuffer<'_, P>],
     luma_rows: u32,
     subsampling_y: u8,
-) -> Vec<Vec<PlaneBuffer<'a>>> {
+) -> Vec<Vec<PlaneBuffer<'a, P>>> {
     let count = planes[0].rows.div_ceil(luma_rows) as usize;
-    let mut bands: Vec<Vec<PlaneBuffer<'a>>> = (0..count).map(|_| Vec::with_capacity(planes.len())).collect();
+    let mut bands: Vec<Vec<PlaneBuffer<'a, P>>> = (0..count).map(|_| Vec::with_capacity(planes.len())).collect();
     for (p, plane) in planes.iter_mut().enumerate() {
         let rows = luma_rows >> if p == 0 { 0 } else { subsampling_y };
         let cols = plane.cols;
@@ -326,9 +364,9 @@ pub(crate) fn split_row_bands<'a>(
     bands
 }
 
-pub(crate) fn loop_filter_frame_with_workers(
+pub(crate) fn loop_filter_frame_with_workers<P: Pixel>(
     ctx: &LoopFilterFrameContext<'_>,
-    planes: &mut [PlaneBuffer<'_>],
+    planes: &mut [PlaneBuffer<'_, P>],
     workers: usize,
 ) {
     #[cfg(not(target_arch = "wasm32"))]
@@ -385,9 +423,9 @@ pub(crate) fn loop_filter_frame_with_workers(
 /// boundaries (filtering horizontally), `1` for horizontal boundaries
 /// (filtering vertically). `row` and `col` are in 4×4-block luma
 /// coordinates.
-pub fn loop_filter_edge(
+pub fn loop_filter_edge<P: Pixel>(
     ctx: &LoopFilterFrameContext<'_>,
-    planes: &mut [PlaneBuffer<'_>],
+    planes: &mut [PlaneBuffer<'_, P>],
     plane: u8,
     pass: u8,
     row: u32,
@@ -398,9 +436,9 @@ pub fn loop_filter_edge(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn loop_filter_edge_at(
+fn loop_filter_edge_at<P: Pixel>(
     ctx: &LoopFilterFrameContext<'_>,
-    plane_buf: &mut PlaneBuffer<'_>,
+    plane_buf: &mut PlaneBuffer<'_, P>,
     plane: u8,
     pass: u8,
     row: u32,
@@ -676,8 +714,8 @@ pub fn adaptive_filter_strength_selection(
 /// [`narrow_filter`] or [`wide_filter`] per the resulting masks and
 /// `filter_size`.
 #[allow(clippy::too_many_arguments)]
-pub fn sample_filtering(
-    plane_buf: &mut PlaneBuffer<'_>,
+pub fn sample_filtering<P: Pixel>(
+    plane_buf: &mut PlaneBuffer<'_, P>,
     x: i32,
     y: i32,
     plane: u8,
@@ -737,8 +775,8 @@ pub struct FilterMaskOutput {
 /// from samples around `(x, y)` on `plane`. av1-spec p.314-315.
 #[allow(clippy::too_many_arguments)]
 #[must_use]
-pub fn filter_mask(
-    plane_buf: &PlaneBuffer<'_>,
+pub fn filter_mask<P: Pixel>(
+    plane_buf: &PlaneBuffer<'_, P>,
     x: i32,
     y: i32,
     plane: u8,
@@ -837,8 +875,8 @@ pub fn filter_mask(
 /// §7.14.6.3 — Modify up to two samples each side of the boundary at
 /// `(x, y)`. `hev_mask == false` widens the modify window from one
 /// to two on each side.
-pub fn narrow_filter(
-    plane_buf: &mut PlaneBuffer<'_>,
+pub fn narrow_filter<P: Pixel>(
+    plane_buf: &mut PlaneBuffer<'_, P>,
     x: i32,
     y: i32,
     dx: i32,
@@ -883,8 +921,8 @@ pub fn narrow_filter(
 /// §7.14.6.4 — Apply the 6/8/14-tap low-pass filter centred at the
 /// boundary. `log2_size ∈ {3, 4}`.
 #[allow(clippy::too_many_arguments)]
-pub fn wide_filter(
-    plane_buf: &mut PlaneBuffer<'_>,
+pub fn wide_filter<P: Pixel>(
+    plane_buf: &mut PlaneBuffer<'_, P>,
     x: i32,
     y: i32,
     plane: u8,
@@ -1018,6 +1056,38 @@ fn filter4_clamp(value: i32, bit_depth: u8) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_deblock_matches_i32_arithmetic_at_all_depths() {
+        fn check<P: Pixel>(depth: u8) {
+            for case in 0..32 {
+                let max = (1i32 << depth) - 1;
+                let source: Vec<i32> = (0..32 * 32).map(|i| {
+                    if case < 16 {
+                        ((max / 2) + ((i / 32 + i % 32) % 7 - 3) * case).clamp(0, max)
+                    } else { (i * 197 + i / 32 * 73 + case * 91) & max }
+                }).collect();
+                for (dx, dy) in [(1, 0), (0, 1)] {
+                    for size in [4, 8, 16] {
+                        for plane in 0..3 {
+                            let mut expected = source.clone();
+                            let mut actual: Vec<P> = source.iter().map(|&v| P::from_i32(v)).collect();
+                            let mut old = PlaneBuffer { rows: 32, cols: 32, samples: &mut expected };
+                            let mut native = PlaneBuffer { rows: 32, cols: 32, samples: &mut actual };
+                            sample_filtering(&mut old, 16, 16, plane, 32, 64, 8, dx, dy, size, depth);
+                            sample_filtering(&mut native, 16, 16, plane, 32, 64, 8, dx, dy, size, depth);
+                            assert!(actual.iter().zip(&expected).all(|(&a, &b)| a.to_i32() == b),
+                                "depth={depth} case={case} size={size} plane={plane}");
+                        }
+                    }
+                }
+            }
+        }
+        check::<u8>(8);
+        check::<u16>(8);
+        check::<u16>(10);
+        check::<u16>(12);
+    }
 
     #[test]
     fn threaded_deblock_axes_match_serial_across_formats() {

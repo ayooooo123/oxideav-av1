@@ -3,14 +3,27 @@
 //! bounded by 24 * 240 = 5760 at 12-bit depth. No saturating arithmetic
 //! changes the specification's result.
 use core::arch::aarch64::*;
+use crate::loop_filter::Pixel;
 
 #[inline(always)]
-unsafe fn load<const W: usize>(p: *const i32) -> int16x8_t {
-    // SAFETY: the block wrapper proves W readable samples at every tap.
+unsafe fn load<const W: usize, P: Pixel>(p: *const P) -> int16x8_t {
+    // SAFETY: Pixel is sealed to u8/u16/i32 and the wrapper proves W
+    // readable samples. Four-byte loads avoid overreading chroma rows.
     unsafe {
-        let lo = vmovn_s32(vld1q_s32(p));
-        let hi = if W == 8 { vmovn_s32(vld1q_s32(p.add(4))) } else { vdup_n_s16(0) };
-        vcombine_s16(lo, hi)
+        if core::mem::size_of::<P>() == 1 {
+            let bytes = if W == 8 { vld1_u8(p.cast()) } else {
+                vreinterpret_u8_u32(vld1_lane_u32::<0>(p.cast(), vdup_n_u32(0)))
+            };
+            vreinterpretq_s16_u16(vmovl_u8(bytes))
+        } else if core::mem::size_of::<P>() == 2 {
+            if W == 8 { vreinterpretq_s16_u16(vld1q_u16(p.cast())) }
+            else { vcombine_s16(vreinterpret_s16_u16(vld1_u16(p.cast())), vdup_n_s16(0)) }
+        } else {
+            let p = p.cast::<i32>();
+            let lo = vmovn_s32(vld1q_s32(p));
+            let hi = if W == 8 { vmovn_s32(vld1q_s32(p.add(4))) } else { vdup_n_s16(0) };
+            vcombine_s16(lo, hi)
+        }
     }
 }
 
@@ -26,8 +39,8 @@ unsafe fn constrained(d: int16x8_t, strength: int16x8_t, shift: int16x8_t) -> in
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn filter<const W: usize>(
-    src: &[i32], base: usize, src_stride: usize, dst: &mut [i32], dst_stride: usize,
+pub(super) fn filter<const W: usize, P: Pixel>(
+    src: &[P], base: usize, src_stride: usize, dst: &mut [P], dst_stride: usize,
     height: usize, pri: &[(isize, i32); 4], sec: &[(isize, i32); 8],
     pri_strength: i32, sec_strength: i32, pri_shift: i32, sec_shift: i32,
 ) {
@@ -52,13 +65,13 @@ pub(super) fn filter<const W: usize>(
         let sshift = vdupq_n_s16(-(sec_shift.min(16) as i16));
         for y in 0..height {
             let row = src.as_ptr().add(base + y * src_stride);
-            let center = load::<W>(row);
+            let center = load::<W, P>(row);
             let mut min = center;
             let mut max = center;
             let mut sum = vdupq_n_s16(0);
             if pri_strength != 0 {
                 for &(off, tap) in pri {
-                    let value = load::<W>(row.offset(off));
+                    let value = load::<W, P>(row.offset(off));
                     min = vminq_s16(min, value);
                     max = vmaxq_s16(max, value);
                     sum = vmlaq_n_s16(sum, constrained(vsubq_s16(value, center), ps, pshift), tap as i16);
@@ -66,7 +79,7 @@ pub(super) fn filter<const W: usize>(
             }
             if sec_strength != 0 {
                 for &(off, tap) in sec {
-                    let value = load::<W>(row.offset(off));
+                    let value = load::<W, P>(row.offset(off));
                     min = vminq_s16(min, value);
                     max = vmaxq_s16(max, value);
                     sum = vmlaq_n_s16(sum, constrained(vsubq_s16(value, center), ss, sshift), tap as i16);
@@ -76,13 +89,22 @@ pub(super) fn filter<const W: usize>(
             let delta = vshrq_n_s16::<4>(vaddq_s16(vaddq_s16(sum, vdupq_n_s16(8)), negative));
             let out = vminq_s16(max, vmaxq_s16(min, vaddq_s16(center, delta)));
             let target = dst.as_mut_ptr().add(y * dst_stride);
-            vst1q_s32(target, vmovl_s16(vget_low_s16(out)));
-            if W == 8 { vst1q_s32(target.add(4), vmovl_s16(vget_high_s16(out))); }
+            if core::mem::size_of::<P>() == 1 {
+                let bytes = vmovn_u16(vreinterpretq_u16_s16(out));
+                if W == 8 { vst1_u8(target.cast(), bytes); }
+                else { vst1_lane_u32::<0>(target.cast(), vreinterpret_u32_u8(bytes)); }
+            } else if core::mem::size_of::<P>() == 2 {
+                if W == 8 { vst1q_s16(target.cast(), out); }
+                else { vst1_s16(target.cast(), vget_low_s16(out)); }
+            } else {
+                vst1q_s32(target.cast(), vmovl_s16(vget_low_s16(out)));
+                if W == 8 { vst1q_s32(target.cast::<i32>().add(4), vmovl_s16(vget_high_s16(out))); }
+            }
         }
     }
 }
 
-pub(super) fn partial(src: &[i32], base: usize, stride: usize, shift: i32) -> [[i32; 15]; 8] {
+pub(super) fn partial<P: Pixel>(src: &[P], base: usize, stride: usize, shift: i32) -> [[i32; 15]; 8] {
     assert!(base + 7 * stride + 8 <= src.len());
     let mut partial = [[0i16; 16]; 8];
     // SAFETY: the eight complete source rows were checked above. Every
@@ -91,7 +113,7 @@ pub(super) fn partial(src: &[i32], base: usize, stride: usize, shift: i32) -> [[
     // eight normalized samples (-1024..1016), exactly representable in i16.
     unsafe {
         for i in 0..8 {
-            let values = vsubq_s16(vshlq_s16(load::<8>(src.as_ptr().add(base + i * stride)),
+            let values = vsubq_s16(vshlq_s16(load::<8, P>(src.as_ptr().add(base + i * stride)),
                 vdupq_n_s16(-(shift as i16))), vdupq_n_s16(128));
             let reverse = vextq_s16::<4>(vrev64q_s16(values), vrev64q_s16(values));
             for (dir, offset, v) in [(0, i, values), (4, i, reverse),
@@ -151,8 +173,27 @@ mod tests {
                 }
                 assert_eq!(partial(&src, base, stride, depth - 8), expected,
                     "depth={depth} case={case}");
+                let native16 = src.map(|v| v as u16);
+                assert_eq!(partial(&native16, base, stride, depth - 8), expected);
+                if depth == 8 {
+                    let native8 = src.map(|v| v as u8);
+                    assert_eq!(partial(&native8, base, stride, 0), expected);
+                }
             }
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn native_filter_matches<const W: usize, P: Pixel>(
+        source: &[i32], expected: &[i32], base: usize, stride: usize, height: usize,
+        pri: &[(isize, i32); 4], sec: &[(isize, i32); 8],
+        strength: i32, secondary: i32, adj: i32,
+    ) {
+        let source: Vec<P> = source.iter().map(|&v| P::from_i32(v)).collect();
+        let mut actual = vec![P::from_i32(0x123456); expected.len()];
+        filter::<W, P>(&source, base, stride, &mut actual, stride, height,
+            pri, sec, strength, secondary, adj, adj);
+        assert!(actual.iter().zip(expected).all(|(&a, &b)| a == P::from_i32(b)));
     }
 
     fn filter_cases<const W: usize>() {
@@ -196,14 +237,20 @@ mod tests {
                                 let mut expected = [0x123456; STRIDE * 8];
                                 let mut actual = expected;
                                 for y in 0..height {
-                                    cdef_interior_row::<W>(&src, BASE + y * STRIDE,
+                                    cdef_interior_row::<W, i32>(&src, BASE + y * STRIDE,
                                         (&mut expected[y * STRIDE..y * STRIDE + W]).try_into().unwrap(),
                                         &pri, &sec, strength as i32 * scale, secondary * scale, adj, adj);
                                 }
-                                filter::<W>(&src, BASE, STRIDE, &mut actual, STRIDE, height,
+                                filter::<W, i32>(&src, BASE, STRIDE, &mut actual, STRIDE, height,
                                     &pri, &sec, strength as i32 * scale, secondary * scale, adj, adj);
                                 assert_eq!(actual, expected,
                                     "W={W} depth={depth} direction={dir} strength={strength} secondary={secondary} adj={adj} case={case}");
+                                native_filter_matches::<W, u16>(&src, &expected, BASE, STRIDE, height,
+                                    &pri, &sec, strength as i32 * scale, secondary * scale, adj);
+                                if depth == 8 {
+                                    native_filter_matches::<W, u8>(&src, &expected, BASE, STRIDE, height,
+                                        &pri, &sec, strength as i32 * scale, secondary * scale, adj);
+                                }
                             }
                         }
                     }

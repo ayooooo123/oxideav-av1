@@ -53,7 +53,7 @@
 //!   reference loop here mirrors the spec's per-sample formulation.
 
 use crate::cdf::{MI_SIZE, MI_SIZE_LOG2};
-use crate::loop_filter::PlaneBuffer;
+use crate::loop_filter::{Pixel, PlaneBuffer};
 use crate::uncompressed_header_tail::CdefParams;
 
 #[cfg(target_arch = "aarch64")]
@@ -181,18 +181,18 @@ const CDEF_MASK_4: u32 = !(CDEF_SIZE_4 - 1);
 /// `dst_planes` is `CdefFrame[plane]` (written in place). Both have
 /// the same `(rows, cols)` shape per the spec's `CdefFrame =
 /// CurrFrame.clone(); ...` initialisation.
-pub fn cdef_frame(
+pub fn cdef_frame<P: Pixel>(
     ctx: &CdefFrameContext<'_>,
-    src_planes: &[PlaneBuffer<'_>],
-    dst_planes: &mut [PlaneBuffer<'_>],
+    src_planes: &[PlaneBuffer<'_, P>],
+    dst_planes: &mut [PlaneBuffer<'_, P>],
 ) {
     cdef_frame_rows(ctx, src_planes, dst_planes, 0, ctx.mi_rows);
 }
 
-fn cdef_frame_rows(
+fn cdef_frame_rows<P: Pixel>(
     ctx: &CdefFrameContext<'_>,
-    src_planes: &[PlaneBuffer<'_>],
-    dst_planes: &mut [PlaneBuffer<'_>],
+    src_planes: &[PlaneBuffer<'_, P>],
+    dst_planes: &mut [PlaneBuffer<'_, P>],
     mi_row_start: u32,
     mi_row_end: u32,
 ) {
@@ -240,10 +240,10 @@ fn cdef_frame_rows(
     }
 }
 
-pub(crate) fn cdef_frame_with_workers(
+pub(crate) fn cdef_frame_with_workers<P: Pixel>(
     ctx: &CdefFrameContext<'_>,
-    src_planes: &[PlaneBuffer<'_>],
-    dst_planes: &mut [PlaneBuffer<'_>],
+    src_planes: &[PlaneBuffer<'_, P>],
+    dst_planes: &mut [PlaneBuffer<'_, P>],
     workers: usize,
 ) {
     #[cfg(not(target_arch = "wasm32"))]
@@ -281,10 +281,10 @@ pub(crate) fn cdef_frame_with_workers(
 /// `(r, c)` is in 4×4-block luma coordinates; the block spans
 /// `(r..r+2, c..c+2)` (4×4 cells) and `(r*MI_SIZE..r*MI_SIZE+8,
 /// c*MI_SIZE..c*MI_SIZE+8)` (luma samples).
-pub fn cdef_block(
+pub fn cdef_block<P: Pixel>(
     ctx: &CdefFrameContext<'_>,
-    src_planes: &[PlaneBuffer<'_>],
-    dst_planes: &mut [PlaneBuffer<'_>],
+    src_planes: &[PlaneBuffer<'_, P>],
+    dst_planes: &mut [PlaneBuffer<'_, P>],
     num_planes: u8,
     r: u32,
     c: u32,
@@ -338,10 +338,10 @@ pub fn cdef_block(
 /// Runs no copy and no skip test — the caller has already established
 /// the block is filtered (`idx >= 0`, not all-skip).
 #[allow(clippy::too_many_arguments)]
-pub fn cdef_block_dir(
+pub fn cdef_block_dir<P: Pixel>(
     ctx: &CdefFrameContext<'_>,
-    src_planes: &[PlaneBuffer<'_>],
-    dst_planes: &mut [PlaneBuffer<'_>],
+    src_planes: &[PlaneBuffer<'_, P>],
+    dst_planes: &mut [PlaneBuffer<'_, P>],
     num_planes: u8,
     r: u32,
     c: u32,
@@ -352,10 +352,10 @@ pub fn cdef_block_dir(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn cdef_block_dir_at(
+fn cdef_block_dir_at<P: Pixel>(
     ctx: &CdefFrameContext<'_>,
-    src_planes: &[PlaneBuffer<'_>],
-    dst_planes: &mut [PlaneBuffer<'_>],
+    src_planes: &[PlaneBuffer<'_, P>],
+    dst_planes: &mut [PlaneBuffer<'_, P>],
     num_planes: u8,
     r: u32,
     c: u32,
@@ -422,9 +422,9 @@ fn cdef_block_dir_at(
 /// §7.15.1 copy-loop helper — av1-spec p.319 lines 17631-17651.
 /// Copies the 8×8 (post-subsampling) block from `src_planes[plane]`
 /// into `dst_planes[plane]`.
-fn cdef_copy_plane(
-    src_planes: &[PlaneBuffer<'_>],
-    dst_planes: &mut [PlaneBuffer<'_>],
+fn cdef_copy_plane<P: Pixel>(
+    src_planes: &[PlaneBuffer<'_, P>],
+    dst_planes: &mut [PlaneBuffer<'_, P>],
     plane: u8,
     r: u32,
     c: u32,
@@ -468,18 +468,18 @@ fn cdef_copy_plane(
 ///   [`CDEF_DIRECTIONS`]).
 /// * `var` — `(bestCost - cost[(yDir + 4) & 7]) >> 10`, a measure of
 ///   direction confidence consumed by §7.15.1 line 17683.
-pub fn cdef_direction(
+pub fn cdef_direction<P: Pixel>(
     ctx: &CdefFrameContext<'_>,
-    src_planes: &[PlaneBuffer<'_>],
+    src_planes: &[PlaneBuffer<'_, P>],
     r: u32,
     c: u32,
 ) -> (i32, i32) {
     cdef_direction_impl(ctx, src_planes, r, c, cfg!(target_arch = "aarch64"))
 }
 
-fn cdef_direction_impl(
+fn cdef_direction_impl<P: Pixel>(
     ctx: &CdefFrameContext<'_>,
-    src_planes: &[PlaneBuffer<'_>],
+    src_planes: &[PlaneBuffer<'_, P>],
     r: u32,
     c: u32,
     simd: bool,
@@ -508,7 +508,7 @@ fn cdef_direction_impl(
         let y0 = y0 as usize;
         for i in 0..8usize {
             let row = &plane0.samples[(y0 + i) * stride + x0..][..8];
-            let values: [i32; 8] = core::array::from_fn(|j| (row[j] >> shift) - 128);
+            let values: [i32; 8] = core::array::from_fn(|j| (row[j].to_i32() >> shift) - 128);
             let mut row_sum = 0;
             for j in 0..8usize {
                 let x = values[j];
@@ -531,7 +531,7 @@ fn cdef_direction_impl(
             for j in 0..8i32 {
                 let sx = (x0 + j).clamp(0, plane0.cols as i32 - 1) as usize;
                 let sy = (y0 + i).clamp(0, plane0.rows as i32 - 1) as usize;
-                let raw = plane0.samples[sy * (plane0.cols as usize) + sx];
+                let raw = plane0.samples[sy * (plane0.cols as usize) + sx].to_i32();
                 let x = (raw >> shift) - 128;
                 partial[0][(i + j) as usize] += x;
                 partial[1][(i + j / 2) as usize] += x;
@@ -609,10 +609,10 @@ fn cdef_direction_impl(
 /// `min` / `max` track the min/max of the neighbour samples actually
 /// consulted.
 #[allow(clippy::too_many_arguments)]
-pub fn cdef_filter_block(
+pub fn cdef_filter_block<P: Pixel>(
     ctx: &CdefFrameContext<'_>,
-    src_planes: &[PlaneBuffer<'_>],
-    dst_planes: &mut [PlaneBuffer<'_>],
+    src_planes: &[PlaneBuffer<'_, P>],
+    dst_planes: &mut [PlaneBuffer<'_, P>],
     plane: u8,
     r: u32,
     c: u32,
@@ -625,10 +625,10 @@ pub fn cdef_filter_block(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn cdef_filter_block_at(
+fn cdef_filter_block_at<P: Pixel>(
     ctx: &CdefFrameContext<'_>,
-    src_planes: &[PlaneBuffer<'_>],
-    dst_planes: &mut [PlaneBuffer<'_>],
+    src_planes: &[PlaneBuffer<'_, P>],
+    dst_planes: &mut [PlaneBuffer<'_, P>],
     plane: u8,
     r: u32,
     c: u32,
@@ -738,10 +738,10 @@ fn cdef_filter_block_at(
             let base = y0 * src_cols + x0;
             let target = &mut dst.samples[(y0 - dst_y0) * dst_cols + x0..];
             if w == 8 {
-                neon::filter::<8>(src.samples, base, src_cols, target, dst_cols, h,
+                neon::filter::<8, P>(src.samples, base, src_cols, target, dst_cols, h,
                     &pri_offs, &sec_offs, pri_str, sec_str, pri_adj, sec_adj);
             } else {
-                neon::filter::<4>(src.samples, base, src_cols, target, dst_cols, h,
+                neon::filter::<4, P>(src.samples, base, src_cols, target, dst_cols, h,
                     &pri_offs, &sec_offs, pri_str, sec_str, pri_adj, sec_adj);
             }
         }
@@ -753,12 +753,12 @@ fn cdef_filter_block_at(
             let dst_row_base = (py - dst_y0) * dst_cols + x0;
             let dst_row = &mut dst.samples[dst_row_base..dst_row_base + w];
             if w == 8 {
-                cdef_interior_row::<8>(
+                cdef_interior_row::<8, P>(
                     src.samples, src_row_base, dst_row.try_into().unwrap(),
                     &pri_offs, &sec_offs, pri_str, sec_str, pri_adj, sec_adj,
                 );
             } else {
-                cdef_interior_row::<4>(
+                cdef_interior_row::<4, P>(
                     src.samples, src_row_base, dst_row.try_into().unwrap(),
                     &pri_offs, &sec_offs, pri_str, sec_str, pri_adj, sec_adj,
                 );
@@ -775,7 +775,7 @@ fn cdef_filter_block_at(
                 if px < 0 || px >= plane_w {
                     continue;
                 }
-                let x = src.samples[(py as usize) * src_cols + (px as usize)];
+                let x = src.samples[(py as usize) * src_cols + (px as usize)].to_i32();
                 let mut sum = 0i32;
                 let mut max_v = x;
                 let mut min_v = x;
@@ -784,7 +784,7 @@ fn cdef_filter_block_at(
                         let (dy, dx) = (CDEF_DIRECTIONS[dir_p][k][0], CDEF_DIRECTIONS[dir_p][k][1]);
                         let (ty, tx) = (py + sign * dy, px + sign * dx);
                         if ty >= 0 && ty < plane_h && tx >= 0 && tx < plane_w {
-                            let p_val = src.samples[(ty as usize) * src_cols + (tx as usize)];
+                            let p_val = src.samples[(ty as usize) * src_cols + (tx as usize)].to_i32();
                             sum += pri_taps[k] * constrain_adj(p_val - x, pri_str, pri_adj);
                             max_v = max_v.max(p_val);
                             min_v = min_v.min(p_val);
@@ -793,7 +793,7 @@ fn cdef_filter_block_at(
                             let (dy, dx) = (CDEF_DIRECTIONS[d2][k][0], CDEF_DIRECTIONS[d2][k][1]);
                             let (ty, tx) = (py + sign * dy, px + sign * dx);
                             if ty >= 0 && ty < plane_h && tx >= 0 && tx < plane_w {
-                                let s_val = src.samples[(ty as usize) * src_cols + (tx as usize)];
+                                let s_val = src.samples[(ty as usize) * src_cols + (tx as usize)].to_i32();
                                 sum += sec_taps[k] * constrain_adj(s_val - x, sec_str, sec_adj);
                                 max_v = max_v.max(s_val);
                                 min_v = min_v.min(s_val);
@@ -803,7 +803,7 @@ fn cdef_filter_block_at(
                 }
                 let delta = (8 + sum - i32::from(sum < 0)) >> 4;
                 let out = clip3(min_v, max_v, x + delta);
-                dst.samples[(py as usize - dst_y0) * dst_cols + (px as usize)] = out;
+                dst.samples[(py as usize - dst_y0) * dst_cols + (px as usize)] = P::from_i32(out);
             }
         }
     }
@@ -812,10 +812,10 @@ fn cdef_filter_block_at(
 #[cfg_attr(all(target_arch = "aarch64", not(test)), allow(dead_code))]
 #[inline]
 #[allow(clippy::too_many_arguments)]
-fn cdef_interior_row<const W: usize>(
-    src: &[i32],
+fn cdef_interior_row<const W: usize, P: Pixel>(
+    src: &[P],
     base: usize,
-    dst: &mut [i32; W],
+    dst: &mut [P; W],
     pri_offs: &[(isize, i32); 4],
     sec_offs: &[(isize, i32); 8],
     pri_str: i32,
@@ -823,14 +823,14 @@ fn cdef_interior_row<const W: usize>(
     pri_adj: i32,
     sec_adj: i32,
 ) {
-    let center: &[i32; W] = src[base..base + W].try_into().unwrap();
+    let center: [i32; W] = core::array::from_fn(|c| src[base + c].to_i32());
     let mut sums = [0i32; W];
-    let mut min_v = *center;
-    let mut max_v = *center;
+    let mut min_v = center;
+    let mut max_v = center;
     if pri_str != 0 {
         for &(off, tap) in pri_offs {
             let start = (base as isize + off) as usize;
-            let row: &[i32; W] = src[start..start + W].try_into().unwrap();
+            let row: [i32; W] = core::array::from_fn(|c| src[start + c].to_i32());
             for c in 0..W {
                 sums[c] += tap * constrain_adj(row[c] - center[c], pri_str, pri_adj);
                 min_v[c] = min_v[c].min(row[c]);
@@ -841,7 +841,7 @@ fn cdef_interior_row<const W: usize>(
     if sec_str != 0 {
         for &(off, tap) in sec_offs {
             let start = (base as isize + off) as usize;
-            let row: &[i32; W] = src[start..start + W].try_into().unwrap();
+            let row: [i32; W] = core::array::from_fn(|c| src[start + c].to_i32());
             for c in 0..W {
                 sums[c] += tap * constrain_adj(row[c] - center[c], sec_str, sec_adj);
                 min_v[c] = min_v[c].min(row[c]);
@@ -852,7 +852,7 @@ fn cdef_interior_row<const W: usize>(
     for c in 0..W {
         let sum = sums[c];
         let delta = (8 + sum - i32::from(sum < 0)) >> 4;
-        dst[c] = clip3(min_v[c], max_v[c], center[c] + delta);
+        dst[c] = P::from_i32(clip3(min_v[c], max_v[c], center[c] + delta));
     }
 }
 
