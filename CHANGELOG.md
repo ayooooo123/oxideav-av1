@@ -25,6 +25,8 @@ All notable changes to `oxideav-av1` are recorded here.
   stages. Horizontal deblock preserves each plane's ordered row dependencies
   and only runs independent planes concurrently. WebAssembly remains serial;
   filter-context callbacks are `Sync` so shared metadata is thread-safe.
+- DCT schedules use fixed-size arrays and batch four bounded column transforms
+  in safe Rust; rotation products and every rounding/clamping step remain exact.
 
 ### Added
 

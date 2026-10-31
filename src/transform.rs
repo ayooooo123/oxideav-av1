@@ -189,17 +189,7 @@ pub fn sin128(angle: i32) -> i32 {
 /// for spec faithfulness but the runtime does not enforce the bound.
 #[inline]
 pub fn butterfly_b(t: &mut [i64], a: usize, b: usize, angle: i32, flip: u8, _r: u32) {
-    let cos_a = cos128(angle) as i64;
-    let sin_a = sin128(angle) as i64;
-    let ta = t[a];
-    let tb = t[b];
-    let x = ta * cos_a - tb * sin_a;
-    let y = ta * sin_a + tb * cos_a;
-    t[a] = round2(x, 12);
-    t[b] = round2(y, 12);
-    if flip == 1 {
-        t.swap(a, b);
-    }
+    dct_b(t, a, b, angle, flip, _r);
 }
 
 /// §7.13.2.1 Hadamard `H( a, b, flip, r )` (av1-spec p.297). For
@@ -208,18 +198,115 @@ pub fn butterfly_b(t: &mut [i64], a: usize, b: usize, angle: i32, flip: u8, _r: 
 /// `H(b, a, 0, r)` (i.e. flips the input argument order).
 #[inline]
 pub fn butterfly_h(t: &mut [i64], a: usize, b: usize, flip: u8, r: u32) {
+    dct_h(t, a, b, flip, r);
+}
+
+trait DctValue: Copy {
+    fn rotate(a: Self, b: Self, cos: i32, sin: i32) -> (Self, Self);
+    fn hadamard(a: Self, b: Self, r: u32) -> (Self, Self);
+}
+
+impl DctValue for i64 {
+    #[inline(always)]
+    fn rotate(a: Self, b: Self, cos: i32, sin: i32) -> (Self, Self) {
+        let (cos, sin) = (i64::from(cos), i64::from(sin));
+        (round2(a * cos - b * sin, 12), round2(a * sin + b * cos, 12))
+    }
+
+    #[inline(always)]
+    fn hadamard(a: Self, b: Self, r: u32) -> (Self, Self) {
+        let lo = -(1i64 << (r - 1));
+        let hi = (1i64 << (r - 1)) - 1;
+        (clip3(lo, hi, a + b), clip3(lo, hi, a - b))
+    }
+}
+
+impl DctValue for [i32; 4] {
+    #[inline(always)]
+    fn rotate(a: Self, b: Self, cos: i32, sin: i32) -> (Self, Self) {
+        let (cos, sin) = (i64::from(cos), i64::from(sin));
+        let mut x = [0i32; 4];
+        let mut y = [0i32; 4];
+        for lane in 0..4 {
+            let (a, b) = (i64::from(a[lane]), i64::from(b[lane]));
+            x[lane] = round2(a * cos - b * sin, 12) as i32;
+            y[lane] = round2(a * sin + b * cos, 12) as i32;
+        }
+        (x, y)
+    }
+
+    #[inline(always)]
+    fn hadamard(a: Self, b: Self, r: u32) -> (Self, Self) {
+        let lo = -(1i32 << (r - 1));
+        let hi = (1i32 << (r - 1)) - 1;
+        let mut sum = [0i32; 4];
+        let mut diff = [0i32; 4];
+        for lane in 0..4 {
+            sum[lane] = (a[lane] + b[lane]).clamp(lo, hi);
+            diff[lane] = (a[lane] - b[lane]).clamp(lo, hi);
+        }
+        (sum, diff)
+    }
+}
+
+#[inline(always)]
+fn dct_b<T: DctValue>(t: &mut [T], a: usize, b: usize, angle: i32, flip: u8, _r: u32) {
+    let (x, y) = T::rotate(t[a], t[b], cos128(angle), sin128(angle));
+    t[a] = x;
+    t[b] = y;
+    if flip == 1 {
+        t.swap(a, b);
+    }
+}
+
+#[inline(always)]
+fn dct_h<T: DctValue>(t: &mut [T], a: usize, b: usize, flip: u8, r: u32) {
     let (ai, bi) = if flip == 1 { (b, a) } else { (a, b) };
-    let x = t[ai];
-    let y = t[bi];
-    let lo: i64 = -(1i64 << (r - 1));
-    let hi: i64 = (1i64 << (r - 1)) - 1;
-    t[ai] = clip3(lo, hi, x + y);
-    t[bi] = clip3(lo, hi, x - y);
+    let (sum, diff) = T::hadamard(t[ai], t[bi], r);
+    t[ai] = sum;
+    t[bi] = diff;
+}
+
+#[inline]
+pub fn inverse_dct_4(t: &mut [i64], r: u32) {
+    inverse_dct_4_impl((&mut t[..4]).try_into().unwrap(), r);
+}
+
+#[inline]
+pub fn inverse_dct_8(t: &mut [i64], r: u32) {
+    inverse_dct_8_impl((&mut t[..8]).try_into().unwrap(), r);
+}
+
+#[inline]
+pub fn inverse_dct_16(t: &mut [i64], r: u32) {
+    inverse_dct_16_impl((&mut t[..16]).try_into().unwrap(), r);
+}
+
+#[inline]
+pub fn inverse_dct_32(t: &mut [i64], r: u32) {
+    inverse_dct_32_impl((&mut t[..32]).try_into().unwrap(), r);
+}
+
+#[inline]
+pub fn inverse_dct_64(t: &mut [i64], r: u32) {
+    inverse_dct_64_impl((&mut t[..64]).try_into().unwrap(), r);
+}
+
+fn inverse_dct_columns(t: &mut [[i32; 4]], n: u32, r: u32) {
+    match n {
+        2 => inverse_dct_4_impl((&mut t[..4]).try_into().unwrap(), r),
+        3 => inverse_dct_8_impl((&mut t[..8]).try_into().unwrap(), r),
+        4 => inverse_dct_16_impl((&mut t[..16]).try_into().unwrap(), r),
+        5 => inverse_dct_32_impl((&mut t[..32]).try_into().unwrap(), r),
+        6 => inverse_dct_64_impl((&mut t[..64]).try_into().unwrap(), r),
+        _ => unreachable!("AV1 DCT column size"),
+    }
 }
 
 /// §7.13.2.2 inverse DCT permutation (av1-spec p.297). Permutes the
 /// length-`2^n` array `T` in place via `T[i] = copyT[brev(n, i)]`.
-pub fn inverse_dct_permute(t: &mut [i64], n: u32) {
+#[inline]
+pub fn inverse_dct_permute<T>(t: &mut [T], n: u32) {
     let len = 1usize << n;
     let slice = &mut t[..len];
     for i in 0..len {
@@ -231,7 +318,9 @@ pub fn inverse_dct_permute(t: &mut [i64], n: u32) {
 }
 
 #[inline]
-pub fn inverse_dct_4(t: &mut [i64], r: u32) {
+fn inverse_dct_4_impl<T: DctValue>(t: &mut [T; 4], r: u32) {
+    use self::dct_b as butterfly_b;
+    use self::dct_h as butterfly_h;
     t.swap(1, 2);
     butterfly_b(t, 0, 1, 32, 1, r);
     butterfly_b(t, 2, 3, 48, 0, r);
@@ -240,7 +329,9 @@ pub fn inverse_dct_4(t: &mut [i64], r: u32) {
 }
 
 #[inline]
-pub fn inverse_dct_8(t: &mut [i64], r: u32) {
+fn inverse_dct_8_impl<T: DctValue>(t: &mut [T; 8], r: u32) {
+    use self::dct_b as butterfly_b;
+    use self::dct_h as butterfly_h;
     t.swap(1, 4);
     t.swap(3, 6);
     butterfly_b(t, 4, 7, 56, 0, r);
@@ -259,7 +350,9 @@ pub fn inverse_dct_8(t: &mut [i64], r: u32) {
 }
 
 #[inline]
-pub fn inverse_dct_16(t: &mut [i64], r: u32) {
+fn inverse_dct_16_impl<T: DctValue>(t: &mut [T; 16], r: u32) {
+    use self::dct_b as butterfly_b;
+    use self::dct_h as butterfly_h;
     t.swap(1, 8);
     t.swap(2, 4);
     t.swap(3, 12);
@@ -300,7 +393,9 @@ pub fn inverse_dct_16(t: &mut [i64], r: u32) {
 }
 
 #[inline]
-pub fn inverse_dct_32(t: &mut [i64], r: u32) {
+fn inverse_dct_32_impl<T: DctValue>(t: &mut [T; 32], r: u32) {
+    use self::dct_b as butterfly_b;
+    use self::dct_h as butterfly_h;
     inverse_dct_permute(t, 5);
     const STEP3_ANGLES: [i32; 8] = [62, 30, 46, 14, 54, 22, 38, 6];
     for i in 0..8 {
@@ -374,7 +469,9 @@ pub fn inverse_dct_32(t: &mut [i64], r: u32) {
 }
 
 #[inline]
-pub fn inverse_dct_64(t: &mut [i64], r: u32) {
+fn inverse_dct_64_impl<T: DctValue>(t: &mut [T; 64], r: u32) {
+    use self::dct_b as butterfly_b;
+    use self::dct_h as butterfly_h;
     inverse_dct_permute(t, 6);
     const STEP2_ANGLES: [i32; 16] = [63, 31, 47, 15, 55, 23, 39, 7, 59, 27, 43, 11, 51, 19, 35, 3];
     for i in 0..16 {
@@ -830,19 +927,40 @@ pub fn inverse_transform_2d(
         *cell = clip3(lo, hi, *cell);
     }
     // Column transforms.
-    let mut tbuf_arr = [0i64; 64];
-    for j in 0..w {
-        let tbuf = &mut tbuf_arr[..h];
-        for i in 0..h {
-            tbuf[i] = residual[i * w + j];
+    if !lossless && col_clamp_range <= 18
+        && matches!(tx_type, DCT_DCT | DCT_ADST | DCT_FLIPADST | V_DCT)
+    {
+        // Columns start clamped to at most 18 signed bits. All butterfly
+        // values fit i32; rotations still use their exact i64 products.
+        let mut columns = [[0i32; 4]; 64];
+        for j in (0..w).step_by(4) {
+            for i in 0..h {
+                for lane in 0..4 {
+                    columns[i][lane] = residual[i * w + j + lane] as i32;
+                }
+            }
+            inverse_dct_columns(&mut columns[..h], log2_h, col_clamp_range);
+            for i in 0..h {
+                for lane in 0..4 {
+                    residual[i * w + j + lane] = i64::from((columns[i][lane] + 8) >> 4);
+                }
+            }
         }
-        if lossless {
-            inverse_wht4(tbuf, 0);
-        } else {
-            apply_col_kernel(tbuf, tx_type, log2_h, col_clamp_range);
-        }
-        for i in 0..h {
-            residual[i * w + j] = round2(tbuf[i], col_shift);
+    } else {
+        let mut tbuf_arr = [0i64; 64];
+        for j in 0..w {
+            let tbuf = &mut tbuf_arr[..h];
+            for i in 0..h {
+                tbuf[i] = residual[i * w + j];
+            }
+            if lossless {
+                inverse_wht4(tbuf, 0);
+            } else {
+                apply_col_kernel(tbuf, tx_type, log2_h, col_clamp_range);
+            }
+            for i in 0..h {
+                residual[i * w + j] = round2(tbuf[i], col_shift);
+            }
         }
     }
     residual
@@ -910,6 +1028,37 @@ fn apply_col_kernel(t: &mut [i64], tx_type: usize, log2_h: u32, col_clamp_range:
 mod tests {
     use super::*;
     use crate::cdf::{TX_16X16, TX_32X32, TX_4X4, TX_4X8, TX_64X64, TX_8X8};
+
+    #[test]
+    fn four_column_dct_matches_scalar_at_precision_limits() {
+        let mut state = 0x6d2b79f5u32;
+        for n in 2..=6u32 {
+            let len = 1usize << n;
+            for r in [16u32, 18] {
+                for _ in 0..128 {
+                    let mut columns = [[0i32; 4]; 64];
+                    for row in &mut columns[..len] {
+                        for value in row {
+                            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                            *value = ((state & ((1 << r) - 1)) as i32) - (1 << (r - 1));
+                        }
+                    }
+                    let original = columns;
+                    inverse_dct_columns(&mut columns[..len], n, r);
+                    for lane in 0..4 {
+                        let mut scalar = [0i64; 64];
+                        for i in 0..len {
+                            scalar[i] = i64::from(original[i][lane]);
+                        }
+                        inverse_dct(&mut scalar[..len], n, r);
+                        for i in 0..len {
+                            assert_eq!(i64::from(columns[i][lane]), scalar[i]);
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn cos128_spec_anchor_points() {
