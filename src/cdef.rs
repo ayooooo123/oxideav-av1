@@ -439,18 +439,22 @@ pub fn cdef_direction(
         let y0 = y0 as usize;
         for i in 0..8usize {
             let row = &plane0.samples[(y0 + i) * stride + x0..][..8];
-            let i = i as i32;
+            let values: [i32; 8] = core::array::from_fn(|j| (row[j] >> shift) - 128);
+            let mut row_sum = 0;
             for j in 0..8usize {
-                let x = (row[j] >> shift) - 128;
-                let j = j as i32;
-                partial[0][(i + j) as usize] += x;
-                partial[1][(i + j / 2) as usize] += x;
-                partial[2][i as usize] += x;
-                partial[3][(3 + i - j / 2) as usize] += x;
-                partial[4][(7 + i - j) as usize] += x;
-                partial[5][(3 - i / 2 + j) as usize] += x;
-                partial[6][j as usize] += x;
-                partial[7][(i / 2 + j) as usize] += x;
+                let x = values[j];
+                partial[0][i + j] += x;
+                partial[4][7 + i - j] += x;
+                partial[5][3 - i / 2 + j] += x;
+                partial[6][j] += x;
+                partial[7][i / 2 + j] += x;
+                row_sum += x;
+            }
+            partial[2][i] = row_sum;
+            for j in 0..4usize {
+                let pair = values[j * 2] + values[j * 2 + 1];
+                partial[1][i + j] += pair;
+                partial[3][3 + i - j] += pair;
             }
         }
     } else {
@@ -646,34 +650,17 @@ pub fn cdef_filter_block(
             let py = y0 + i;
             let src_row_base = py * src_cols + x0;
             let dst_row_base = py * dst_cols + x0;
-            for j in 0..w {
-                let src_idx = src_row_base + j;
-                let x = src.samples[src_idx];
-                let mut sum = 0i32;
-                let mut max_v = x;
-                let mut min_v = x;
-
-                if pri_str != 0 {
-                    for &(off, tap) in &pri_offs {
-                        let p_val = src.samples[(src_idx as isize + off) as usize];
-                        sum += tap * constrain_adj(p_val - x, pri_str, pri_adj);
-                        max_v = max_v.max(p_val);
-                        min_v = min_v.min(p_val);
-                    }
-                }
-
-                if sec_str != 0 {
-                    for &(off, tap) in &sec_offs {
-                        let s_val = src.samples[(src_idx as isize + off) as usize];
-                        sum += tap * constrain_adj(s_val - x, sec_str, sec_adj);
-                        max_v = max_v.max(s_val);
-                        min_v = min_v.min(s_val);
-                    }
-                }
-
-                let delta = (8 + sum - i32::from(sum < 0)) >> 4;
-                let out = clip3(min_v, max_v, x + delta);
-                dst.samples[dst_row_base + j] = out;
+            let dst_row = &mut dst.samples[dst_row_base..dst_row_base + w];
+            if w == 8 {
+                cdef_interior_row::<8>(
+                    src.samples, src_row_base, dst_row.try_into().unwrap(),
+                    &pri_offs, &sec_offs, pri_str, sec_str, pri_adj, sec_adj,
+                );
+            } else {
+                cdef_interior_row::<4>(
+                    src.samples, src_row_base, dst_row.try_into().unwrap(),
+                    &pri_offs, &sec_offs, pri_str, sec_str, pri_adj, sec_adj,
+                );
             }
         }
     } else {
@@ -718,6 +705,52 @@ pub fn cdef_filter_block(
                 dst.samples[(py as usize) * dst_cols + (px as usize)] = out;
             }
         }
+    }
+}
+
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn cdef_interior_row<const W: usize>(
+    src: &[i32],
+    base: usize,
+    dst: &mut [i32; W],
+    pri_offs: &[(isize, i32); 4],
+    sec_offs: &[(isize, i32); 8],
+    pri_str: i32,
+    sec_str: i32,
+    pri_adj: i32,
+    sec_adj: i32,
+) {
+    let center: &[i32; W] = src[base..base + W].try_into().unwrap();
+    let mut sums = [0i32; W];
+    let mut min_v = *center;
+    let mut max_v = *center;
+    if pri_str != 0 {
+        for &(off, tap) in pri_offs {
+            let start = (base as isize + off) as usize;
+            let row: &[i32; W] = src[start..start + W].try_into().unwrap();
+            for c in 0..W {
+                sums[c] += tap * constrain_adj(row[c] - center[c], pri_str, pri_adj);
+                min_v[c] = min_v[c].min(row[c]);
+                max_v[c] = max_v[c].max(row[c]);
+            }
+        }
+    }
+    if sec_str != 0 {
+        for &(off, tap) in sec_offs {
+            let start = (base as isize + off) as usize;
+            let row: &[i32; W] = src[start..start + W].try_into().unwrap();
+            for c in 0..W {
+                sums[c] += tap * constrain_adj(row[c] - center[c], sec_str, sec_adj);
+                min_v[c] = min_v[c].min(row[c]);
+                max_v[c] = max_v[c].max(row[c]);
+            }
+        }
+    }
+    for c in 0..W {
+        let sum = sums[c];
+        let delta = (8 + sum - i32::from(sum < 0)) >> 4;
+        dst[c] = clip3(min_v[c], max_v[c], center[c] + delta);
     }
 }
 
@@ -798,6 +831,44 @@ fn clip3(a: i32, b: i32, x: i32) -> i32 {
 mod tests {
     use super::*;
     use crate::uncompressed_header_tail::CDEF_MAX_STRENGTHS;
+
+    #[test]
+    fn interior_rows_match_scalar_tap_accumulation() {
+        fn check<const W: usize>() {
+            let src: Vec<i32> = (0..1024).map(|i| (i * 197 + i / 64 * 73) & 4095).collect();
+            let base = 400usize;
+            let pri = [(-65isize, 4), (65, 4), (-130, 2), (130, 2)];
+            let sec = [(-64isize, 2), (64, 2), (-1, 2), (1, 2), (-128, 1), (128, 1), (-2, 1), (2, 1)];
+            for pri_str in [0, 1, 4, 15, 60] {
+                for sec_str in [0, 1, 2, 4, 16] {
+                    for adj in [0, 1, 3, 7, 32] {
+                        let mut expected = [0i32; W];
+                        for c in 0..W {
+                            let x = src[base + c];
+                            let (mut sum, mut lo, mut hi) = (0, x, x);
+                            for (offsets, strength) in [(&pri[..], pri_str), (&sec[..], sec_str)] {
+                                if strength == 0 {
+                                    continue;
+                                }
+                                for &(off, tap) in offsets {
+                                    let p = src[(base as isize + c as isize + off) as usize];
+                                    sum += tap * constrain_adj(p - x, strength, adj);
+                                    lo = lo.min(p);
+                                    hi = hi.max(p);
+                                }
+                            }
+                            expected[c] = clip3(lo, hi, x + ((8 + sum - i32::from(sum < 0)) >> 4));
+                        }
+                        let mut actual = [0i32; W];
+                        cdef_interior_row(&src, base, &mut actual, &pri, &sec, pri_str, sec_str, adj, adj);
+                        assert_eq!(actual, expected);
+                    }
+                }
+            }
+        }
+        check::<4>();
+        check::<8>();
+    }
 
     fn make_params(damping: u8) -> CdefParams {
         CdefParams {

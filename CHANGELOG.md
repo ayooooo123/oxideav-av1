@@ -15,6 +15,9 @@ All notable changes to `oxideav-av1` are recorded here.
   zero without evaluating their butterfly schedules.
 - Wiener restoration selects its stripe source once per row and copies interior
   windows contiguously; symmetric taps share their exact integer products.
+- Interior CDEF filtering accumulates taps over fixed-width contiguous rows;
+  direction search shares adjacent-pixel sums for oblique projections. Boundary
+  filtering and all constrain/clipping arithmetic remain exact.
 
 ### Added
 
