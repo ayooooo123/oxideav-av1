@@ -69,6 +69,9 @@ use crate::cdf::{
     TX_WIDTH, TX_WIDTH_LOG2, V_ADST, V_DCT, V_FLIPADST,
 };
 
+#[cfg(target_arch = "aarch64")]
+mod neon;
+
 /// `Cos128_Lookup[65]` (§7.13.2.1 av1-spec p.296). Quarter-period
 /// table: `Cos128_Lookup[k] = round(4096 * cos(k * pi / 128))` for
 /// `k in 0..=64`. Reproduced verbatim from the spec text.
@@ -857,6 +860,22 @@ pub fn inverse_identity(t: &mut [i64], n: u32) {
 ///
 /// Returns the `w * h` `Residual` buffer.
 pub fn inverse_transform_2d(
+    dequant: &[i64],
+    tx_sz: usize,
+    tx_type: usize,
+    bit_depth: u32,
+    lossless: bool,
+) -> Vec<i64> {
+    #[cfg(target_arch = "aarch64")]
+    if !lossless && tx_sz < TX_SIZES_ALL && dequant.len() == TX_WIDTH[tx_sz] * TX_HEIGHT[tx_sz] {
+        if let Some(residual) = neon::inverse_2d(dequant, tx_sz, tx_type, bit_depth) {
+            return residual;
+        }
+    }
+    inverse_transform_2d_scalar(dequant, tx_sz, tx_type, bit_depth, lossless)
+}
+
+fn inverse_transform_2d_scalar(
     dequant: &[i64],
     tx_sz: usize,
     tx_type: usize,

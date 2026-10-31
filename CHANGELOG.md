@@ -6,6 +6,10 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Changed
 
+- AArch64 inverse transforms batch four rows and columns using explicit NEON
+  DCT, ADST, and identity passes. Widened products, stage precision clamps,
+  rectangular scaling, and both rounding stages remain bit-exact; lossless
+  and out-of-range standalone inputs retain the scalar reference path.
 - AArch64 motion compensation processes eight horizontal/vertical outputs per
   NEON iteration and combines average compounds without wide scalar loops.
   Dedicated checked SIMD helpers also narrow/widen the inter-leaf bridge;
