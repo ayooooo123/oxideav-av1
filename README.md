@@ -1912,10 +1912,16 @@ deblock trials. The threaded walk runs each tile on tile-sized state
 coefficient storage in the committed trees (69 MiB dense before),
 lazy local-warp grid, stripe-boundary rows instead of a pre-CDEF
 frame copy, band-sampled deblock trials. Every stream decodes to the
-encoder's reconstruction sample for sample; the decoder's resident
-set is three frame-sized `i32` in-loop buffers plus the mirror
-(`PlaneBuffer<i32>` kernels — a `u16` pipeline is the next step
-towards the 120 MiB target).
+encoder's reconstruction sample for sample. Decoder reconstruction and
+in-loop filtering now use monomorphized native planes: `u8` at 8 bits,
+`u16` at 10/12 bits. Immutable reference snapshots use the same storage,
+and inter prediction borrows the destination directly without a full-frame
+representation mirror. Sequence headers select the specialization once;
+frame workers retain that selection with their immutable sequence snapshot.
+At 1080p 4:2:0, one cropped plane set holds 3,110,400 bytes at 8 bits or
+6,220,800 bytes at 10/12 bits, instead of 12,441,600 working bytes before.
+Transform and interpolation intermediates retain their specification widths.
+Owned output byte planes move into core frames without an additional copy.
 
 **Any extent** (r460): a picture whose width / height is not a
 multiple of 8 — 257×131, 7×3, 1×1 — is replicated out to the §5.9.5

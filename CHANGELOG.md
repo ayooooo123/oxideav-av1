@@ -14,15 +14,19 @@ All notable changes to `oxideav-av1` are recorded here.
   restoration and film grain write native `u8` (8-bit) or `u16` (10/12-bit)
   planes. Transform coefficients/residual arithmetic keep their signed widths.
   Eight-bit display output takes ownership of its plane allocation directly.
-  Reference snapshots retain their existing `u16` boundary during migration.
+  Immutable reference snapshots use the same native depth, including replay
+  grain and large-scale tiles. The sequence installs its monomorphized decoder
+  once; frame workers capture that selection with their sequence snapshot.
+  Inter reconstruction borrows destination planes directly, removing full-plane
+  representation mirrors; core output takes owned byte planes without a clone.
 - AArch64 inverse transforms batch four rows and columns using explicit NEON
   DCT, ADST, and identity passes. Widened products, stage precision clamps,
   rectangular scaling, and both rounding stages remain bit-exact; lossless
   and out-of-range standalone inputs retain the scalar reference path.
 - AArch64 motion compensation processes eight horizontal/vertical outputs per
   NEON iteration and combines average compounds without wide scalar loops.
-  Dedicated checked SIMD helpers also narrow/widen the inter-leaf bridge;
-  all interpolation phases, bit depths, and scalar odd-width tails stay exact.
+  All interpolation phases, bit depths, and scalar odd-width tails stay exact.
+  Native `u8`/`u16` reference loads feed the same signed intermediate lanes.
 - AArch64 CDEF uses explicit NEON for interior four/eight-sample filters and
   eight-direction projection sums, with exact 8/10/12-bit arithmetic. Frame
   edges and other architectures retain the scalar specification path;

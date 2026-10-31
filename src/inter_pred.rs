@@ -597,24 +597,17 @@ thread_local! {
 #[cfg(target_arch = "aarch64")]
 mod neon;
 
-pub(crate) fn pack_prediction_samples(src: &[i32], dst: &mut [u16]) {
-    #[cfg(target_arch = "aarch64")]
-    neon::pack(src, dst);
-    #[cfg(not(target_arch = "aarch64"))]
-    for (dst, &src) in dst.iter_mut().zip(src) { *dst = src as u16; }
-}
+use crate::loop_filter::Pixel;
 
-pub(crate) fn unpack_prediction_samples(src: &[u16], dst: &mut [i32]) {
-    #[cfg(target_arch = "aarch64")]
-    neon::unpack(src, dst);
-    #[cfg(not(target_arch = "aarch64"))]
-    for (dst, &src) in dst.iter_mut().zip(src) { *dst = i32::from(src); }
+#[inline]
+fn store_prediction<P: Pixel>(dst: &mut [P], src: &[u16]) {
+    for (dst, &src) in dst.iter_mut().zip(src) { *dst = P::from_i32(i32::from(src)); }
 }
 
 #[allow(dead_code)]
 #[inline]
-fn filter_8tap_h_scalar(
-    src: &[u16],
+fn filter_8tap_h_scalar<R: Pixel>(
+    src: &[R],
     coeffs: &[i32; 8],
     inter_round0: u32,
     dst: &mut [i32],
@@ -630,21 +623,21 @@ fn filter_8tap_h_scalar(
     let c6 = coeffs[6];
     let c7 = coeffs[7];
     for c in 0..w {
-        let s = c0 * (src[c] as i32)
-            + c1 * (src[c + 1] as i32)
-            + c2 * (src[c + 2] as i32)
-            + c3 * (src[c + 3] as i32)
-            + c4 * (src[c + 4] as i32)
-            + c5 * (src[c + 5] as i32)
-            + c6 * (src[c + 6] as i32)
-            + c7 * (src[c + 7] as i32);
+        let s = c0 * src[c].to_i32()
+            + c1 * src[c + 1].to_i32()
+            + c2 * src[c + 2].to_i32()
+            + c3 * src[c + 3].to_i32()
+            + c4 * src[c + 4].to_i32()
+            + c5 * src[c + 5].to_i32()
+            + c6 * src[c + 6].to_i32()
+            + c7 * src[c + 7].to_i32();
         dst[c] = (s + round_offset) >> inter_round0;
     }
 }
 
 #[inline(always)]
-fn filter_8tap_h(
-    src: &[u16],
+fn filter_8tap_h<R: Pixel>(
+    src: &[R],
     coeffs: &[i32; 8],
     inter_round0: u32,
     dst: &mut [i32],
@@ -779,11 +772,11 @@ fn filter_8tap_v(
 /// `step_x <= 0`, `step_y <= 0`, `interp_filter_x >= 6`,
 /// `interp_filter_y >= 6`, `pred.len() < h * w`.
 #[allow(clippy::too_many_arguments)]
-pub fn block_inter_prediction(
+pub fn block_inter_prediction<R: Pixel>(
     plane: u8,
     subsampling_x: u8,
     subsampling_y: u8,
-    ref_plane: &[u16],
+    ref_plane: &[R],
     ref_stride: usize,
     ref_width: u32,
     ref_height: u32,
@@ -887,13 +880,13 @@ pub fn block_inter_prediction(
                 if inside_x {
                     let start = base + x_int as usize;
                     for (out, &sample) in dst.iter_mut().zip(&ref_plane[start..start + w]) {
-                        let horizontal = (128 * i32::from(sample) + round0) >> inter_round0;
+                        let horizontal = (128 * sample.to_i32() + round0) >> inter_round0;
                         *out = (128 * horizontal + round1) >> inter_round1;
                     }
                 } else {
                     for (c, out) in dst.iter_mut().enumerate() {
                         let x = clip3_i32(0, last_x, x_int + c as i32) as usize;
-                        let horizontal = (128 * i32::from(ref_plane[base + x]) + round0) >> inter_round0;
+                        let horizontal = (128 * ref_plane[base + x].to_i32() + round0) >> inter_round0;
                         *out = (128 * horizontal + round1) >> inter_round1;
                     }
                 }
@@ -910,7 +903,7 @@ pub fn block_inter_prediction(
                     finish(dst);
                 }
             } else {
-                let mut edge = [0u16; 256 + 7];
+                let mut edge = [R::default(); 256 + 7];
                 for r in 0..h {
                     let ry = clip3_i32(0, last_y, y_int + r as i32) as usize;
                     let base = ry * ref_stride;
@@ -959,12 +952,12 @@ pub fn block_inter_prediction(
                     if start_x_int >= 0 && start_x_int as usize + w <= plane_w {
                         let start = row_base + start_x_int as usize;
                         for (dst, &src) in dst_row.iter_mut().zip(&ref_plane[start..start + w]) {
-                            *dst = (128 * i32::from(src) + round_offset) >> inter_round0;
+                            *dst = (128 * src.to_i32() + round_offset) >> inter_round0;
                         }
                     } else {
                         for (c, dst) in dst_row.iter_mut().enumerate() {
                             let rx = clip3_i32(0, last_x, start_x_int + c as i32) as usize;
-                            *dst = (128 * i32::from(ref_plane[row_base + rx]) + round_offset)
+                            *dst = (128 * ref_plane[row_base + rx].to_i32() + round_offset)
                                 >> inter_round0;
                         }
                     }
@@ -979,7 +972,7 @@ pub fn block_inter_prediction(
                     filter_8tap_h(src_row, coeffs_h, inter_round0, dst_row, w);
                 }
             } else {
-                let mut edge = [0u16; 256 + 7];
+                let mut edge = [R::default(); 256 + 7];
                 for r in 0..intermediate_height {
                     let ry = clip3_i32(0, last_y, y_base + r as i32) as usize;
                     let row_base = ry * ref_stride;
@@ -1009,7 +1002,7 @@ pub fn block_inter_prediction(
                     let mut s: i64 = 0;
                     for (t, coef) in coeffs.iter().enumerate() {
                         let rx = clip3_i32(0, last_x, p_int + (t as i32) - 3) as usize;
-                        let sample = ref_plane[row_base + rx] as i64;
+                        let sample = i64::from(ref_plane[row_base + rx].to_i32());
                         s += (*coef as i64) * sample;
                     }
                     intermediate[r * w + c] = round2(s, inter_round0) as i32;
@@ -1155,13 +1148,13 @@ pub fn clip1_single_ref(bit_depth: u8, pred: &[i32], out: &mut [u16]) -> Result<
 /// [`predict_inter`]'s argument list so adding the compound arm in a
 /// future arc is a one-call-site change.
 #[derive(Debug, Clone, Copy)]
-pub struct PredictInterRef<'a> {
+pub struct PredictInterRef<'a, R: Pixel = u16> {
     /// §7.11.3.1 step 5 — `RefFrames[candRow][candCol][refList]`
     /// resolved to a per-plane sample buffer. Row-major flat layout
     /// with `ref_stride` column stride. Per-plane sample values are
     /// the spec's `RefFrames[][][..]` values clipped to `BitDepth`
     /// (i.e. `0..=(1 << bit_depth) - 1`).
-    pub ref_plane: &'a [u16],
+    pub ref_plane: &'a [R],
     /// Column stride of `ref_plane` (`>= ref_width`).
     pub ref_stride: usize,
     /// §7.11.3.3 `RefUpscaledWidth[refIdx]` — pre-superres ref
@@ -1441,8 +1434,8 @@ pub struct WedgeInterIntraInfo<'a> {
 /// Allocates the `w * h` `i32` buffer fallibly (returns
 /// `Error::PartitionWalkOutOfRange` on alloc failure).
 #[allow(clippy::too_many_arguments)]
-fn predict_inter_per_ref_into(
-    r: &PredictInterRef<'_>,
+fn predict_inter_per_ref_into<R: Pixel>(
+    r: &PredictInterRef<'_, R>,
     plane: u8,
     x: i32,
     y: i32,
@@ -1494,8 +1487,8 @@ fn predict_inter_per_ref_into(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn predict_inter_per_ref(
-    r: &PredictInterRef<'_>,
+fn predict_inter_per_ref<R: Pixel>(
+    r: &PredictInterRef<'_, R>,
     plane: u8,
     x: i32,
     y: i32,
@@ -1753,7 +1746,7 @@ pub struct WarpDriverParams {
 /// av1-spec p.275 line 15313 / 15336. The caller is responsible for
 /// the Clip3.
 #[derive(Debug, Clone, Copy)]
-pub struct ObmcNeighbour<'a> {
+pub struct ObmcNeighbour<'a, R: Pixel = u16> {
     /// §7.11.3.9 step 5 `refIdx` → spec `RefFrames[candRow][candCol]
     /// [0]` resolved into a ref-frame plane bundle. The bundle's
     /// `ref_plane` / `ref_stride` / `ref_upscaled_width` / `ref_width`
@@ -1763,7 +1756,7 @@ pub struct ObmcNeighbour<'a> {
     ///
     /// The `mv` field carries `Mvs[candRow][candCol][0]` per av1-spec
     /// p.276 line 15359.
-    pub bundle: PredictInterRef<'a>,
+    pub bundle: PredictInterRef<'a, R>,
     /// `step4 = Clip3( 2, 16, Num_4x4_Blocks_{Wide,High}[ candSz ] )`
     /// per av1-spec p.275 lines 15313 / 15336 — how many 4×4 mi cells
     /// this neighbour spans along the walk axis. The driver advances
@@ -1827,7 +1820,7 @@ pub struct ObmcNeighbour<'a> {
 ///   slice = no qualifying neighbour on that axis = no overlap blend
 ///   contribution.
 #[derive(Debug, Clone, Copy)]
-pub struct ObmcParams<'a, 'n> {
+pub struct ObmcParams<'a, 'n, R: Pixel = u16> {
     /// §5.9.5 `MiRow` of the current block (luma mi-grid).
     pub mi_row: u32,
     /// §5.9.5 `MiCol` of the current block (luma mi-grid).
@@ -1853,12 +1846,12 @@ pub struct ObmcParams<'a, 'n> {
     /// `x4` ascending). Each entry's `step4` is the `Clip3(2, 16,
     /// Num_4x4_Blocks_Wide[ candSz ])` advance for the slot it
     /// occupies.
-    pub above_neighbours: &'n [ObmcNeighbour<'a>],
+    pub above_neighbours: &'n [ObmcNeighbour<'a, R>],
     /// §7.11.3.9 left-pass qualifying neighbour list (ordered along
     /// `y4` ascending). Each entry's `step4` is the `Clip3(2, 16,
     /// Num_4x4_Blocks_High[ candSz ])` advance for the slot it
     /// occupies.
-    pub left_neighbours: &'n [ObmcNeighbour<'a>],
+    pub left_neighbours: &'n [ObmcNeighbour<'a, R>],
 }
 
 /// §7.11.3.1 step-7 output: which `block_warp` matrix to apply for
@@ -1942,8 +1935,8 @@ fn derive_use_warp(
 /// USE_WARP_LOCAL`) or `gm_params[refFrame]` (when `use_warp ==
 /// USE_WARP_GLOBAL`); the caller picks per the step-7 derivation.
 #[allow(clippy::too_many_arguments)]
-fn predict_inter_per_ref_warp(
-    r: &PredictInterRef<'_>,
+fn predict_inter_per_ref_warp<R: Pixel>(
+    r: &PredictInterRef<'_, R>,
     use_warp: u8,
     plane: u8,
     x: i32,
@@ -2011,8 +2004,8 @@ fn predict_inter_per_ref_warp(
 /// caller-supplied `WarpDriverParams::local_valid` after the
 /// `plane == 0` re-check against `setup_shear(LocalWarpParams)`).
 #[allow(clippy::too_many_arguments)]
-fn predict_inter_one_ref_into(
-    r: &PredictInterRef<'_>,
+fn predict_inter_one_ref_into<R: Pixel>(
+    r: &PredictInterRef<'_, R>,
     ref_list: usize,
     plane: u8,
     x: i32,
@@ -2121,8 +2114,8 @@ fn predict_inter_one_ref_into(
 }
 
 #[allow(clippy::too_many_arguments, dead_code)]
-fn predict_inter_one_ref(
-    r: &PredictInterRef<'_>,
+fn predict_inter_one_ref<R: Pixel>(
+    r: &PredictInterRef<'_, R>,
     ref_list: usize,
     plane: u8,
     x: i32,
@@ -2208,7 +2201,7 @@ fn predict_inter_one_ref(
 /// (`x_block_plane = (MiCol * MI_SIZE) >> subX`, similarly for y) to
 /// buffer-relative before the §7.11.3.10 blend.
 #[allow(clippy::too_many_arguments)]
-fn obmc_walk_axis(
+fn obmc_walk_axis<R: Pixel>(
     pass: OverlapPass,
     plane: u8,
     block_x_plane: i32,
@@ -2228,7 +2221,7 @@ fn obmc_walk_axis(
     inter_round0: u32,
     inter_round1: u32,
     bit_depth: u8,
-    neighbours: &[ObmcNeighbour<'_>],
+    neighbours: &[ObmcNeighbour<'_, R>],
     pred_out: &mut [u16],
 ) -> Result<(), crate::Error> {
     let mi_size: u32 = crate::cdf::MI_SIZE as u32;
@@ -2397,7 +2390,7 @@ fn obmc_walk_axis(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn predict_inter(
+pub fn predict_inter<R: Pixel>(
     plane: u8,
     x: i32,
     y: i32,
@@ -2413,11 +2406,11 @@ pub fn predict_inter(
     frame_height: u32,
     interp_filter_x: u8,
     interp_filter_y: u8,
-    refs: &[PredictInterRef<'_>],
+    refs: &[PredictInterRef<'_, R>],
     compound: Option<CompoundParams<'_>>,
     inter_intra: Option<InterIntraParams<'_>>,
     warp: Option<&WarpDriverParams>,
-    obmc: Option<&ObmcParams<'_, '_>>,
+    obmc: Option<&ObmcParams<'_, '_, R>>,
     pred_out: &mut [u16],
 ) -> Result<(), crate::Error> {
     // ---------- caller-bug guards ----------
@@ -4566,7 +4559,7 @@ pub const USE_WARP_GLOBAL: u8 = 2;
 /// i8b*8 >= h, j8b*8 >= w, ref_stride < per-plane ref_upscaled_width,
 /// pred_stride < w, pred too short, use_warp not in {1, 2}).
 #[allow(clippy::too_many_arguments)]
-pub fn block_warp(
+pub fn block_warp<R: Pixel>(
     use_warp: u8,
     plane: u8,
     subsampling_x: u8,
@@ -4577,7 +4570,7 @@ pub fn block_warp(
     j8b: i32,
     w: usize,
     h: usize,
-    ref_plane: &[u16],
+    ref_plane: &[R],
     ref_stride: usize,
     ref_upscaled_width: u32,
     ref_frame_height: u32,
@@ -4685,7 +4678,7 @@ pub fn block_warp(
             let mut s: i64 = 0;
             for (i3, coef) in WARPED_FILTERS[offs].iter().enumerate() {
                 let rx = warp_clip3_i32(0, last_x, ix4 + i2 - 3 + (i3 as i32)) as usize;
-                s += (*coef as i64) * (ref_plane[base + rx] as i64);
+                s += (*coef as i64) * i64::from(ref_plane[base + rx].to_i32());
             }
             // §7.11.3.5 `intermediate[..] = Round2(s, InterRound0)` —
             // plain Round2 (negative sums round toward -∞ + carry).
@@ -5120,10 +5113,10 @@ pub struct InterModeInfo {
 /// being run for (the caller does the per-plane `>> subX` / `>> subY`
 /// the same way [`PredictInterRef`] documents).
 #[derive(Debug, Clone, Copy)]
-pub struct RefFrameStoreEntry<'a> {
+pub struct RefFrameStoreEntry<'a, R: Pixel = u16> {
     /// `FrameStore[ refIdx ]` plane samples (row-major, `stride`
     /// columns).
-    pub plane: &'a [u16],
+    pub plane: &'a [R],
     /// Column stride of `plane` (`>=` the PER-PLANE width — the
     /// stride stays in this plane's own sample units).
     pub stride: usize,
@@ -5171,10 +5164,10 @@ pub struct RefFrameStoreEntry<'a> {
 /// `(x, y, w, h)` write region, or anything [`predict_inter`] itself
 /// rejects.
 #[allow(clippy::too_many_arguments)]
-pub fn reconstruct_inter_block(
+pub fn reconstruct_inter_block<R: Pixel, P: Pixel>(
     mode_info: InterModeInfo,
     ref_frame_idx: &[u8],
-    frame_store: &[RefFrameStoreEntry<'_>],
+    frame_store: &[RefFrameStoreEntry<'_, R>],
     plane: u8,
     x: i32,
     y: i32,
@@ -5187,7 +5180,7 @@ pub fn reconstruct_inter_block(
     frame_height: u32,
     interp_filter_x: u8,
     interp_filter_y: u8,
-    curr_plane: &mut [u16],
+    curr_plane: &mut [P],
     curr_stride: usize,
 ) -> Result<(), crate::Error> {
     // ---------- §7.11.3.1 step 5 — RefFrame[0] validity ----------
@@ -5282,7 +5275,7 @@ pub fn reconstruct_inter_block(
     for i in 0..fit_h {
         let dst = (py + i) * curr_stride + px;
         let src = i * w;
-        curr_plane[dst..dst + fit_w].copy_from_slice(&pred_out[src..src + fit_w]);
+        store_prediction(&mut curr_plane[dst..dst + fit_w], &pred_out[src..src + fit_w]);
     }
 
     PRED_U16_SCRATCH.with(|cell| *cell.borrow_mut() = pred_out);
@@ -5325,11 +5318,11 @@ pub fn reconstruct_inter_block(
 /// `refIdx`, a `curr_plane` too small for the `(x, y, w, h)` write
 /// region), plus anything [`predict_inter`]'s WARP arm itself rejects.
 #[allow(clippy::too_many_arguments)]
-pub fn reconstruct_inter_block_warp(
+pub fn reconstruct_inter_block_warp<R: Pixel, P: Pixel>(
     mode_info: InterModeInfo,
     warp: &WarpDriverParams,
     ref_frame_idx: &[u8],
-    frame_store: &[RefFrameStoreEntry<'_>],
+    frame_store: &[RefFrameStoreEntry<'_, R>],
     plane: u8,
     x: i32,
     y: i32,
@@ -5342,7 +5335,7 @@ pub fn reconstruct_inter_block_warp(
     frame_height: u32,
     interp_filter_x: u8,
     interp_filter_y: u8,
-    curr_plane: &mut [u16],
+    curr_plane: &mut [P],
     curr_stride: usize,
 ) -> Result<(), crate::Error> {
     // ---------- §7.11.3.1 step 5 — RefFrame[0] validity ----------
@@ -5423,7 +5416,7 @@ pub fn reconstruct_inter_block_warp(
     for i in 0..fit_h {
         let dst = (py + i) * curr_stride + px;
         let src = i * w;
-        curr_plane[dst..dst + fit_w].copy_from_slice(&pred_out[src..src + fit_w]);
+        store_prediction(&mut curr_plane[dst..dst + fit_w], &pred_out[src..src + fit_w]);
     }
 
     Ok(())
@@ -5467,11 +5460,11 @@ pub fn reconstruct_inter_block_warp(
 /// `refIdx`, a `curr_plane` too small for the `(x, y, w, h)` write
 /// region), plus anything [`predict_inter`]'s OBMC arm itself rejects.
 #[allow(clippy::too_many_arguments)]
-pub fn reconstruct_inter_block_obmc(
+pub fn reconstruct_inter_block_obmc<R: Pixel, P: Pixel>(
     mode_info: InterModeInfo,
-    obmc: &ObmcParams<'_, '_>,
+    obmc: &ObmcParams<'_, '_, R>,
     ref_frame_idx: &[u8],
-    frame_store: &[RefFrameStoreEntry<'_>],
+    frame_store: &[RefFrameStoreEntry<'_, R>],
     plane: u8,
     x: i32,
     y: i32,
@@ -5484,7 +5477,7 @@ pub fn reconstruct_inter_block_obmc(
     frame_height: u32,
     interp_filter_x: u8,
     interp_filter_y: u8,
-    curr_plane: &mut [u16],
+    curr_plane: &mut [P],
     curr_stride: usize,
 ) -> Result<(), crate::Error> {
     // ---------- §7.11.3.1 step 5 — RefFrame[0] validity ----------
@@ -5565,7 +5558,7 @@ pub fn reconstruct_inter_block_obmc(
     for i in 0..fit_h {
         let dst = (py + i) * curr_stride + px;
         let src = i * w;
-        curr_plane[dst..dst + fit_w].copy_from_slice(&pred_out[src..src + fit_w]);
+        store_prediction(&mut curr_plane[dst..dst + fit_w], &pred_out[src..src + fit_w]);
     }
 
     Ok(())
@@ -5716,11 +5709,11 @@ pub struct CompoundOrderHintContext {
 /// a `curr_plane` too small for the `(x, y, w, h)` write region, or
 /// anything [`predict_inter`] itself rejects.
 #[allow(clippy::too_many_arguments)]
-pub fn reconstruct_inter_block_compound(
+pub fn reconstruct_inter_block_compound<R: Pixel, P: Pixel>(
     mode_info: CompoundInterModeInfo,
     order_hints: CompoundOrderHintContext,
     ref_frame_idx: &[u8],
-    frame_store: &[RefFrameStoreEntry<'_>],
+    frame_store: &[RefFrameStoreEntry<'_, R>],
     plane: u8,
     x: i32,
     y: i32,
@@ -5741,7 +5734,7 @@ pub fn reconstruct_inter_block_compound(
     // compound driver is its only route). `None` keeps the
     // translational-only path.
     warp: Option<&WarpDriverParams>,
-    curr_plane: &mut [u16],
+    curr_plane: &mut [P],
     curr_stride: usize,
 ) -> Result<(), crate::Error> {
     // ---------- compound_type gate ----------
@@ -5775,7 +5768,7 @@ pub fn reconstruct_inter_block_compound(
     // `RefFrame` index selects a `ref_frame_idx[]` slot naming a
     // `FrameStore[]` entry. Both list-0 and list-1 references must be
     // real inter references (`LAST_FRAME..=ALTREF_FRAME`).
-    let resolve = |rf: u8| -> Result<&RefFrameStoreEntry<'_>, crate::Error> {
+    let resolve = |rf: u8| -> Result<&RefFrameStoreEntry<'_, R>, crate::Error> {
         let rf = rf as usize;
         if !(crate::uncompressed_header_tail::LAST_FRAME
             ..=crate::uncompressed_header_tail::ALTREF_FRAME)
@@ -5944,7 +5937,7 @@ pub fn reconstruct_inter_block_compound(
     for i in 0..fit_h {
         let dst = (py + i) * curr_stride + px;
         let src = i * w;
-        curr_plane[dst..dst + fit_w].copy_from_slice(&pred_out[src..src + fit_w]);
+        store_prediction(&mut curr_plane[dst..dst + fit_w], &pred_out[src..src + fit_w]);
     }
 
     PRED_U16_SCRATCH.with(|cell| *cell.borrow_mut() = pred_out);
@@ -6059,10 +6052,10 @@ pub struct InterIntraWedgeModeInfo {
 /// rejects, a `curr_plane` too small for the `(x, y, w, h)` write region,
 /// or anything [`predict_inter`] itself rejects.
 #[allow(clippy::too_many_arguments)]
-pub fn reconstruct_inter_block_interintra(
+pub fn reconstruct_inter_block_interintra<R: Pixel, P: Pixel>(
     mode_info: InterIntraModeInfo,
     ref_frame_idx: &[u8],
-    frame_store: &[RefFrameStoreEntry<'_>],
+    frame_store: &[RefFrameStoreEntry<'_, R>],
     plane: u8,
     x: i32,
     y: i32,
@@ -6077,7 +6070,7 @@ pub fn reconstruct_inter_block_interintra(
     interp_filter_y: u8,
     wedge_mask_buf: Option<&mut [u8]>,
     warp: Option<&WarpDriverParams>,
-    curr_plane: &mut [u16],
+    curr_plane: &mut [P],
     curr_stride: usize,
 ) -> Result<(), crate::Error> {
     // ---------- §7.11.3.1 step 5 — RefFrame[0] validity ----------
@@ -6156,7 +6149,9 @@ pub fn reconstruct_inter_block_interintra(
     for i in 0..fit_h {
         let src = (py + i) * curr_stride + px;
         let dst = i * w;
-        pred_out[dst..dst + fit_w].copy_from_slice(&curr_plane[src..src + fit_w]);
+        for (dst, &src) in pred_out[dst..dst + fit_w].iter_mut().zip(&curr_plane[src..src + fit_w]) {
+            *dst = src.to_i32() as u16;
+        }
     }
 
     // ---------- §7.11.3.11 wedge-mask regeneration (wedge arm) -------
@@ -6236,7 +6231,7 @@ pub fn reconstruct_inter_block_interintra(
     for i in 0..fit_h {
         let dst = (py + i) * curr_stride + px;
         let src = i * w;
-        curr_plane[dst..dst + fit_w].copy_from_slice(&pred_out[src..src + fit_w]);
+        store_prediction(&mut curr_plane[dst..dst + fit_w], &pred_out[src..src + fit_w]);
     }
 
     PRED_U16_SCRATCH.with(|cell| *cell.borrow_mut() = pred_out);
@@ -6306,12 +6301,12 @@ pub struct InterIntraLeaf {
 /// Returns [`crate::Error::PartitionWalkOutOfRange`] for an out-of-range
 /// `MiSize`, or for anything [`reconstruct_inter_block_interintra`] itself
 /// rejects.
-pub fn reconstruct_inter_intra_block(
+pub fn reconstruct_inter_intra_block<R: Pixel, P: Pixel>(
     leaf: &InterIntraLeaf,
     ref_frame_idx: &[u8],
     bit_depth: u8,
     warp: Option<&WarpDriverParams>,
-    planes: &mut [PlaneReconContext<'_>],
+    planes: &mut [PlaneReconContext<'_, R, P>],
 ) -> Result<(), crate::Error> {
     if leaf.mi_size >= crate::cdf::BLOCK_SIZES {
         return Err(crate::Error::PartitionWalkOutOfRange);
@@ -6389,13 +6384,13 @@ pub fn reconstruct_inter_intra_block(
 /// As with [`reconstruct_inter_intra_block`], the caller must already have
 /// written the §7.11.2 intra prediction (the readout's intra-half tasks)
 /// into each plane's `curr` buffer before calling this bridge.
-pub fn reconstruct_inter_intra_from_dispatch(
+pub fn reconstruct_inter_intra_from_dispatch<R: Pixel, P: Pixel>(
     readout: &crate::cdf::ComputePredictionReadout,
     leaf: &InterIntraLeaf,
     ref_frame_idx: &[u8],
     bit_depth: u8,
     warp: Option<&WarpDriverParams>,
-    planes: &mut [PlaneReconContext<'_>],
+    planes: &mut [PlaneReconContext<'_, R, P>],
 ) -> Result<(), crate::Error> {
     // The dispatcher must have taken the §5.11.33 `IsInterIntra` arm.
     if !readout.is_inter_intra {
@@ -6501,7 +6496,7 @@ pub fn reconstruct_inter_intra_from_dispatch(
 /// and subsampling the inter prediction reads, matching
 /// [`PlaneReconContext`].
 #[derive(Debug, Clone, Copy)]
-pub struct PlaneRefSpec<'a> {
+pub struct PlaneRefSpec<'a, R: Pixel = u16> {
     /// `0` (Y), `1` (Cb), `2` (Cr). Must match a plane the walker has
     /// a tracked `CurrFrame[plane]` buffer for.
     pub plane: u8,
@@ -6512,7 +6507,7 @@ pub struct PlaneRefSpec<'a> {
     /// This plane's §7.11.3.3 `FrameStore` slice (indexed by the
     /// resolved `refIdx`), per-plane resolved like
     /// [`RefFrameStoreEntry`].
-    pub frame_store: &'a [RefFrameStoreEntry<'a>],
+    pub frame_store: &'a [RefFrameStoreEntry<'a, R>],
     /// §7.11.3 `FrameWidth` in LUMA samples (r405: no longer
     /// per-plane — it feeds only the §7.11.3.3 scale ratio, which is
     /// luma-derived for every plane).
@@ -6532,7 +6527,7 @@ pub struct PlaneRefSpec<'a> {
 /// samples (r405) — the §7.11.3.3/.4/.5 leaves derive the per-plane
 /// values internally, preserving odd-luma-extent parity.
 #[derive(Debug)]
-pub struct PlaneReconContext<'a> {
+pub struct PlaneReconContext<'a, R: Pixel = u16, P: Pixel = u16> {
     /// `0` (Y), `1` (Cb), `2` (Cr).
     pub plane: u8,
     /// §6.4.2 `subsampling_x` for this plane's chroma down-shift
@@ -6543,7 +6538,7 @@ pub struct PlaneReconContext<'a> {
     /// This plane's §7.11.3.3 `FrameStore` slice (indexed by the
     /// resolved `refIdx`); per-plane resolved like
     /// [`RefFrameStoreEntry`].
-    pub frame_store: &'a [RefFrameStoreEntry<'a>],
+    pub frame_store: &'a [RefFrameStoreEntry<'a, R>],
     /// §7.11.3 `FrameWidth` in LUMA samples (r405: no longer
     /// per-plane — it feeds only the §7.11.3.3 scale ratio, which is
     /// luma-derived for every plane).
@@ -6552,7 +6547,7 @@ pub struct PlaneReconContext<'a> {
     pub frame_height: u32,
     /// `CurrFrame[plane]` output buffer (row-major, `curr_stride`
     /// columns), large enough for `frame_height` rows.
-    pub curr: &'a mut [u16],
+    pub curr: &'a mut [P],
     /// Column stride of `curr` (`>= frame_width`).
     pub curr_stride: usize,
 }
@@ -6814,11 +6809,11 @@ pub struct GridObmcContext<'a> {
 /// *sequence* is identical across planes — only the bundle resolution
 /// changes.
 #[allow(clippy::too_many_arguments)]
-fn obmc_dispatch_leaf(
+fn obmc_dispatch_leaf<R: Pixel, P: Pixel>(
     grid: &InterModeInfoGrid<'_>,
     oc: &GridObmcContext<'_>,
     ref_frame_idx: &[u8],
-    planes: &mut [PlaneReconContext<'_>],
+    planes: &mut [PlaneReconContext<'_, R, P>],
     mi_row: usize,
     mi_col: usize,
     mi_size: usize,
@@ -6871,7 +6866,7 @@ fn obmc_dispatch_leaf(
         let above_gate = avail_u && plane_sz >= crate::cdf::BLOCK_8X8;
 
         // ----- above-pass neighbour list (line 15301-15324) -----
-        let mut above: Vec<ObmcNeighbour<'_>> = Vec::new();
+        let mut above: Vec<ObmcNeighbour<'_, R>> = Vec::new();
         if above_gate {
             let w4 = crate::cdf::num_4x4_blocks_wide(mi_size);
             let n_limit = core::cmp::min(4, crate::cdf::mi_width_log2(mi_size));
@@ -6916,7 +6911,7 @@ fn obmc_dispatch_leaf(
         // ----- left-pass neighbour list (line 15325-15346) -----
         // The left-pass is unconditional on the §7.11.3.9 "small blocks →
         // left neighbour only" carve-out; only `AvailL` gates it.
-        let mut left: Vec<ObmcNeighbour<'_>> = Vec::new();
+        let mut left: Vec<ObmcNeighbour<'_, R>> = Vec::new();
         if avail_l {
             let h4 = crate::cdf::num_4x4_blocks_high(mi_size);
             let n_limit = core::cmp::min(4, crate::cdf::mi_height_log2(mi_size));
@@ -7013,12 +7008,12 @@ fn obmc_dispatch_leaf(
 /// resolved `refIdx` against `frame_store`, returning
 /// [`crate::Error::PartitionWalkOutOfRange`] for an out-of-range value
 /// (caller-bug grid).
-fn resolve_obmc_neighbour_bundle<'a>(
+fn resolve_obmc_neighbour_bundle<'a, R: Pixel>(
     cand_ref_frame: i8,
     mv: [i16; 2],
     ref_frame_idx: &[u8],
-    frame_store: &[RefFrameStoreEntry<'a>],
-) -> Result<PredictInterRef<'a>, crate::Error> {
+    frame_store: &[RefFrameStoreEntry<'a, R>],
+) -> Result<PredictInterRef<'a, R>, crate::Error> {
     let rf = cand_ref_frame as usize;
     if !(crate::uncompressed_header_tail::LAST_FRAME
         ..=crate::uncompressed_header_tail::ALTREF_FRAME)
@@ -7136,10 +7131,10 @@ fn resolve_obmc_neighbour_bundle<'a>(
 /// out-of-range `MiSize`, or for anything [`reconstruct_inter_block`]
 /// itself rejects (out-of-range `ref_frame` / resolved `refIdx`, a
 /// `CurrFrame` plane too small for the write region, …).
-pub fn reconstruct_inter_frame(
+pub fn reconstruct_inter_frame<R: Pixel, P: Pixel>(
     grid: &InterModeInfoGrid<'_>,
     ref_frame_idx: &[u8],
-    planes: &mut [PlaneReconContext<'_>],
+    planes: &mut [PlaneReconContext<'_, R, P>],
 ) -> Result<(), crate::Error> {
     let mi_rows = grid.mi_rows as usize;
     let mi_cols = grid.mi_cols as usize;
@@ -7265,10 +7260,10 @@ pub fn reconstruct_inter_frame(
 /// Error surface matches [`reconstruct_inter_frame`] (out-of-range
 /// `MiSize` / `RefFrame` / resolved `refIdx`, a too-small `curr`
 /// plane, …).
-pub(crate) fn reconstruct_inter_leaf_at(
+pub(crate) fn reconstruct_inter_leaf_at<R: Pixel, P: Pixel>(
     grid: &InterModeInfoGrid<'_>,
     ref_frame_idx: &[u8],
-    planes: &mut [PlaneReconContext<'_>],
+    planes: &mut [PlaneReconContext<'_, R, P>],
     mi_row: usize,
     mi_col: usize,
 ) -> Result<(), crate::Error> {

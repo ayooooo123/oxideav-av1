@@ -50,6 +50,7 @@ struct CompletedFrame {
 struct Job {
     id: usize,
     seq: Arc<SequenceHeader>,
+    decode: FrameDecode,
     fh: FrameHeader,
     info: RefInfo,
     slots: Slots,
@@ -104,6 +105,7 @@ struct Input {
 #[derive(Debug)]
 pub struct FrameThreadDecoder {
     seq: Option<Arc<SequenceHeader>>,
+    decode: FrameDecode,
     info: RefInfo,
     slots: Slots,
     chosen_op: u8,
@@ -145,6 +147,7 @@ impl FrameThreadDecoder {
         });
         let mut decoder = Self {
             seq: session.seq.clone().map(Arc::new), info: session.refs.info.clone(), slots,
+            decode: session.refs.decode,
             chosen_op: session.chosen_op, op_idc: session.op_idc,
             max_picture_size: session.max_picture_size, exec: exec.clone(),
             inputs: VecDeque::new(), pending: VecDeque::new(), ordered: VecDeque::new(),
@@ -239,7 +242,7 @@ impl FrameThreadDecoder {
         }));
         let session = SpecDecodeSession {
             seq: self.seq.as_ref().map(|seq| (**seq).clone()),
-            refs: SpecRefState { info: self.info.clone(), slots },
+            refs: SpecRefState { info: self.info.clone(), decode: self.decode, slots },
             chosen_op: self.chosen_op, op_idc: self.op_idc,
             max_picture_size: self.max_picture_size, exec: self.exec.clone(),
         };
@@ -401,6 +404,7 @@ impl FrameThreadDecoder {
                 let op = seq.operating_points.get(usize::from(self.chosen_op))
                     .ok_or(Error::OperatingPointOutOfRange)?;
                 self.op_idc = op.operating_point_idc;
+                self.decode = frame_decoder(seq.color_config.bit_depth);
                 self.seq = Some(Arc::new(seq));
             }
             ObuType::FrameHeader => {
@@ -485,7 +489,7 @@ impl FrameThreadDecoder {
             }
         }
         let job = Job { id: self.next_id, seq, fh, info: self.info.clone(), slots: self.slots.clone(),
-            needed, tiles, version: version.clone(), replay };
+            decode: self.decode, needed, tiles, version: version.clone(), replay };
         self.next_id = self.next_id.wrapping_add(1);
         self.publish_header(&job)?;
         self.ordered.push_back(Ordered { version, shown: replay || job.fh.show_frame, pts });
@@ -618,6 +622,7 @@ impl Drop for FrameThreadDecoder {
 fn run_job(job: Job, exec: &oxideav_core::ExecutionContext) -> Result<CompletedFrame, Error> {
     let mut refs = SpecRefState {
         info: job.info,
+        decode: job.decode,
         slots: core::array::from_fn(|i| {
             if !job.needed[i] { return None; }
             job.slots[i].as_ref().and_then(|version| version.result.get())
@@ -648,8 +653,7 @@ fn job_bytes(job: &Job) -> usize {
 
 fn slot_bytes(slot: &SpecRefSlot) -> usize {
     size_of::<SpecRefSlot>() + size_of::<TileCdfContext>()
-        + slot.planes.capacity() * size_of::<Vec<u16>>()
-        + slot.planes.iter().map(|plane| plane.capacity() * size_of::<u16>()).sum::<usize>()
+        + slot.planes.retained_bytes()
         + slot.plane_dims.capacity() * size_of::<(u32, u32)>()
         + slot.mf_mvs.capacity() * size_of::<i16>() + slot.mf_ref_frames.capacity()
         + slot.segment_ids.capacity() * size_of::<i32>()

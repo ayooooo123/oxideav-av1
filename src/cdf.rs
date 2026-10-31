@@ -13945,7 +13945,7 @@ pub fn tx_size_sqr_index(tx_size: usize) -> usize {
     (side.trailing_zeros() as usize) - 2
 }
 
-impl<P: crate::loop_filter::Pixel> PartitionWalker<P> {
+impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker<P, R> {
     /// r464 — import the per-mi grids of a `h4 × w4` rect from
     /// `src` (at `src_row`, `src_col`) into this walker at `dst_row`,
     /// `dst_col`: every per-cell grid, the `TxTypes[]` / `cdef_idx[]`
@@ -14086,7 +14086,7 @@ impl<P: crate::loop_filter::Pixel> PartitionWalker<P> {
     }
 }
 
-impl<P: crate::loop_filter::Pixel> PartitionWalker<P> {
+impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker<P, R> {
     /// r464 — diagnostic: the names of the fields on which `self` and
     /// `other` differ (empty when equal).
     #[doc(hidden)]
@@ -14127,9 +14127,6 @@ impl<P: crate::loop_filter::Pixel> PartitionWalker<P> {
         }
         if self.walk_avail_l != other.walk_avail_l {
             out.push("walk_avail_l");
-        }
-        if self.inter_pred_scratch != other.inter_pred_scratch {
-            out.push("inter_pred_scratch");
         }
         if !pal_eq_i32(&self.local_warp_params, &other.local_warp_params) {
             out.push("local_warp_params");
@@ -14288,7 +14285,7 @@ impl<P: crate::loop_filter::Pixel> PartitionWalker<P> {
     }
 }
 
-impl<P: crate::loop_filter::Pixel> PartitionWalker<P> {
+impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker<P, R> {
     /// `transform_type( x4, y4, txSz )` per §5.11.47 (av1-spec p.99-100).
     /// Decodes the per-luma-TU `TxType` from the bitstream and emits
     /// the value the caller stamps into `TxTypes[ y4 + j ][ x4 + i ]`.
@@ -15731,7 +15728,8 @@ const BD_STRIDE: usize = MAX_SB4 + 2;
 // r421: `Clone` so the encoder's search-side rate twin can price
 // candidate symbol sequences on a snapshot of the write-side mirror.
 #[derive(Debug, Clone)]
-pub struct PartitionWalker<P: crate::loop_filter::Pixel = i32> {
+pub struct PartitionWalker<P: crate::loop_filter::Pixel = i32, R: crate::loop_filter::Pixel = u16> {
+    reference_sample: core::marker::PhantomData<R>,
     mi_rows: u32,
     mi_cols: u32,
     geometry: TileGeometry,
@@ -15754,13 +15752,6 @@ pub struct PartitionWalker<P: crate::loop_filter::Pixel = i32> {
     /// §5.11.18 per-cell `AvailL` (`is_inside( MiRow, MiCol - 1 )`,
     /// av1-spec line 3916) — sibling of [`Self::walk_avail_u`].
     walk_avail_l: Vec<u8>,
-    /// In-walk §5.11.33 `predict_inter` scratch — per-plane `u16`
-    /// mirrors of `CurrFrame[ plane ]` (the §7.11.3 drivers operate
-    /// on `u16` planes; the walker's buffers are post-`Clip1` `i32`,
-    /// so both directions of the mirror are lossless). Lazily sized
-    /// on first use; only the leaf's plane rect is synced per
-    /// prediction, so stale samples outside the rect are never read.
-    inter_pred_scratch: [Vec<u16>; 3],
     /// §7.11.3.8 `LocalWarpParams[ 0..6 ]` per cell — stamped at a
     /// `WARPED_CAUSAL` leaf's origin by the §5.11.5 inter arm (the
     /// §7.10.4 sample list + §7.11.3.8 least-squares fit run at the
@@ -16620,7 +16611,7 @@ pub struct TileDecodeParams<'a> {
     pub enable_intra_edge_filter: bool,
 }
 
-impl<P: crate::loop_filter::Pixel> PartitionWalker<P> {
+impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker<P, R> {
     /// Construct a fresh walker for a frame with the given mi-unit
     /// extent and tile bounds. Every `MiSizes[]` cell starts at
     /// [`BLOCK_INVALID`] (the §5.11.4 unfilled-cell sentinel).
@@ -16863,13 +16854,13 @@ impl<P: crate::loop_filter::Pixel> PartitionWalker<P> {
             }
         }
         Some(Self {
+            reference_sample: core::marker::PhantomData,
             mi_rows,
             mi_cols,
             geometry,
             enable_intra_edge_filter: false,
             walk_avail_u,
             walk_avail_l,
-            inter_pred_scratch: [Vec::new(), Vec::new(), Vec::new()],
             // r464 — materialised lazily by the first WARPED_CAUSAL
             // stamp (`ensure_local_warp_params`): 24 bytes per mi, 18
             // MB of zeros per walker at 12 MP that an intra frame
@@ -17031,7 +17022,7 @@ impl<P: crate::loop_filter::Pixel> PartitionWalker<P> {
     ///
     /// Indexed `samples()[ y * cols + x ]` against the `(rows, cols)`
     /// pair returned by [`Self::curr_frame_dims`]. Sample values are
-    /// `i32` post-`Clip1` (so always in `0..=(1 << BitDepth) - 1` for
+    /// native post-`Clip1` (so always in `0..=(1 << BitDepth) - 1` for
     /// the `BitDepth` the §7.12.3 step-3 merge was driven with).
     ///
     /// `plane` is `0` (Y), `1` (Cb), `2` (Cr); out-of-range `plane`
@@ -17048,7 +17039,7 @@ impl<P: crate::loop_filter::Pixel> PartitionWalker<P> {
     /// §7.16 / §7.17 in-loop passes operate on caller-owned buffers
     /// and nothing in the walker reads `CurrFrame` after the walk, so
     /// the frame driver takes ownership instead of copying the
-    /// full-frame `i32` buffer. Returns `(rows, cols, samples)`; the
+    /// full-frame native buffer. Returns `(rows, cols, samples)`; the
     /// plane's slot is left unallocated (as before the first merge).
     pub(crate) fn take_curr_frame_plane(&mut self, plane: usize) -> Option<(u32, u32, Vec<P>)> {
         self.curr_frame
@@ -17909,13 +17900,8 @@ impl<P: crate::loop_filter::Pixel> PartitionWalker<P> {
     /// caller bug ([`crate::Error::PartitionWalkOutOfRange`]) — the intra
     /// half of the blend must already be present.
     ///
-    /// The walker buffers are `i32` (post-`Clip1`, always in
-    /// `0..=(1 << BitDepth) - 1`); the §7.11.3.14 driver works in `u16`,
-    /// so this bridge materialises a `u16` mirror of each plane buffer,
-    /// drives the blend, and copies the (post-`Clip1`, in-range) result
-    /// back as `i32`. The mirror is the whole plane buffer (the driver
-    /// addresses it at the leaf's plane-space `(baseX, baseY)` origin via
-    /// `curr_stride`).
+    /// The walker buffers hold native post-`Clip1` samples. Plane contexts
+    /// borrow them directly for the blend's strided write footprint.
     ///
     /// Returns [`crate::Error::PartitionWalkOutOfRange`] for an empty
     /// `plane_refs`, a `plane >= 3`, a plane with no tracked buffer, or
@@ -17928,83 +17914,31 @@ impl<P: crate::loop_filter::Pixel> PartitionWalker<P> {
         leaf: &crate::InterIntraLeaf,
         ref_frame_idx: &[u8],
         bit_depth: u8,
-        plane_refs: &[crate::PlaneRefSpec<'_>],
+        plane_refs: &[crate::PlaneRefSpec<'_, R>],
     ) -> Result<(), crate::Error> {
         if plane_refs.is_empty() {
             return Err(crate::Error::PartitionWalkOutOfRange);
         }
-        // Materialise a `u16` mirror of each plane's `i32` `curr_frame`
-        // buffer (the intra half of the §7.11.3.14 blend the step-3
-        // merge already wrote). Each `plane_refs[k].plane` must have an
-        // allocated buffer; samples are post-`Clip1` so the `i32 → u16`
-        // narrowing is lossless.
-        let mut mirrors: Vec<(u8, Vec<u16>, usize, usize)> = Vec::new();
-        if mirrors.try_reserve(plane_refs.len()).is_err() {
-            return Err(crate::Error::PartitionWalkOutOfRange);
-        }
+        let mut slots = self.curr_frame.each_mut().map(|plane| plane.as_mut());
+        let mut planes: Vec<crate::PlaneReconContext<'_, R, P>> = Vec::new();
+        planes.try_reserve(plane_refs.len()).map_err(|_| crate::Error::PartitionWalkOutOfRange)?;
         for spec in plane_refs {
-            let p = spec.plane as usize;
-            if p >= 3 {
-                return Err(crate::Error::PartitionWalkOutOfRange);
-            }
-            let Some(cp) = self.curr_frame[p].as_ref() else {
-                // No tracked buffer — the intra half of the blend has
-                // not been written yet (caller-bug ordering).
-                return Err(crate::Error::PartitionWalkOutOfRange);
-            };
-            let cols = cp.cols as usize;
-            let rows = cp.rows as usize;
-            let mut mirror: Vec<u16> = Vec::new();
-            if mirror.try_reserve_exact(cp.samples.len()).is_err() {
-                return Err(crate::Error::PartitionWalkOutOfRange);
-            }
-            mirror.extend(cp.samples.iter().map(|&s| s.to_i32() as u16));
-            mirrors.push((spec.plane, mirror, cols, rows));
+            let cp = slots.get_mut(spec.plane as usize).and_then(Option::take)
+                .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+            planes.push(crate::PlaneReconContext {
+                plane: spec.plane,
+                subsampling_x: spec.subsampling_x,
+                subsampling_y: spec.subsampling_y,
+                frame_store: spec.frame_store,
+                frame_width: spec.frame_width,
+                frame_height: spec.frame_height,
+                curr: &mut cp.samples,
+                curr_stride: cp.cols as usize,
+            });
         }
-        // Build the per-plane reconstruction contexts over the mirrors.
-        // The mirror borrow and the `plane_refs` borrow are disjoint
-        // (the frame store lives in `plane_refs`, the curr buffer in the
-        // mirror), so the contexts can hold both.
-        {
-            let mut planes: Vec<crate::PlaneReconContext<'_>> = Vec::new();
-            if planes.try_reserve(plane_refs.len()).is_err() {
-                return Err(crate::Error::PartitionWalkOutOfRange);
-            }
-            for ((p, mirror, cols, _rows), spec) in mirrors.iter_mut().zip(plane_refs.iter()) {
-                planes.push(crate::PlaneReconContext {
-                    plane: *p,
-                    subsampling_x: spec.subsampling_x,
-                    subsampling_y: spec.subsampling_y,
-                    frame_store: spec.frame_store,
-                    frame_width: spec.frame_width,
-                    frame_height: spec.frame_height,
-                    curr: mirror.as_mut_slice(),
-                    curr_stride: *cols,
-                });
-            }
-            crate::reconstruct_inter_intra_from_dispatch(
-                readout,
-                leaf,
-                ref_frame_idx,
-                bit_depth,
-                // Translational inter half — this walker bridge
-                // carries no §5.9.24 global-motion context; the
-                // in-walk §5.11.33 route supplies the §7.11.3.1
-                // step-7 warp context for GLOBALMV-class leaves.
-                None,
-                &mut planes,
-            )?;
-        }
-        // §7.11.3.1 final step writes the blended samples in place; copy
-        // the (post-`Clip1`, in-range) `u16` result back into the
-        // walker's `i32` `curr_frame` buffers.
-        for (p, mirror, _cols, _rows) in &mirrors {
-            if let Some(cp) = self.curr_frame[*p as usize].as_mut() {
-                for (dst, &src) in cp.samples.iter_mut().zip(mirror.iter()) {
-                    *dst = P::from_i32(src as i32);
-                }
-            }
-        }
+        crate::reconstruct_inter_intra_from_dispatch(
+            readout, leaf, ref_frame_idx, bit_depth, None, &mut planes,
+        )?;
         Ok(())
     }
 
@@ -18030,16 +17964,12 @@ impl<P: crate::loop_filter::Pixel> PartitionWalker<P> {
     /// does not own the decoded-picture buffer), and the §7.11.3.2
     /// interpolation-filter pair through the shared
     /// [`crate::reconstruct_inter_block`] driver, then writes the
-    /// (post-`Clip1`, in-range) result back into the walker's `i32`
-    /// `curr_frame` buffer.
+    /// clipped result directly into the walker's native `curr_frame` buffer.
     ///
     /// `x` / `y` are the block's top-left in `ref_spec.plane`-space
     /// samples; `w` / `h` are its plane-space size. The walker buffer is
-    /// `i32` (post-`Clip1`, always in `0..=(1 << BitDepth) - 1`); the
-    /// driver works in `u16`, so the bridge mirrors the plane buffer to
-    /// `u16`, drives the block, and copies the result back as `i32`
-    /// (lossless in both directions). Only the `w × h` write footprint
-    /// changes; the rest of the mirror round-trips unchanged.
+    /// native and post-`Clip1`; the driver writes the `w × h` footprint
+    /// directly, leaving the rest of the plane unchanged.
     ///
     /// Returns [`crate::Error::PartitionWalkOutOfRange`] for a
     /// `ref_spec.plane >= 3`, negative `x` / `y`, a `w`/`h` write region
@@ -18052,7 +17982,7 @@ impl<P: crate::loop_filter::Pixel> PartitionWalker<P> {
         &mut self,
         mode_info: crate::InterModeInfo,
         ref_frame_idx: &[u8],
-        ref_spec: &crate::PlaneRefSpec<'_>,
+        ref_spec: &crate::PlaneRefSpec<'_, R>,
         x: i32,
         y: i32,
         w: usize,
@@ -18074,19 +18004,11 @@ impl<P: crate::loop_filter::Pixel> PartitionWalker<P> {
         let rows = (self.mi_rows * (MI_SIZE as u32)) >> ref_spec.subsampling_y;
         let cols = (self.mi_cols * (MI_SIZE as u32)) >> ref_spec.subsampling_x;
         self.ensure_curr_frame_plane(p, rows, cols);
-        let Some(cp) = self.curr_frame[p].as_ref() else {
+        let Some(cp) = self.curr_frame[p].as_mut() else {
             // Allocation failed (try_reserve) — surface as a caller-bug.
             return Err(crate::Error::PartitionWalkOutOfRange);
         };
         let buf_cols = cp.cols as usize;
-        // Materialise a `u16` mirror of the whole `i32` plane buffer; the
-        // samples are post-`Clip1` so the `i32 → u16` narrowing is
-        // lossless.
-        let mut mirror: Vec<u16> = Vec::new();
-        if mirror.try_reserve_exact(cp.samples.len()).is_err() {
-            return Err(crate::Error::PartitionWalkOutOfRange);
-        }
-        mirror.extend(cp.samples.iter().map(|&s| s.to_i32() as u16));
 
         // Drive the single-ref translational reconstruction; the final
         // stitch overwrites the `w × h` footprint at `(x, y)`.
@@ -18106,17 +18028,10 @@ impl<P: crate::loop_filter::Pixel> PartitionWalker<P> {
             ref_spec.frame_height,
             interp_filter_x,
             interp_filter_y,
-            mirror.as_mut_slice(),
+            &mut cp.samples,
             buf_cols,
         )?;
 
-        // Copy the (post-`Clip1`, in-range) `u16` result back into the
-        // walker's `i32` `curr_frame` buffer.
-        if let Some(cp) = self.curr_frame[p].as_mut() {
-            for (dst, &src) in cp.samples.iter_mut().zip(mirror.iter()) {
-                *dst = P::from_i32(src as i32);
-            }
-        }
         Ok(())
     }
 
@@ -18143,10 +18058,7 @@ impl<P: crate::loop_filter::Pixel> PartitionWalker<P> {
     ///
     /// `x` / `y` are the block's top-left in `ref_spec.plane`-space
     /// samples; `w` / `h` are its plane-space size. The walker buffer is
-    /// `i32` (post-`Clip1`); the driver works in `u16`, so the bridge
-    /// mirrors the plane buffer to `u16`, drives the block, and copies the
-    /// result back as `i32` (lossless in both directions). Only the
-    /// `w × h` write footprint changes.
+    /// native and post-`Clip1`; only the `w × h` write footprint changes.
     ///
     /// Returns [`crate::Error::PartitionWalkOutOfRange`] for a
     /// `ref_spec.plane >= 3`, negative `x` / `y`, a `w`/`h` write region
@@ -18160,7 +18072,7 @@ impl<P: crate::loop_filter::Pixel> PartitionWalker<P> {
         mode_info: crate::InterModeInfo,
         warp: &crate::WarpDriverParams,
         ref_frame_idx: &[u8],
-        ref_spec: &crate::PlaneRefSpec<'_>,
+        ref_spec: &crate::PlaneRefSpec<'_, R>,
         x: i32,
         y: i32,
         w: usize,
@@ -18179,18 +18091,10 @@ impl<P: crate::loop_filter::Pixel> PartitionWalker<P> {
         let rows = (self.mi_rows * (MI_SIZE as u32)) >> ref_spec.subsampling_y;
         let cols = (self.mi_cols * (MI_SIZE as u32)) >> ref_spec.subsampling_x;
         self.ensure_curr_frame_plane(p, rows, cols);
-        let Some(cp) = self.curr_frame[p].as_ref() else {
+        let Some(cp) = self.curr_frame[p].as_mut() else {
             return Err(crate::Error::PartitionWalkOutOfRange);
         };
         let buf_cols = cp.cols as usize;
-        // Materialise a `u16` mirror of the whole `i32` plane buffer; the
-        // samples are post-`Clip1` so the `i32 → u16` narrowing is
-        // lossless.
-        let mut mirror: Vec<u16> = Vec::new();
-        if mirror.try_reserve_exact(cp.samples.len()).is_err() {
-            return Err(crate::Error::PartitionWalkOutOfRange);
-        }
-        mirror.extend(cp.samples.iter().map(|&s| s.to_i32() as u16));
 
         // Drive the single-ref warped reconstruction; the final stitch
         // overwrites the `w × h` footprint at `(x, y)`.
@@ -18211,17 +18115,10 @@ impl<P: crate::loop_filter::Pixel> PartitionWalker<P> {
             ref_spec.frame_height,
             interp_filter_x,
             interp_filter_y,
-            mirror.as_mut_slice(),
+            &mut cp.samples,
             buf_cols,
         )?;
 
-        // Copy the (post-`Clip1`, in-range) `u16` result back into the
-        // walker's `i32` `curr_frame` buffer.
-        if let Some(cp) = self.curr_frame[p].as_mut() {
-            for (dst, &src) in cp.samples.iter_mut().zip(mirror.iter()) {
-                *dst = P::from_i32(src as i32);
-            }
-        }
         Ok(())
     }
 
@@ -18252,10 +18149,7 @@ impl<P: crate::loop_filter::Pixel> PartitionWalker<P> {
     ///
     /// `x` / `y` are the block's top-left in `ref_spec.plane`-space
     /// samples; `w` / `h` are its plane-space size. The walker buffer is
-    /// `i32` (post-`Clip1`); the driver works in `u16`, so the bridge
-    /// mirrors the plane buffer to `u16`, drives the block, and copies the
-    /// result back as `i32` (lossless in both directions). Only the
-    /// `w × h` write footprint changes.
+    /// native and post-`Clip1`; only the `w × h` write footprint changes.
     ///
     /// Returns [`crate::Error::PartitionWalkOutOfRange`] for a
     /// `ref_spec.plane >= 3`, negative `x` / `y`, a `w`/`h` write region
@@ -18267,9 +18161,9 @@ impl<P: crate::loop_filter::Pixel> PartitionWalker<P> {
     pub fn reconstruct_inter_block_obmc_into_curr_frame(
         &mut self,
         mode_info: crate::InterModeInfo,
-        obmc: &crate::ObmcParams<'_, '_>,
+        obmc: &crate::ObmcParams<'_, '_, R>,
         ref_frame_idx: &[u8],
-        ref_spec: &crate::PlaneRefSpec<'_>,
+        ref_spec: &crate::PlaneRefSpec<'_, R>,
         x: i32,
         y: i32,
         w: usize,
@@ -18288,18 +18182,10 @@ impl<P: crate::loop_filter::Pixel> PartitionWalker<P> {
         let rows = (self.mi_rows * (MI_SIZE as u32)) >> ref_spec.subsampling_y;
         let cols = (self.mi_cols * (MI_SIZE as u32)) >> ref_spec.subsampling_x;
         self.ensure_curr_frame_plane(p, rows, cols);
-        let Some(cp) = self.curr_frame[p].as_ref() else {
+        let Some(cp) = self.curr_frame[p].as_mut() else {
             return Err(crate::Error::PartitionWalkOutOfRange);
         };
         let buf_cols = cp.cols as usize;
-        // Materialise a `u16` mirror of the whole `i32` plane buffer; the
-        // samples are post-`Clip1` so the `i32 → u16` narrowing is
-        // lossless.
-        let mut mirror: Vec<u16> = Vec::new();
-        if mirror.try_reserve_exact(cp.samples.len()).is_err() {
-            return Err(crate::Error::PartitionWalkOutOfRange);
-        }
-        mirror.extend(cp.samples.iter().map(|&s| s.to_i32() as u16));
 
         // Drive the single-ref OBMC reconstruction; the final stitch
         // overwrites the `w × h` footprint at `(x, y)`.
@@ -18320,17 +18206,10 @@ impl<P: crate::loop_filter::Pixel> PartitionWalker<P> {
             ref_spec.frame_height,
             interp_filter_x,
             interp_filter_y,
-            mirror.as_mut_slice(),
+            &mut cp.samples,
             buf_cols,
         )?;
 
-        // Copy the (post-`Clip1`, in-range) `u16` result back into the
-        // walker's `i32` `curr_frame` buffer.
-        if let Some(cp) = self.curr_frame[p].as_mut() {
-            for (dst, &src) in cp.samples.iter_mut().zip(mirror.iter()) {
-                *dst = P::from_i32(src as i32);
-            }
-        }
         Ok(())
     }
 
@@ -18361,7 +18240,7 @@ impl<P: crate::loop_filter::Pixel> PartitionWalker<P> {
     /// pair through the shared
     /// [`crate::inter_pred::reconstruct_inter_block_compound`] driver, then
     /// writes the (post-`Clip1`, in-range) result back into the walker's
-    /// `i32` `curr_frame` buffer.
+    /// native `curr_frame` buffer.
     ///
     /// The [`crate::COMPOUND_DIFFWTD`] arm's §7.11.3.12 mask is derived
     /// inside the driver from the two formed `preds[]` at `plane == 0`. For
@@ -18376,10 +18255,7 @@ impl<P: crate::loop_filter::Pixel> PartitionWalker<P> {
     ///
     /// `x` / `y` are the block's top-left in `ref_spec.plane`-space
     /// samples; `w` / `h` are its plane-space size. The walker buffer is
-    /// `i32` (post-`Clip1`); the driver works in `u16`, so the bridge
-    /// mirrors the plane buffer to `u16`, drives the block, and copies the
-    /// result back as `i32` (lossless both directions). Only the `w × h`
-    /// write footprint changes.
+    /// native and post-`Clip1`; only the `w × h` write footprint changes.
     ///
     /// Returns [`crate::Error::PartitionWalkOutOfRange`] for a
     /// `ref_spec.plane >= 3`, negative `x` / `y`, a `w`/`h` write region
@@ -18394,7 +18270,7 @@ impl<P: crate::loop_filter::Pixel> PartitionWalker<P> {
         mode_info: crate::inter_pred::CompoundInterModeInfo,
         order_hints: crate::inter_pred::CompoundOrderHintContext,
         ref_frame_idx: &[u8],
-        ref_spec: &crate::PlaneRefSpec<'_>,
+        ref_spec: &crate::PlaneRefSpec<'_, R>,
         x: i32,
         y: i32,
         w: usize,
@@ -18413,18 +18289,10 @@ impl<P: crate::loop_filter::Pixel> PartitionWalker<P> {
         let rows = (self.mi_rows * (MI_SIZE as u32)) >> ref_spec.subsampling_y;
         let cols = (self.mi_cols * (MI_SIZE as u32)) >> ref_spec.subsampling_x;
         self.ensure_curr_frame_plane(p, rows, cols);
-        let Some(cp) = self.curr_frame[p].as_ref() else {
+        let Some(cp) = self.curr_frame[p].as_mut() else {
             return Err(crate::Error::PartitionWalkOutOfRange);
         };
         let buf_cols = cp.cols as usize;
-        // Materialise a `u16` mirror of the whole `i32` plane buffer; the
-        // samples are post-`Clip1` so the `i32 → u16` narrowing is
-        // lossless.
-        let mut mirror: Vec<u16> = Vec::new();
-        if mirror.try_reserve_exact(cp.samples.len()).is_err() {
-            return Err(crate::Error::PartitionWalkOutOfRange);
-        }
-        mirror.extend(cp.samples.iter().map(|&s| s.to_i32() as u16));
 
         // §7.11.3.12 DIFFWTD persistent luma-grid mask — for a single
         // (luma) bridge call the mask buffer is `w × h`. The driver fills
@@ -18462,17 +18330,10 @@ impl<P: crate::loop_filter::Pixel> PartitionWalker<P> {
             interp_filter_y,
             diffwtd_arg,
             /* warp */ None,
-            mirror.as_mut_slice(),
+            &mut cp.samples,
             buf_cols,
         )?;
 
-        // Copy the (post-`Clip1`, in-range) `u16` result back into the
-        // walker's `i32` `curr_frame` buffer.
-        if let Some(cp) = self.curr_frame[p].as_mut() {
-            for (dst, &src) in cp.samples.iter_mut().zip(mirror.iter()) {
-                *dst = P::from_i32(src as i32);
-            }
-        }
         Ok(())
     }
 
@@ -18522,9 +18383,7 @@ impl<P: crate::loop_filter::Pixel> PartitionWalker<P> {
     /// ignored (the loop index drives it). `num_planes` is `1` (luma-only)
     /// or `3` (Y/Cb/Cr); chroma planes are skipped when `num_planes == 1`.
     ///
-    /// Like the single-plane bridges, the walker buffer is `i32`
-    /// (post-`Clip1`); the driver works in `u16`, so each plane is
-    /// mirrored, driven, and copied back (lossless). Each plane's buffer
+    /// Each native post-`Clip1` plane is written directly. Its buffer
     /// is allocated if untouched (compound overwrites — no intra-half
     /// prerequisite), sized from `MiRows × MiCols × MI_SIZE >>
     /// subsampling_*` so a later §7.12.3 step-3 merge is a no-op.
@@ -18543,7 +18402,7 @@ impl<P: crate::loop_filter::Pixel> PartitionWalker<P> {
         mode_info: crate::inter_pred::CompoundInterModeInfo,
         order_hints: crate::inter_pred::CompoundOrderHintContext,
         ref_frame_idx: &[u8],
-        plane_specs: &[crate::PlaneRefSpec<'_>],
+        plane_specs: &[crate::PlaneRefSpec<'_, R>],
         mi_col: u32,
         mi_row: u32,
         mi_size: usize,
@@ -18598,17 +18457,10 @@ impl<P: crate::loop_filter::Pixel> PartitionWalker<P> {
             let rows = (self.mi_rows * (MI_SIZE as u32)) >> sub_y;
             let cols = (self.mi_cols * (MI_SIZE as u32)) >> sub_x;
             self.ensure_curr_frame_plane(plane, rows, cols);
-            let Some(cp) = self.curr_frame[plane].as_ref() else {
+            let Some(cp) = self.curr_frame[plane].as_mut() else {
                 return Err(crate::Error::PartitionWalkOutOfRange);
             };
             let buf_cols = cp.cols as usize;
-            // `u16` mirror of the whole `i32` plane buffer (samples are
-            // post-`Clip1`, so the narrowing is lossless).
-            let mut mirror: Vec<u16> = Vec::new();
-            if mirror.try_reserve_exact(cp.samples.len()).is_err() {
-                return Err(crate::Error::PartitionWalkOutOfRange);
-            }
-            mirror.extend(cp.samples.iter().map(|&s| s.to_i32() as u16));
 
             // The DIFFWTD arm receives the *shared* luma-grid mask; the
             // `plane == 0` call fills it, the chroma calls read it
@@ -18638,15 +18490,10 @@ impl<P: crate::loop_filter::Pixel> PartitionWalker<P> {
                 interp_filter_y,
                 diffwtd_arg,
                 /* warp */ None,
-                mirror.as_mut_slice(),
+                &mut cp.samples,
                 buf_cols,
             )?;
 
-            if let Some(cp) = self.curr_frame[plane].as_mut() {
-                for (dst, &src) in cp.samples.iter_mut().zip(mirror.iter()) {
-                    *dst = P::from_i32(src as i32);
-                }
-            }
         }
         Ok(())
     }
@@ -18689,9 +18536,7 @@ impl<P: crate::loop_filter::Pixel> PartitionWalker<P> {
     /// is `1` (luma-only) or `3` (Y/Cb/Cr); chroma planes are skipped
     /// when `num_planes == 1`.
     ///
-    /// Like the single-plane bridges, the walker buffer is `i32`
-    /// (post-`Clip1`); the driver works in `u16`, so each plane is
-    /// mirrored, driven, and copied back (lossless). Each plane's buffer
+    /// Each native post-`Clip1` plane is written directly. Its buffer
     /// is allocated if untouched (single-ref overwrites — no intra-half
     /// prerequisite), sized from `MiRows × MiCols × MI_SIZE >>
     /// subsampling_*` so a later §7.12.3 step-3 merge is a no-op.
@@ -18707,7 +18552,7 @@ impl<P: crate::loop_filter::Pixel> PartitionWalker<P> {
         &mut self,
         mode_info: crate::InterModeInfo,
         ref_frame_idx: &[u8],
-        plane_specs: &[crate::PlaneRefSpec<'_>],
+        plane_specs: &[crate::PlaneRefSpec<'_, R>],
         mi_col: u32,
         mi_row: u32,
         mi_size: usize,
@@ -18749,17 +18594,10 @@ impl<P: crate::loop_filter::Pixel> PartitionWalker<P> {
             let rows = (self.mi_rows * (MI_SIZE as u32)) >> sub_y;
             let cols = (self.mi_cols * (MI_SIZE as u32)) >> sub_x;
             self.ensure_curr_frame_plane(plane, rows, cols);
-            let Some(cp) = self.curr_frame[plane].as_ref() else {
+            let Some(cp) = self.curr_frame[plane].as_mut() else {
                 return Err(crate::Error::PartitionWalkOutOfRange);
             };
             let buf_cols = cp.cols as usize;
-            // `u16` mirror of the whole `i32` plane buffer (samples are
-            // post-`Clip1`, so the narrowing is lossless).
-            let mut mirror: Vec<u16> = Vec::new();
-            if mirror.try_reserve_exact(cp.samples.len()).is_err() {
-                return Err(crate::Error::PartitionWalkOutOfRange);
-            }
-            mirror.extend(cp.samples.iter().map(|&s| s.to_i32() as u16));
 
             crate::reconstruct_inter_block(
                 mode_info,
@@ -18777,15 +18615,10 @@ impl<P: crate::loop_filter::Pixel> PartitionWalker<P> {
                 spec.frame_height,
                 interp_filter_x,
                 interp_filter_y,
-                mirror.as_mut_slice(),
+                &mut cp.samples,
                 buf_cols,
             )?;
 
-            if let Some(cp) = self.curr_frame[plane].as_mut() {
-                for (dst, &src) in cp.samples.iter_mut().zip(mirror.iter()) {
-                    *dst = P::from_i32(src as i32);
-                }
-            }
         }
         Ok(())
     }
@@ -19131,9 +18964,7 @@ impl<P: crate::loop_filter::Pixel> PartitionWalker<P> {
     ///
     /// Each plane buffer is allocated (sized `MiRows × MiCols × MI_SIZE >>
     /// subsampling_*`) if it has not been touched yet; the walker buffer is
-    /// `i32` (post-`Clip1`), the driver works in `u16`, so the bridge
-    /// mirrors each plane to `u16`, drives the frame, and copies the result
-    /// back as `i32` (lossless in both directions).
+    /// native and post-`Clip1`, and the frame driver borrows it directly.
     ///
     /// Returns [`crate::Error::PartitionWalkOutOfRange`] for an empty
     /// `plane_refs`, a `plane_refs[k].plane >= 3`, an allocation failure,
@@ -19145,7 +18976,7 @@ impl<P: crate::loop_filter::Pixel> PartitionWalker<P> {
         &mut self,
         ref_frame_idx: &[u8],
         bit_depth: u8,
-        plane_refs: &[crate::PlaneRefSpec<'_>],
+        plane_refs: &[crate::PlaneRefSpec<'_, R>],
     ) -> Result<(), crate::Error> {
         // Delegate with identity-zero §7.11.3.15 order hints. The
         // mask-free [`COMPOUND_AVERAGE`], the [`COMPOUND_WEDGE`], the
@@ -19175,7 +19006,7 @@ impl<P: crate::loop_filter::Pixel> PartitionWalker<P> {
         &mut self,
         ref_frame_idx: &[u8],
         bit_depth: u8,
-        plane_refs: &[crate::PlaneRefSpec<'_>],
+        plane_refs: &[crate::PlaneRefSpec<'_, R>],
         order_hints: FrameInterOrderHints,
     ) -> Result<(), crate::Error> {
         if plane_refs.is_empty() {
@@ -19188,85 +19019,14 @@ impl<P: crate::loop_filter::Pixel> PartitionWalker<P> {
             .checked_mul(mi_cols as usize)
             .ok_or(crate::Error::PartitionWalkOutOfRange)?;
 
-        // Snapshot the grid slices into owned buffers. `reconstruct_inter_frame`
-        // borrows the grid (`&InterModeInfoGrid`) and the plane buffers
-        // (`&mut [PlaneReconContext]`) at once; the grid slices live in
-        // `&self` while the plane mirrors live in fresh allocations, so
-        // copying the grids out of `self` lets both borrows coexist.
-        let mut mi_sizes_snap: Vec<usize> = Vec::new();
-        let mut is_inters_snap: Vec<u8> = Vec::new();
-        let mut ref_frames_snap: Vec<i8> = Vec::new();
-        let mut mvs_snap: Vec<i16> = Vec::new();
-        let mut interp_filters_snap: Vec<u8> = Vec::new();
-        if mi_sizes_snap.try_reserve_exact(cells).is_err()
-            || is_inters_snap.try_reserve_exact(cells).is_err()
-            || ref_frames_snap.try_reserve_exact(cells * 2).is_err()
-            || mvs_snap.try_reserve_exact(cells * 4).is_err()
-            || interp_filters_snap.try_reserve_exact(cells * 2).is_err()
-        {
-            return Err(crate::Error::PartitionWalkOutOfRange);
-        }
-        mi_sizes_snap.extend_from_slice(&self.mi_sizes[..cells]);
-        is_inters_snap.extend_from_slice(&self.is_inters[..cells]);
-        ref_frames_snap.extend_from_slice(&self.ref_frames[..cells * 2]);
-        mvs_snap.extend_from_slice(&self.mvs[..cells * 4]);
-        interp_filters_snap.extend_from_slice(&self.interp_filters[..cells * 2]);
-
-        // Snapshot the §5.11.29 / §5.11.28 compound / inter-intra
-        // side-data grids the §5.11.23 inter cascade stamped, so the
-        // frame walk dispatches a decoded compound (AVERAGE / DISTANCE /
-        // WEDGE / DIFFWTD) or inter-intra leaf through the matching
-        // §7.11.3 arm instead of driving it translationally. Each is
-        // read only at the matching leaf-origin cell; the stamped values
-        // collapse to the §5.11.29 / §5.11.28 short-circuit defaults on
-        // single-ref / intra cells the walk never reads.
-        let mut compound_types_snap: Vec<u8> = Vec::new();
-        let mut compound_wedge_indices_snap: Vec<u8> = Vec::new();
-        let mut compound_wedge_signs_snap: Vec<u8> = Vec::new();
-        let mut compound_mask_types_snap: Vec<u8> = Vec::new();
-        let mut interintra_modes_snap: Vec<u8> = Vec::new();
-        let mut wedge_interintras_snap: Vec<u8> = Vec::new();
-        let mut interintra_wedge_indices_snap: Vec<u8> = Vec::new();
-        if compound_types_snap.try_reserve_exact(cells).is_err()
-            || compound_wedge_indices_snap
-                .try_reserve_exact(cells)
-                .is_err()
-            || compound_wedge_signs_snap.try_reserve_exact(cells).is_err()
-            || compound_mask_types_snap.try_reserve_exact(cells).is_err()
-            || interintra_modes_snap.try_reserve_exact(cells).is_err()
-            || wedge_interintras_snap.try_reserve_exact(cells).is_err()
-            || interintra_wedge_indices_snap
-                .try_reserve_exact(cells)
-                .is_err()
-        {
-            return Err(crate::Error::PartitionWalkOutOfRange);
-        }
-        compound_types_snap.extend_from_slice(&self.compound_types[..cells]);
-        compound_wedge_indices_snap.extend_from_slice(&self.compound_wedge_indices[..cells]);
-        compound_wedge_signs_snap.extend_from_slice(&self.compound_wedge_signs[..cells]);
-        compound_mask_types_snap.extend_from_slice(&self.compound_mask_types[..cells]);
-        interintra_modes_snap.extend_from_slice(&self.interintra_modes[..cells]);
-        wedge_interintras_snap.extend_from_slice(&self.wedge_interintras[..cells]);
-        interintra_wedge_indices_snap.extend_from_slice(&self.interintra_wedge_indices[..cells]);
-
-        // §5.11.27 / §7.11.3.9 OBMC context: snapshot the per-cell
-        // `motion_modes` grid the §5.11.27 read stamped, and derive the
-        // §5.11.18 `AvailU` / `AvailL` per-cell availability grids from the
-        // walker's tile geometry (`AvailU = is_inside(MiRow - 1, MiCol)`,
-        // `AvailL = is_inside(MiRow, MiCol - 1)` — av1-spec lines
-        // 3915-3916). The frame walk then dispatches a decoded
-        // `motion_mode == OBMC` single-ref leaf to the §7.11.3.9-10 overlap
-        // path, resolving its neighbour lists internally from the grid.
-        let mut motion_modes_snap: Vec<u8> = Vec::new();
+        // Availability is derived from the frame walk's tile geometry.
         let mut avail_u_snap: Vec<u8> = Vec::new();
         let mut avail_l_snap: Vec<u8> = Vec::new();
-        if motion_modes_snap.try_reserve_exact(cells).is_err()
-            || avail_u_snap.try_reserve_exact(cells).is_err()
+        if avail_u_snap.try_reserve_exact(cells).is_err()
             || avail_l_snap.try_reserve_exact(cells).is_err()
         {
             return Err(crate::Error::PartitionWalkOutOfRange);
         }
-        motion_modes_snap.extend_from_slice(&self.motion_modes[..cells]);
         for r in 0..(mi_rows as usize) {
             for c in 0..(mi_cols as usize) {
                 avail_u_snap.push(self.geometry.is_inside(r as i32 - 1, c as i32) as u8);
@@ -19274,15 +19034,7 @@ impl<P: crate::loop_filter::Pixel> PartitionWalker<P> {
             }
         }
 
-        // Mirror each plane's `i32` `curr_frame` buffer to `u16`,
-        // allocating the plane if the residual merge has not yet touched it
-        // (a skip-coded P-frame block has no residual writer, so its plane
-        // can be untouched at this point). Samples are post-`Clip1` so the
-        // `i32 → u16` narrowing is lossless.
-        let mut mirrors: Vec<(u8, Vec<u16>, usize)> = Vec::new();
-        if mirrors.try_reserve(plane_refs.len()).is_err() {
-            return Err(crate::Error::PartitionWalkOutOfRange);
-        }
+        // Allocate untouched native planes before borrowing metadata and pixels.
         for spec in plane_refs {
             let p = spec.plane as usize;
             if p >= 3 {
@@ -19291,35 +19043,23 @@ impl<P: crate::loop_filter::Pixel> PartitionWalker<P> {
             let rows = (mi_rows * (MI_SIZE as u32)) >> spec.subsampling_y;
             let cols = (mi_cols * (MI_SIZE as u32)) >> spec.subsampling_x;
             self.ensure_curr_frame_plane(p, rows, cols);
-            let Some(cp) = self.curr_frame[p].as_ref() else {
-                return Err(crate::Error::PartitionWalkOutOfRange);
-            };
-            let buf_cols = cp.cols as usize;
-            let mut mirror: Vec<u16> = Vec::new();
-            if mirror.try_reserve_exact(cp.samples.len()).is_err() {
-                return Err(crate::Error::PartitionWalkOutOfRange);
-            }
-            mirror.extend(cp.samples.iter().map(|&s| s.to_i32() as u16));
-            mirrors.push((spec.plane, mirror, buf_cols));
         }
 
-        // Drive the frame walk. The grid snapshots and plane mirrors are
-        // disjoint owned buffers, so the `&grid` / `&mut planes` borrows
-        // coexist.
+        // Metadata and native plane fields have disjoint borrows.
         {
             let grid = crate::InterModeInfoGrid {
-                mi_sizes: &mi_sizes_snap,
-                is_inters: &is_inters_snap,
-                ref_frames: &ref_frames_snap,
-                mvs: &mvs_snap,
-                interp_filters: &interp_filters_snap,
-                compound_types: &compound_types_snap,
-                wedge_indices: &compound_wedge_indices_snap,
-                wedge_signs: &compound_wedge_signs_snap,
-                mask_types: &compound_mask_types_snap,
-                interintra_modes: &interintra_modes_snap,
-                wedge_interintras: &wedge_interintras_snap,
-                interintra_wedge_indices: &interintra_wedge_indices_snap,
+                mi_sizes: &self.mi_sizes,
+                is_inters: &self.is_inters,
+                ref_frames: &self.ref_frames,
+                mvs: &self.mvs,
+                interp_filters: &self.interp_filters,
+                compound_types: &self.compound_types,
+                wedge_indices: &self.compound_wedge_indices,
+                wedge_signs: &self.compound_wedge_signs,
+                mask_types: &self.compound_mask_types,
+                interintra_modes: &self.interintra_modes,
+                wedge_interintras: &self.wedge_interintras,
+                interintra_wedge_indices: &self.interintra_wedge_indices,
                 order_hint_bits: order_hints.order_hint_bits,
                 current_order_hint: order_hints.current_order_hint,
                 order_hints_by_ref: &order_hints.order_hints_by_ref,
@@ -19328,39 +19068,33 @@ impl<P: crate::loop_filter::Pixel> PartitionWalker<P> {
                 bit_depth,
                 warp: None,
                 obmc: Some(crate::GridObmcContext {
-                    motion_modes: &motion_modes_snap,
+                    motion_modes: &self.motion_modes,
                     avail_u: &avail_u_snap,
                     avail_l: &avail_l_snap,
                 }),
             };
-            let mut planes: Vec<crate::PlaneReconContext<'_>> = Vec::new();
+            let mut slots = self.curr_frame.each_mut().map(|plane| plane.as_mut());
+            let mut planes: Vec<crate::PlaneReconContext<'_, R, P>> = Vec::new();
             if planes.try_reserve(plane_refs.len()).is_err() {
                 return Err(crate::Error::PartitionWalkOutOfRange);
             }
-            for ((p, mirror, cols), spec) in mirrors.iter_mut().zip(plane_refs.iter()) {
+            for spec in plane_refs {
+                let cp = slots[spec.plane as usize].take()
+                    .ok_or(crate::Error::PartitionWalkOutOfRange)?;
                 planes.push(crate::PlaneReconContext {
-                    plane: *p,
+                    plane: spec.plane,
                     subsampling_x: spec.subsampling_x,
                     subsampling_y: spec.subsampling_y,
                     frame_store: spec.frame_store,
                     frame_width: spec.frame_width,
                     frame_height: spec.frame_height,
-                    curr: mirror.as_mut_slice(),
-                    curr_stride: *cols,
+                    curr: &mut cp.samples,
+                    curr_stride: cp.cols as usize,
                 });
             }
             crate::reconstruct_inter_frame(&grid, ref_frame_idx, &mut planes)?;
         }
 
-        // Copy the (post-`Clip1`, in-range) `u16` result back into the
-        // walker's `i32` `curr_frame` buffers.
-        for (p, mirror, _cols) in &mirrors {
-            if let Some(cp) = self.curr_frame[*p as usize].as_mut() {
-                for (dst, &src) in cp.samples.iter_mut().zip(mirror.iter()) {
-                    *dst = P::from_i32(src as i32);
-                }
-            }
-        }
         Ok(())
     }
 
@@ -19392,16 +19126,14 @@ impl<P: crate::loop_filter::Pixel> PartitionWalker<P> {
     /// sample list is not retained); wiring it is the warped-motion
     /// follow-up.
     ///
-    /// The §7.11.3 drivers operate on `u16` planes while the walker's
-    /// `CurrFrame` is post-`Clip1` `i32`; the leaf's plane rect is
-    /// mirrored through [`Self::inter_pred_scratch`] in both directions
-    /// (lossless).
+    /// The field-split plane contexts borrow native `CurrFrame` storage
+    /// directly; no full-frame representation mirror is needed.
     pub fn predict_inter_leaf_from_walk(
         &mut self,
         mi_row: u32,
         mi_col: u32,
         mi_size: usize,
-        ctx: &InterFrameContext<'_>,
+        ctx: &InterFrameContext<'_, R>,
     ) -> Result<(), crate::Error> {
         if mi_size >= BLOCK_SIZES || mi_row >= self.mi_rows || mi_col >= self.mi_cols {
             return Err(crate::Error::PartitionWalkOutOfRange);
@@ -19414,17 +19146,6 @@ impl<P: crate::loop_filter::Pixel> PartitionWalker<P> {
             return Err(crate::Error::PartitionWalkOutOfRange);
         }
 
-        // Per-plane leaf rect: `(base, w, h)` in plane samples, clipped
-        // to the plane's mi-grid extent — the §5.11.33 write region.
-        struct LeafRect {
-            plane: usize,
-            x0: usize,
-            y0: usize,
-            w: usize,
-            h: usize,
-            stride: usize,
-        }
-        let mut rects: Vec<LeafRect> = Vec::with_capacity(pixels.plane_refs.len());
         for spec in pixels.plane_refs {
             let p = spec.plane as usize;
             if p >= 3 {
@@ -19438,39 +19159,8 @@ impl<P: crate::loop_filter::Pixel> PartitionWalker<P> {
             let rows = ((mi_rows * (MI_SIZE as u32)) >> sub_y) as usize;
             let cols = ((mi_cols * (MI_SIZE as u32)) >> sub_x) as usize;
             self.ensure_curr_frame_plane(p, rows as u32, cols as u32);
-            // Size the scratch mirror once per plane (stale samples
-            // outside the synced rect are never read).
-            if self.inter_pred_scratch[p].len() != rows * cols {
-                self.inter_pred_scratch[p].resize(rows * cols, 0);
-            }
-            let plane_sz = get_plane_residual_size(mi_size, spec.plane, sub_x, sub_y)
+            get_plane_residual_size(mi_size, spec.plane, sub_x, sub_y)
                 .ok_or(crate::Error::PartitionWalkOutOfRange)?;
-            let x0 = ((mi_col >> sub_x) as usize) * MI_SIZE;
-            let y0 = ((mi_row >> sub_y) as usize) * MI_SIZE;
-            let w = (num_4x4_blocks_wide(plane_sz) * 4).min(cols.saturating_sub(x0));
-            let h = (num_4x4_blocks_high(plane_sz) * 4).min(rows.saturating_sub(y0));
-            rects.push(LeafRect {
-                plane: p,
-                x0,
-                y0,
-                w,
-                h,
-                stride: cols,
-            });
-        }
-
-        // Mirror the leaf rects `i32 → u16` into the scratch planes.
-        for r in &rects {
-            let Some(cp) = self.curr_frame[r.plane].as_ref() else {
-                return Err(crate::Error::PartitionWalkOutOfRange);
-            };
-            let scratch = &mut self.inter_pred_scratch[r.plane];
-            for y in r.y0..r.y0 + r.h {
-                let start = y * r.stride + r.x0;
-                let src_row = &cp.samples[start..start + r.w];
-                let dst_row = &mut scratch[start..start + r.w];
-                for (&value, dst) in src_row.iter().zip(dst_row) { *dst = value.to_i32() as u16; }
-            }
         }
 
         // §5.9.24 global-motion tables in the [`crate::GridWarpContext`]
@@ -19491,7 +19181,7 @@ impl<P: crate::loop_filter::Pixel> PartitionWalker<P> {
 
         // Drive the shared per-leaf walk. Field-split borrows: the grid
         // views borrow the walker's grid vectors immutably while the
-        // plane contexts borrow `inter_pred_scratch` mutably.
+        // plane contexts borrow native `CurrFrame` storage mutably.
         {
             if self.walk_avail_u.len() < cells || self.walk_avail_l.len() < cells {
                 return Err(crate::Error::PartitionWalkOutOfRange);
@@ -19537,18 +19227,11 @@ impl<P: crate::loop_filter::Pixel> PartitionWalker<P> {
                     avail_l: &self.walk_avail_l,
                 }),
             };
-            let mut scratch_iter = self.inter_pred_scratch.iter_mut();
-            let (s0, s1, s2) = (
-                scratch_iter.next().unwrap(),
-                scratch_iter.next().unwrap(),
-                scratch_iter.next().unwrap(),
-            );
-            let mut slots: [Option<&mut Vec<u16>>; 3] = [Some(s0), Some(s1), Some(s2)];
-            let mut planes: Vec<crate::PlaneReconContext<'_>> =
+            let mut slots = self.curr_frame.each_mut().map(|plane| plane.as_mut());
+            let mut planes: Vec<crate::PlaneReconContext<'_, R, P>> =
                 Vec::with_capacity(pixels.plane_refs.len());
-            for (spec, rect) in pixels.plane_refs.iter().zip(rects.iter()) {
-                let buf = slots[rect.plane]
-                    .take()
+            for spec in pixels.plane_refs {
+                let buf = slots[spec.plane as usize].take()
                     .ok_or(crate::Error::PartitionWalkOutOfRange)?;
                 planes.push(crate::PlaneReconContext {
                     plane: spec.plane,
@@ -19557,8 +19240,8 @@ impl<P: crate::loop_filter::Pixel> PartitionWalker<P> {
                     frame_store: spec.frame_store,
                     frame_width: spec.frame_width,
                     frame_height: spec.frame_height,
-                    curr: buf.as_mut_slice(),
-                    curr_stride: rect.stride,
+                    curr: &mut buf.samples,
+                    curr_stride: buf.cols as usize,
                 });
             }
             crate::inter_pred::reconstruct_inter_leaf_at(
@@ -19570,19 +19253,6 @@ impl<P: crate::loop_filter::Pixel> PartitionWalker<P> {
             )?;
         }
 
-        // Mirror the leaf rects back `u16 → i32`.
-        for r in &rects {
-            let scratch = &self.inter_pred_scratch[r.plane];
-            let Some(cp) = self.curr_frame[r.plane].as_mut() else {
-                return Err(crate::Error::PartitionWalkOutOfRange);
-            };
-            for y in r.y0..r.y0 + r.h {
-                let start = y * r.stride + r.x0;
-                let src_row = &scratch[start..start + r.w];
-                let dst_row = &mut cp.samples[start..start + r.w];
-                for (&value, dst) in src_row.iter().zip(dst_row) { *dst = P::from_i32(value as i32); }
-            }
-        }
         Ok(())
     }
 
@@ -30629,7 +30299,7 @@ impl<P: crate::loop_filter::Pixel> PartitionWalker<P> {
         // through to [`Self::compute_prediction`] +
         // [`Self::residual`], and the walker advances past the
         // historical r189 stub site.
-        inter_ctx: Option<&InterFrameContext>,
+        inter_ctx: Option<&InterFrameContext<'_, R>>,
         // r286: §5.9.12 per-frame quantiser state + §5.9.21
         // `reduced_tx_set`. Threaded into the §5.11.34 `residual()`
         // dispatch's [`ResidualContext`] so the §5.11.47
@@ -31407,7 +31077,7 @@ impl<P: crate::loop_filter::Pixel> PartitionWalker<P> {
         bit_depth: u8,
         quant: &QuantizerParams,
         reduced_tx_set: bool,
-        ctx: &InterFrameContext,
+        ctx: &InterFrameContext<'_, R>,
     ) -> Result<DecodedBlock, crate::Error> {
         // §5.11.19 `predictedSegmentId = get_segment_id()` — the
         // §5.11.21 min-scan over `PrevSegmentIds` at THIS block's
@@ -33763,7 +33433,7 @@ impl<P: crate::loop_filter::Pixel> PartitionWalker<P> {
         // r190: optional inter-arm context. See
         // [`Self::decode_block_syntax`]'s `inter_ctx` parameter for
         // the contract.
-        inter_ctx: Option<&InterFrameContext>,
+        inter_ctx: Option<&InterFrameContext<'_, R>>,
         // r286: §5.9.12 quantiser state + §5.9.21 `reduced_tx_set`. See
         // [`Self::decode_block_syntax`]'s `quant` / `reduced_tx_set`
         // parameters for the contract — threaded unchanged into every
@@ -34138,7 +33808,7 @@ impl<P: crate::loop_filter::Pixel> PartitionWalker<P> {
         decoder: &mut crate::symbol_decoder::SymbolDecoder<'_>,
         cdfs: &mut TileCdfContext,
         params: &TileDecodeParams<'_>,
-        inter_ctx: Option<&InterFrameContext>,
+        inter_ctx: Option<&InterFrameContext<'_, R>>,
         quant: &QuantizerParams,
         read_deltas: bool,
     ) -> Result<(), crate::Error> {
@@ -34167,7 +33837,7 @@ impl<P: crate::loop_filter::Pixel> PartitionWalker<P> {
         cdfs: &mut TileCdfContext,
         params: &TileDecodeParams<'_>,
         lr_params: Option<&LrParams>,
-        inter_ctx: Option<&InterFrameContext>,
+        inter_ctx: Option<&InterFrameContext<'_, R>>,
         quant: &QuantizerParams,
         read_deltas: bool,
     ) -> Result<(), crate::Error> {
@@ -36266,11 +35936,11 @@ pub struct FindMvStackResult {
 /// of any preceding decoded blocks committed into its `PaletteSizes` /
 /// `PaletteColors` grids.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn read_palette_entries_y<P: crate::loop_filter::Pixel>(
+pub(crate) fn read_palette_entries_y<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel>(
     decoder: &mut crate::symbol_decoder::SymbolDecoder<'_>,
     bit_depth: u8,
     palette_size_y: usize,
-    walker: &PartitionWalker<P>,
+    walker: &PartitionWalker<P, R>,
     mi_row: u32,
     mi_col: u32,
 ) -> Result<[u16; PALETTE_COLORS], crate::Error> {
@@ -36375,11 +36045,11 @@ pub(crate) fn read_palette_entries_y<P: crate::loop_filter::Pixel>(
 /// Returns a `(u, v)` tuple, each a `[u16; PALETTE_COLORS]` with the
 /// first `palette_size_uv` slots carrying the decoded entries.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn read_palette_entries_uv<P: crate::loop_filter::Pixel>(
+pub(crate) fn read_palette_entries_uv<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel>(
     decoder: &mut crate::symbol_decoder::SymbolDecoder<'_>,
     bit_depth: u8,
     palette_size_uv: usize,
-    walker: &PartitionWalker<P>,
+    walker: &PartitionWalker<P, R>,
     mi_row: u32,
     mi_col: u32,
 ) -> Result<([u16; PALETTE_COLORS], [u16; PALETTE_COLORS]), crate::Error> {
@@ -36869,7 +36539,7 @@ pub struct DecodedInterFrameModeInfo {
 /// argument shape one-to-one so callers can construct the context
 /// once per frame and reuse it across every per-block dispatch.
 #[derive(Debug, Clone)]
-pub struct InterFrameContext<'a> {
+pub struct InterFrameContext<'a, R: crate::loop_filter::Pixel = u16> {
     // ---- §5.9.14 / §6.10 segmentation state ----
     /// `segmentation_update_map` (§5.9.14).
     pub segmentation_update_map: bool,
@@ -36959,7 +36629,7 @@ pub struct InterFrameContext<'a> {
     /// post-walk via the frame-scope bridge, valid only when no intra
     /// leaf reads an inter neighbour and no inter leaf codes a
     /// residual).
-    pub pixels: Option<&'a InterWalkPixels<'a>>,
+    pub pixels: Option<&'a InterWalkPixels<'a, R>>,
 }
 
 /// §7.11.3 reference-pixel state for the in-walk §5.11.33
@@ -36967,7 +36637,7 @@ pub struct InterFrameContext<'a> {
 /// §5.11.5 walker motion-compensates against. Carried on
 /// [`InterFrameContext::pixels`].
 #[derive(Debug)]
-pub struct InterWalkPixels<'a> {
+pub struct InterWalkPixels<'a, R: crate::loop_filter::Pixel = u16> {
     /// §6.8.2 `ref_frame_idx[ 0..REFS_PER_FRAME ]` — the slot index
     /// each of the seven inter references (`LAST_FRAME - LAST_FRAME =
     /// 0` .. `ALTREF_FRAME - LAST_FRAME = 6`) resolves to.
@@ -36977,12 +36647,12 @@ pub struct InterWalkPixels<'a> {
     /// Per-decoded-plane reference specs — each carries the plane
     /// ordinal, its subsampling, the per-slot §7.11.3.3 `FrameStore`
     /// slices, and the current frame's plane-space dimensions.
-    pub plane_refs: &'a [crate::PlaneRefSpec<'a>],
+    pub plane_refs: &'a [crate::PlaneRefSpec<'a, R>],
     /// §7.11.3.15 order-hint context (COMPOUND_DISTANCE weights).
     pub order_hints: FrameInterOrderHints,
 }
 
-impl<'a> InterFrameContext<'a> {
+impl<'a, R: crate::loop_filter::Pixel> InterFrameContext<'a, R> {
     /// Identity-default `InterFrameContext` — every flag off, segment
     /// id `0`, `gm_params[ref][2] = gm_params[ref][5] = 1 << WARPEDMODEL_PREC_BITS`
     /// (the §5.9.24 identity-warp defaults), zero MV / no skip-mode

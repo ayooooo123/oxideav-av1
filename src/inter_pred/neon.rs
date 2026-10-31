@@ -1,7 +1,8 @@
 //! Clean-room §7.11 convolution, combination, and sample representation lanes.
 use core::arch::aarch64::*;
+use crate::loop_filter::Pixel;
 
-pub(super) fn horizontal(src: &[u16], coeff: &[i32; 8], shift: u32, dst: &mut [i32], w: usize) {
+pub(super) fn horizontal<R: Pixel>(src: &[R], coeff: &[i32; 8], shift: u32, dst: &mut [i32], w: usize) {
     assert!(src.len() >= w + 7 && dst.len() >= w);
     assert!((1..32).contains(&shift));
     let end = w / 8 * 8;
@@ -16,7 +17,15 @@ pub(super) fn horizontal(src: &[u16], coeff: &[i32; 8], shift: u32, dst: &mut [i
             let mut lo = offset;
             let mut hi = offset;
             for (k, &c) in coeff.iter().enumerate() {
-                let s = vreinterpretq_s16_u16(vld1q_u16(p.add(k)));
+                let p = p.add(k);
+                let s = if core::mem::size_of::<R>() == 1 {
+                    vreinterpretq_s16_u16(vmovl_u8(vld1_u8(p.cast())))
+                } else if core::mem::size_of::<R>() == 2 {
+                    vreinterpretq_s16_u16(vld1q_u16(p.cast()))
+                } else {
+                    let p = p.cast::<i32>();
+                    vcombine_s16(vmovn_s32(vld1q_s32(p)), vmovn_s32(vld1q_s32(p.add(4))))
+                };
                 lo = vmlal_n_s16(lo, vget_low_s16(s), c as i16);
                 hi = vmlal_high_n_s16(hi, s, c as i16);
             }
@@ -25,7 +34,7 @@ pub(super) fn horizontal(src: &[u16], coeff: &[i32; 8], shift: u32, dst: &mut [i
         }
     }
     for x in end..w {
-        let sum: i32 = (0..8).map(|k| coeff[k] * i32::from(src[x + k])).sum();
+        let sum: i32 = (0..8).map(|k| coeff[k] * src[x + k].to_i32()).sum();
         dst[x] = (sum + (1 << (shift - 1))) >> shift;
     }
 }
@@ -104,36 +113,6 @@ pub(super) fn average(depth: u8, shift: u32, a: &[i32], b: &[i32], dst: &mut [u1
     }
 }
 
-pub(super) fn pack(src: &[i32], dst: &mut [u16]) {
-    assert!(dst.len() >= src.len());
-    let end = src.len() / 8 * 8;
-    // SAFETY: both slices cover eight elements per iteration. Non-saturating
-    // narrowing preserves Rust's wrapping `as u16`, including arbitrary i32.
-    unsafe {
-        for x in (0..end).step_by(8) {
-            let lo = vmovn_s32(vld1q_s32(src.as_ptr().add(x)));
-            let hi = vmovn_s32(vld1q_s32(src.as_ptr().add(x + 4)));
-            vst1q_u16(dst.as_mut_ptr().add(x), vreinterpretq_u16_s16(vcombine_s16(lo, hi)));
-        }
-    }
-    for x in end..src.len() { dst[x] = src[x] as u16; }
-}
-
-pub(super) fn unpack(src: &[u16], dst: &mut [i32]) {
-    assert!(dst.len() >= src.len());
-    let end = src.len() / 8 * 8;
-    // SAFETY: both slices cover eight elements per iteration. Zero extension
-    // exactly matches `u16 as i32`, including the complete u16 range.
-    unsafe {
-        for x in (0..end).step_by(8) {
-            let v = vld1q_u16(src.as_ptr().add(x));
-            vst1q_s32(dst.as_mut_ptr().add(x), vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(v))));
-            vst1q_s32(dst.as_mut_ptr().add(x + 4), vreinterpretq_s32_u32(vmovl_high_u16(v)));
-        }
-    }
-    for x in end..src.len() { dst[x] = i32::from(src[x]); }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -158,6 +137,14 @@ mod tests {
                             horizontal(&src[r * (w + 7)..], coeff, round0, &mut actual[r * w..], w);
                         }
                         assert_eq!(actual, expected, "horizontal depth={depth} w={w}");
+                        if depth == 8 {
+                            let native: Vec<u8> = src.iter().map(|&v| v as u8).collect();
+                            let mut native_actual = vec![0; w * 8];
+                            for r in 0..8 {
+                                horizontal(&native[r * (w + 7)..], coeff, round0, &mut native_actual[r * w..], w);
+                            }
+                            assert_eq!(native_actual, expected, "native u8 horizontal w={w}");
+                        }
                         for shift in [7, 9, 11] {
                             let mut a = vec![0; w]; let mut b = a.clone();
                             filter_8tap_v_scalar(&expected, w, 0, coeff, shift, &mut a);
@@ -170,16 +157,12 @@ mod tests {
         }
     }
     #[test]
-    fn combinations_and_bridge_match_full_range_scalar() {
+    fn combinations_match_full_range_scalar() {
         let mut state = 0xa197c489;
         for n in 0..=513 {
             let a: Vec<i32> = (0..n).map(|i| match i % 8 { 0 => i32::MIN, 1 => i32::MAX,
                 2 => -1, 3 => 4095, _ => next(&mut state) as i32 }).collect();
             let b: Vec<i32> = (0..n).map(|_| next(&mut state) as i32).collect();
-            let mut packed = vec![0; n]; pack(&a, &mut packed);
-            assert_eq!(packed, a.iter().map(|&v| v as u16).collect::<Vec<_>>());
-            let mut unpacked = vec![0; n]; unpack(&packed, &mut unpacked);
-            assert_eq!(unpacked, packed.iter().map(|&v| i32::from(v)).collect::<Vec<_>>());
             for depth in [8, 10, 12] {
                 let max = (1 << depth) - 1;
                 let mut dst = vec![0; n]; clip(depth, &a, &mut dst);

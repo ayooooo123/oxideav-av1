@@ -253,7 +253,8 @@ impl Decoder for Av1Decoder {
                     Ok((session, frames)) => {
                         self.session = session;
                         self.queue.extend(frames.into_iter().map(|(frame, pts)| {
-                            (spec_frame_to_video_frame(&frame, pts), frame_layout(&frame))
+                            let layout = frame_layout(&frame);
+                            (spec_frame_to_video_frame(std::sync::Arc::unwrap_or_clone(frame), pts), layout)
                         }));
                     }
                     Err(error) => self.pending_error = Some(CoreError::invalid(format!("oxideav-av1: {error}"))),
@@ -274,11 +275,9 @@ impl Decoder for Av1Decoder {
             }
         }
         let mut push = |frames: Vec<SpecFrame>| {
-            for frame in &frames {
-                self.queue.push_back((
-                    spec_frame_to_video_frame(frame, packet.pts),
-                    frame_layout(frame),
-                ));
+            for frame in frames {
+                let layout = frame_layout(&frame);
+                self.queue.push_back((spec_frame_to_video_frame(frame, packet.pts), layout));
             }
         };
         if packet.data.len() >= 4 && &packet.data[..4] == IVF_MAGIC {
@@ -320,7 +319,7 @@ impl Decoder for Av1Decoder {
                         .map_err(|error| CoreError::invalid(format!("oxideav-av1: {error}")))? {
                         Some((frame, pts)) => {
                             self.last_output = Some(frame_layout(&frame));
-                            Ok(CoreFrame::Video(spec_frame_to_video_frame(&frame, pts)))
+                            Ok(CoreFrame::Video(spec_frame_to_video_frame(std::sync::Arc::unwrap_or_clone(frame), pts)))
                         }
                         None if self.eof => Err(CoreError::Eof),
                         None => Err(CoreError::NeedMore),
@@ -391,15 +390,15 @@ impl Decoder for Av1Decoder {
 /// row-major bytes — one byte per sample at 8-bit, packed little-endian
 /// `u16` at 10/12-bit — so each plane moves verbatim with its byte
 /// stride (`width` samples × 1 or 2 bytes).
-fn spec_frame_to_video_frame(frame: &SpecFrame, pts: Option<i64>) -> VideoFrame {
+fn spec_frame_to_video_frame(frame: SpecFrame, pts: Option<i64>) -> VideoFrame {
     let bytes_per_sample: usize = if frame.bit_depth > 8 { 2 } else { 1 };
     let planes = frame
         .planes
-        .iter()
+        .into_iter()
         .zip(frame.plane_dims.iter())
         .map(|(data, &(w, _h))| VideoPlane {
             stride: (w as usize) * bytes_per_sample,
-            data: data.clone(),
+            data,
         })
         .collect();
     VideoFrame { pts, planes }

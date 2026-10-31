@@ -4238,7 +4238,7 @@ fn r190_decode_block_syntax_inter_arm_without_ctx_keeps_legacy_stub() {
 #[test]
 fn r190_inter_frame_context_identity_default_matches_spec_identity_warp() {
     let mfmvs = MotionFieldMvs::new_invalid(16, 16);
-    let ctx = InterFrameContext::identity_default(&mfmvs);
+    let ctx = InterFrameContext::<u16>::identity_default(&mfmvs);
     for ref_idx in 0..8 {
         assert_eq!(
             ctx.gm_params[ref_idx][2],

@@ -883,6 +883,68 @@ mod tests {
     use crate::uncompressed_header_tail::FilmGrainParams;
 
     #[test]
+    fn native_grain_matches_original_i32_all_depths_and_formats() {
+        fn check<P: Pixel>(depth: u8) {
+            for (sub_x, sub_y) in [(0u8, 0u8), (1, 0), (1, 1)] {
+                let dims: Vec<(u32, u32)> = (0..3).map(|p| {
+                    if p == 0 { (67, 41) } else { ((67 + u32::from(sub_x)) >> sub_x,
+                        (41 + u32::from(sub_y)) >> sub_y) }
+                }).collect();
+                for overlap in [false, true] {
+                    for restricted in [false, true] {
+                        for csfl in [false, true] {
+                            let mut fg = FilmGrainParams::reset();
+                            fg.apply_grain = true;
+                            fg.grain_seed = 0x91a7;
+                            fg.grain_scaling = 8;
+                            fg.ar_coeff_lag = 2;
+                            fg.ar_coeff_shift = 6;
+                            fg.ar_coeffs_y_plus_128.fill(129);
+                            fg.ar_coeffs_cb_plus_128.fill(127);
+                            fg.ar_coeffs_cr_plus_128.fill(129);
+                            fg.num_y_points = 2;
+                            fg.point_y_value[1] = 255;
+                            fg.point_y_scaling[..2].copy_from_slice(&[32, 180]);
+                            fg.chroma_scaling_from_luma = csfl;
+                            fg.num_cb_points = if csfl { 0 } else { 2 };
+                            fg.num_cr_points = fg.num_cb_points;
+                            fg.point_cb_value[1] = 255;
+                            fg.point_cr_value[1] = 255;
+                            fg.point_cb_scaling[..2].copy_from_slice(&[80, 150]);
+                            fg.point_cr_scaling[..2].copy_from_slice(&[150, 40]);
+                            fg.cb_mult = 140;
+                            fg.cb_luma_mult = 160;
+                            fg.cb_offset = 256;
+                            fg.cr_mult = 150;
+                            fg.cr_luma_mult = 120;
+                            fg.cr_offset = 250;
+                            fg.overlap_flag = overlap;
+                            fg.clip_to_restricted_range = restricted;
+                            let max = (1i32 << depth) - 1;
+                            let mut original: Vec<Vec<i32>> = dims.iter().enumerate().map(|(p, &(w, h))|
+                                (0..w * h).map(|i| (i as i32 * 197 + p as i32 * 719) & max).collect()
+                            ).collect();
+                            let mut native: Vec<Vec<P>> = original.iter().map(|p|
+                                p.iter().map(|&v| P::from_i32(v)).collect()).collect();
+                            let mut old_views: Vec<_> = original.iter_mut().zip(&dims).map(
+                                |(samples, &(cols, rows))| PlaneBuffer { rows, cols, samples }).collect();
+                            let mut new_views: Vec<_> = native.iter_mut().zip(&dims).map(
+                                |(samples, &(cols, rows))| PlaneBuffer { rows, cols, samples }).collect();
+                            film_grain_synthesis(&fg, depth, 3, sub_x, sub_y, 1, &mut old_views);
+                            film_grain_synthesis(&fg, depth, 3, sub_x, sub_y, 1, &mut new_views);
+                            assert!(original.iter().zip(&native).all(|(a, b)|
+                                a.iter().zip(b).all(|(&a, &b)| a == b.to_i32())));
+                        }
+                    }
+                }
+            }
+        }
+        check::<u8>(8);
+        check::<u16>(10);
+        check::<u16>(12);
+    }
+
+    #[test]
     fn lfsr_first_three_draws_for_seed_one() {
         // av1-spec p.339 LFSR with seed = 1, draw 11 bits:
         //   r = 1

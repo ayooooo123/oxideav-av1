@@ -52,6 +52,7 @@ use crate::cdf::{
     FrameInterOrderHints, InterFrameContext, InterWalkPixels, MotionFieldMvs, PartitionWalker,
     QuantizerParams, TileCdfContext, TileDecodeParams, TileGeometry,
 };
+use crate::loop_filter::Pixel;
 use crate::decoder::frame_driver::lossless_array;
 use crate::decoder::SpecFrame;
 use crate::frame_header::{
@@ -292,22 +293,21 @@ fn validate_lst_shape(seq: &SequenceHeader, fh: &FrameHeader) -> Result<LstGeome
     })
 }
 
-/// An anchor's planes widened to `u16` (the §7.20 `FrameStore`
-/// sample type), validated against the camera frame's extents.
-struct AnchorPlanes {
-    planes: Vec<Vec<u16>>,
+/// Native anchor planes, validated against the camera frame's extents.
+struct AnchorPlanes<P: Pixel> {
+    planes: Vec<Vec<P>>,
     dims: Vec<(u32, u32)>,
 }
 
 /// One decoded camera tile: per-plane §7.3.2 `OutY`/`OutU`/`OutV`
 /// buffers plus their `(width, height)` extents.
-type CameraTilePlanes = (Vec<Vec<i32>>, Vec<(u32, u32)>);
+type CameraTilePlanes<P> = (Vec<Vec<P>>, Vec<(u32, u32)>);
 
-fn anchor_planes(
+fn anchor_planes<P: Pixel>(
     anchor: &SpecFrame,
     seq: &SequenceHeader,
     fh: &FrameHeader,
-) -> Result<AnchorPlanes, Error> {
+) -> Result<AnchorPlanes<P>, Error> {
     let fs = fh.frame_size.as_ref().ok_or(Error::TileListInvalid)?;
     let cc = &seq.color_config;
     // §7.3.1 steps 6-13 stamp the CURRENT frame's dimensions /
@@ -324,21 +324,21 @@ fn anchor_planes(
     for (p, bytes) in anchor.planes.iter().enumerate() {
         let (w, h) = *anchor.plane_dims.get(p).ok_or(Error::TileListInvalid)?;
         let want = (w as usize) * (h as usize);
-        let widened: Vec<u16> = if anchor.bit_depth == 8 {
+        let native: Vec<P> = if anchor.bit_depth == 8 {
             if bytes.len() != want {
                 return Err(Error::TileListInvalid);
             }
-            bytes.iter().map(|&v| u16::from(v)).collect()
+            bytes.iter().map(|&v| P::from_i32(i32::from(v))).collect()
         } else {
             if bytes.len() != want * 2 {
                 return Err(Error::TileListInvalid);
             }
             bytes
                 .chunks_exact(2)
-                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .map(|c| P::from_i32(i32::from(u16::from_le_bytes([c[0], c[1]]))))
                 .collect()
         };
-        planes.push(widened);
+        planes.push(native);
     }
     Ok(AnchorPlanes {
         planes,
@@ -350,12 +350,12 @@ fn anchor_planes(
 /// frame against `anchor` (installed as `FrameStore[ ref_frame_idx[0]
 /// ]`), returning the tile's plane buffers at their §7.3.2 `OutY` /
 /// `OutU` / `OutV` extents.
-fn decode_camera_tile(
+fn decode_camera_tile<P: Pixel>(
     seq: &SequenceHeader,
     fh: &FrameHeader,
-    anchor: &AnchorPlanes,
+    anchor: &AnchorPlanes<P>,
     entry: &TileListEntry,
-) -> Result<CameraTilePlanes, Error> {
+) -> Result<CameraTilePlanes<P>, Error> {
     let cc = &seq.color_config;
     let fs = fh.frame_size.as_ref().ok_or(Error::TileListInvalid)?;
     let ti = fh.tile_info.as_ref().ok_or(Error::TileListInvalid)?;
@@ -467,7 +467,7 @@ fn decode_camera_tile(
     let sub_y = u8::from(cc.subsampling_y);
     // Never-referenced placeholder for the other slots (§7.3.2's
     // read_ref_frames conformance restricts prediction to LAST).
-    let dummy_plane: Vec<u16> = vec![0u16; 64];
+    let dummy_plane: Vec<P> = vec![P::default(); 64];
     let dummy_entry = || RefFrameStoreEntry {
         plane: &dummy_plane,
         stride: 8,
@@ -475,9 +475,9 @@ fn decode_camera_tile(
         width: 8,
         height: 8,
     };
-    let mut plane_stores: Vec<[RefFrameStoreEntry<'_>; NUM_REF_FRAMES as usize]> = Vec::new();
+    let mut plane_stores: Vec<[RefFrameStoreEntry<'_, P>; NUM_REF_FRAMES as usize]> = Vec::new();
     for plane in 0..num_planes {
-        let arr: [RefFrameStoreEntry<'_>; NUM_REF_FRAMES as usize] = core::array::from_fn(|slot| {
+        let arr: [RefFrameStoreEntry<'_, P>; NUM_REF_FRAMES as usize] = core::array::from_fn(|slot| {
             if slot == last_slot {
                 let (w, _h) = anchor.dims[plane];
                 let (lw, lh) = anchor.dims[0];
@@ -503,7 +503,7 @@ fn decode_camera_tile(
         current_order_hint: 0,
         order_hints_by_ref: [0; 8],
     };
-    let plane_ref_specs: Vec<PlaneRefSpec<'_>> = (0..num_planes)
+    let plane_ref_specs: Vec<PlaneRefSpec<'_, P>> = (0..num_planes)
         .map(|p| PlaneRefSpec {
             plane: p as u8,
             subsampling_x: if p > 0 { sub_x } else { 0 },
@@ -552,7 +552,7 @@ fn decode_camera_tile(
     // ---- §7.3.2: one §5.11.2 tile decode, no post-processing. ----
     let mi_rows = fs.mi_rows;
     let mi_cols = fs.mi_cols;
-    let mut walker = PartitionWalker::<i32>::new(mi_rows,
+    let mut walker = PartitionWalker::<P, P>::new(mi_rows,
     mi_cols,
     TileGeometry {
         mi_row_start: 0,
@@ -598,7 +598,7 @@ fn decode_camera_tile(
     let h = (geometry.mi_row_end - geometry.mi_row_start) * 4;
     let x0 = geometry.mi_col_start * 4;
     let y0 = geometry.mi_row_start * 4;
-    let mut out_planes: Vec<Vec<i32>> = Vec::with_capacity(num_planes);
+    let mut out_planes: Vec<Vec<P>> = Vec::with_capacity(num_planes);
     let mut out_dims: Vec<(u32, u32)> = Vec::with_capacity(num_planes);
     for plane in 0..num_planes {
         let src = walker.curr_frame(plane).ok_or(Error::TileListInvalid)?;
@@ -618,7 +618,7 @@ fn decode_camera_tile(
         if py0 + ph > rows || px0 + pw > cols {
             return Err(Error::TileListInvalid);
         }
-        let mut buf = vec![0i32; (pw as usize) * (ph as usize)];
+        let mut buf = vec![P::default(); (pw as usize) * (ph as usize)];
         for y in 0..ph as usize {
             let src_row = (py0 as usize + y) * cols as usize + px0 as usize;
             buf[y * pw as usize..(y + 1) * pw as usize]
@@ -652,6 +652,19 @@ pub fn decode_tile_list(
     anchors: &[SpecFrame],
     tl: &TileListObu,
 ) -> Result<SpecFrame, Error> {
+    match seq.color_config.bit_depth {
+        8 => decode_tile_list_native::<u8>(seq, fh, anchors, tl),
+        10 | 12 => decode_tile_list_native::<u16>(seq, fh, anchors, tl),
+        _ => Err(Error::TileListInvalid),
+    }
+}
+
+fn decode_tile_list_native<P: Pixel>(
+    seq: &SequenceHeader,
+    fh: &FrameHeader,
+    anchors: &[SpecFrame],
+    tl: &TileListObu,
+) -> Result<SpecFrame, Error> {
     let geom = validate_lst_shape(seq, fh)?;
     let cc = &seq.color_config;
     let width_in_tiles = u32::from(tl.output_frame_width_in_tiles_minus_1) + 1;
@@ -679,14 +692,14 @@ pub fn decode_tile_list(
             (output_w >> sub_x, output_h >> sub_y)
         });
     }
-    let mut out_planes: Vec<Vec<i32>> = out_dims
+    let mut out_planes: Vec<Vec<P>> = out_dims
         .iter()
-        .map(|&(w, h)| vec![0i32; (w as usize) * (h as usize)])
+        .map(|&(w, h)| vec![P::default(); (w as usize) * (h as usize)])
         .collect();
 
     // Anchor conversions are cached per distinct index (a tile list
     // routinely references the same anchor many times).
-    let mut anchor_cache: Vec<Option<AnchorPlanes>> = Vec::new();
+    let mut anchor_cache: Vec<Option<AnchorPlanes<P>>> = Vec::new();
     anchor_cache.resize_with(anchors.len(), || None);
 
     for (tile, entry) in tl.entries.iter().enumerate() {
@@ -722,21 +735,8 @@ pub fn decode_tile_list(
 
     // §7.3.1: "The bitdepth of each output sample is given by
     // BitDepth" — the same output layout contract as [`SpecFrame`].
-    let max_val: i32 = (1 << cc.bit_depth) - 1;
-    let planes: Vec<Vec<u8>> = out_planes
-        .into_iter()
-        .map(|buf| {
-            if cc.bit_depth == 8 {
-                buf.into_iter().map(|v| v.clamp(0, 255) as u8).collect()
-            } else {
-                let mut out = Vec::with_capacity(buf.len() * 2);
-                for v in buf {
-                    out.extend_from_slice(&(v.clamp(0, max_val) as u16).to_le_bytes());
-                }
-                out
-            }
-        })
-        .collect();
+    let planes: Vec<Vec<u8>> = out_planes.into_iter()
+        .map(|buf| P::into_bytes(buf, cc.bit_depth)).collect();
     Ok(SpecFrame {
         width: output_w,
         height: output_h,
@@ -794,6 +794,43 @@ pub fn decode_tile_list_stream(input: &[u8], anchors: &[SpecFrame]) -> Result<Sp
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_high_depth_camera_tiles_match_original_i32_storage() {
+        use crate::encoder::{encode_camera_frame_yuv420, Yuv420Frame};
+        let flat = Yuv420Frame::filled(64, 64, 128);
+        let encoded = encode_camera_frame_yuv420(&flat, &flat, 0).unwrap();
+        let tl = TileListObu {
+            output_frame_width_in_tiles_minus_1: 0,
+            output_frame_height_in_tiles_minus_1: 0,
+            entries: vec![TileListEntry {
+                anchor_frame_idx: 0, anchor_tile_row: 0, anchor_tile_col: 0,
+                coded_tile_data: encoded.coded_tile_data.clone(),
+            }],
+        };
+        // The encoder's identity, all-skip camera syntax carries no residual
+        // coefficients and is depth-independent. Supply native-depth anchor
+        // samples and the matching parsed sequence flags.
+        for depth in [8, 10, 12] {
+            let mut seq = encoded.seq.clone();
+            seq.seq_profile = if depth == 12 { 2 } else { 0 };
+            seq.color_config.bit_depth = depth;
+            seq.color_config.high_bitdepth = depth > 8;
+            seq.color_config.twelve_bit = depth == 12;
+            let dims = vec![(64, 64), (32, 32), (32, 32)];
+            let planes = dims.iter().enumerate().map(|(p, &(w, h))| {
+                let values = (0..w * h).map(|i| ((i * 197 + p as u32 * 71) & ((1 << depth) - 1)) as u16);
+                if depth == 8 { values.map(|v| v as u8).collect() }
+                else { values.flat_map(u16::to_le_bytes).collect() }
+            }).collect();
+            let anchor = SpecFrame { width: 64, height: 64, planes, plane_dims: dims, bit_depth: depth };
+            let anchors = [anchor];
+            let expected = decode_tile_list_native::<i32>(&seq, &encoded.fh, &anchors, &tl).unwrap();
+            let actual = decode_tile_list(&seq, &encoded.fh, &anchors, &tl).unwrap();
+            assert_eq!(actual, expected, "camera tile depth={depth}");
+            assert_eq!(actual.planes, anchors[0].planes, "identity camera prediction depth={depth}");
+        }
+    }
 
     fn sample_tl() -> TileListObu {
         TileListObu {

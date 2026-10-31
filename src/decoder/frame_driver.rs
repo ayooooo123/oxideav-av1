@@ -82,6 +82,63 @@ pub struct SpecFrame {
     pub bit_depth: u8,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NativePlanes {
+    U8(Vec<Vec<u8>>),
+    U16(Vec<Vec<u16>>),
+}
+
+impl NativePlanes {
+    fn len(&self) -> usize {
+        match self { Self::U8(p) => p.len(), Self::U16(p) => p.len() }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn retained_bytes(&self) -> usize {
+        match self {
+            Self::U8(p) => p.capacity() * std::mem::size_of::<Vec<u8>>()
+                + p.iter().map(|p| p.capacity()).sum::<usize>(),
+            Self::U16(p) => p.capacity() * std::mem::size_of::<Vec<u16>>()
+                + p.iter().map(|p| p.capacity() * 2).sum::<usize>(),
+        }
+    }
+
+    #[cfg(test)]
+    fn canonical_samples(&self) -> Vec<Vec<u16>> {
+        match self {
+            Self::U8(p) => p.iter().map(|p| p.iter().map(|&v| u16::from(v)).collect()).collect(),
+            Self::U16(p) => p.clone(),
+        }
+    }
+}
+
+trait FramePixel: Pixel {
+    fn snapshot(planes: &[Vec<Self>]) -> NativePlanes;
+    fn reference(planes: &NativePlanes, index: usize) -> Option<&[Self]>;
+}
+
+impl FramePixel for u8 {
+    fn snapshot(planes: &[Vec<Self>]) -> NativePlanes { NativePlanes::U8(planes.to_vec()) }
+    fn reference(planes: &NativePlanes, index: usize) -> Option<&[Self]> {
+        match planes { NativePlanes::U8(p) => p.get(index).map(Vec::as_slice), _ => None }
+    }
+}
+
+impl FramePixel for u16 {
+    fn snapshot(planes: &[Vec<Self>]) -> NativePlanes { NativePlanes::U16(planes.to_vec()) }
+    fn reference(planes: &NativePlanes, index: usize) -> Option<&[Self]> {
+        match planes { NativePlanes::U16(p) => p.get(index).map(Vec::as_slice), _ => None }
+    }
+}
+
+#[cfg(test)]
+impl FramePixel for i32 {
+    fn snapshot(planes: &[Vec<Self>]) -> NativePlanes {
+        NativePlanes::U16(planes.iter().map(|p| p.iter().map(|&v| v as u16).collect()).collect())
+    }
+    fn reference(_planes: &NativePlanes, _index: usize) -> Option<&[Self]> { None }
+}
+
 /// §7.20 per-slot reference store — the decoded frame a later inter
 /// frame motion-compensates against, plus the per-mi grids the §7.9
 /// temporal projection and the §7.21 `show_existing_frame` output
@@ -90,10 +147,9 @@ pub struct SpecFrame {
 struct SpecRefSlot {
     /// §7.20 `FrameStore[ i ][ plane ]` — the post-§7.17 (pre-§7.18.3
     /// film-grain) planes at their §7.18.2 cropped extents
-    /// (`UpscaledWidth × FrameHeight`, per-plane subsampled), `u16`
-    /// (post-`Clip1`, so the widening from the walker's `i32` is
-    /// lossless).
-    planes: Vec<Vec<u16>>,
+    /// (`UpscaledWidth × FrameHeight`, per-plane subsampled), in the
+    /// stream's native clipped sample representation.
+    planes: NativePlanes,
     /// `(width, height)` per stored plane.
     plane_dims: Vec<(u32, u32)>,
     /// §7.20 `SavedMvs[ i ]` — the §7.19 `MfMvs[ row ][ col ][ 0..2 ]`
@@ -144,12 +200,23 @@ struct SpecRefSlot {
     grain_params: Option<crate::uncompressed_header_tail::FilmGrainParams>,
 }
 
+type FrameDecode = fn(
+    &SequenceHeader, &FrameHeader, &[TilePayload], Option<&SpecRefState>,
+    &oxideav_core::ExecutionContext,
+) -> Result<DecodedFrameInternal, Error>;
+
+fn frame_decoder(bit_depth: u8) -> FrameDecode {
+    if bit_depth == 8 { decode_frame_spec_tiles_checked::<u8, u8> }
+    else { decode_frame_spec_tiles_checked::<u16, u16> }
+}
+
 /// Cross-frame decoder session state: the §5.9.2 `RefInfo` arrays the
 /// inter `uncompressed_header()` parse consumes plus the §7.20
 /// per-slot pixel/grid stores.
 #[derive(Debug, Clone)]
 struct SpecRefState {
     info: RefInfo,
+    decode: FrameDecode,
     /// r453 — `Arc`-shared: §7.20 stores the SAME immutable payload
     /// into every slot `refresh_frame_flags` selects (and the §7.21
     /// show-existing re-store copies a stored one wholesale), so an
@@ -163,6 +230,7 @@ impl SpecRefState {
     fn new() -> Self {
         Self {
             info: RefInfo::default(),
+            decode: frame_decoder(8),
             slots: Default::default(),
         }
     }
@@ -173,8 +241,8 @@ impl SpecRefState {
 struct DecodedFrameInternal {
     /// The §7.18 output frame (post-film-grain).
     frame: SpecFrame,
-    /// The §7.20 store payload: pre-grain cropped planes (`u16`).
-    ref_planes: Vec<Vec<u16>>,
+    /// The §7.20 store payload: native pre-grain cropped planes.
+    ref_planes: NativePlanes,
     /// `(width, height)` per `ref_planes` entry.
     ref_plane_dims: Vec<(u32, u32)>,
     /// §7.19 `MfMvs[]` grid (2 `i16` per mi cell).
@@ -319,23 +387,29 @@ fn decode_frame_spec_tiles(
     refs: Option<&SpecRefState>,
     exec: &oxideav_core::ExecutionContext,
 ) -> Result<DecodedFrameInternal, Error> {
-    let decoded = match seq.color_config.bit_depth {
-        8 => decode_frame_spec_tiles_native::<u8>(seq, fh, tiles, refs, exec),
-        10 | 12 => decode_frame_spec_tiles_native::<u16>(seq, fh, tiles, refs, exec),
-        _ => Err(Error::PartitionWalkOutOfRange),
-    }?;
+    let decode = refs.map_or_else(|| frame_decoder(seq.color_config.bit_depth), |refs| refs.decode);
+    decode(seq, fh, tiles, refs, exec)
+}
+
+fn decode_frame_spec_tiles_checked<P: FramePixel, R: FramePixel>(
+    seq: &SequenceHeader,
+    fh: &FrameHeader,
+    tiles: &[TilePayload],
+    refs: Option<&SpecRefState>,
+    exec: &oxideav_core::ExecutionContext,
+) -> Result<DecodedFrameInternal, Error> {
+    let decoded = decode_frame_spec_tiles_native::<P, R>(seq, fh, tiles, refs, exec)?;
     #[cfg(test)]
     {
-        // Keep the original widened-storage arithmetic as an independent
-        // monomorphization for every unit-test stream and coded frame.
-        let original = decode_frame_spec_tiles_native::<i32>(seq, fh, tiles, refs, exec)?;
+        let original = decode_frame_spec_tiles_native::<i32, R>(seq, fh, tiles, refs, exec)?;
         assert_eq!(decoded.frame, original.frame, "native reconstruction output");
-        assert_eq!(decoded.ref_planes, original.ref_planes, "native reference samples");
+        assert_eq!(decoded.ref_planes.canonical_samples(), original.ref_planes.canonical_samples(),
+            "native reference samples");
     }
     Ok(decoded)
 }
 
-fn decode_frame_spec_tiles_native<P: Pixel>(
+fn decode_frame_spec_tiles_native<P: FramePixel, R: FramePixel>(
     seq: &SequenceHeader,
     fh: &FrameHeader,
     tiles: &[TilePayload],
@@ -509,7 +583,7 @@ fn decode_frame_spec_tiles_native<P: Pixel>(
     let mi_rows = fs.mi_rows;
     let mi_cols = fs.mi_cols;
     let workers = exec.effective_workers(mi_rows.div_ceil(16) as usize);
-    let mut walker = PartitionWalker::<P>::new(mi_rows,
+    let mut walker = PartitionWalker::<P, R>::new(mi_rows,
     mi_cols,
     TileGeometry {
         mi_row_start: 0,
@@ -577,7 +651,7 @@ fn decode_frame_spec_tiles_native<P: Pixel>(
         };
     // Never-referenced placeholder for empty §7.20 slots (a conformant
     // stream only references `RefValid` slots).
-    let dummy_plane: Vec<u16> = vec![0u16; 64];
+    let dummy_plane: Vec<R> = vec![R::default(); 64];
     let dummy_entry = || RefFrameStoreEntry {
         plane: &dummy_plane,
         stride: 8,
@@ -586,7 +660,7 @@ fn decode_frame_spec_tiles_native<P: Pixel>(
         height: 8,
     };
     // Per-plane `FrameStore[ slot ]` views over the §7.20 store.
-    let mut plane_stores: Vec<[RefFrameStoreEntry<'_>; NUM_REF_FRAMES as usize]> = Vec::new();
+    let mut plane_stores: Vec<[RefFrameStoreEntry<'_, R>; NUM_REF_FRAMES as usize]> = Vec::new();
     let mut ref_frame_idx = [0u8; 7];
     let mut order_hints_by_ref = [0i32; ALTREF_FRAME + 1];
     let mut sign_bias = [0i32; 8];
@@ -598,7 +672,7 @@ fn decode_frame_spec_tiles_native<P: Pixel>(
             .as_ref()
             .ok_or(Error::PartitionWalkOutOfRange)?;
         for plane in 0..num_planes_usize {
-            let arr: [RefFrameStoreEntry<'_>; NUM_REF_FRAMES as usize] =
+            let arr: [RefFrameStoreEntry<'_, R>; NUM_REF_FRAMES as usize] =
                 core::array::from_fn(|slot| match st.slots[slot].as_ref() {
                     Some(s) if plane < s.planes.len() => {
                         let (w, _h) = s.plane_dims[plane];
@@ -609,7 +683,7 @@ fn decode_frame_spec_tiles_native<P: Pixel>(
                         // this plane's own sample units.
                         let (lw, lh) = s.plane_dims[0];
                         RefFrameStoreEntry {
-                            plane: &s.planes[plane],
+                            plane: R::reference(&s.planes, plane).unwrap_or(&dummy_plane),
                             stride: w as usize,
                             upscaled_width: lw,
                             width: lw,
@@ -678,7 +752,7 @@ fn decode_frame_spec_tiles_native<P: Pixel>(
         current_order_hint: fh.order_hint as i32,
         order_hints_by_ref,
     };
-    let plane_ref_specs: Vec<PlaneRefSpec<'_>> = (0..plane_stores.len())
+    let plane_ref_specs: Vec<PlaneRefSpec<'_, R>> = (0..plane_stores.len())
         .map(|p| PlaneRefSpec {
             plane: p as u8,
             subsampling_x: if p > 0 { sub_x_u8 } else { 0 },
@@ -698,7 +772,7 @@ fn decode_frame_spec_tiles_native<P: Pixel>(
         plane_refs: &plane_ref_specs,
         order_hints,
     };
-    let ictx: Option<InterFrameContext<'_>> = if is_inter_frame {
+    let ictx: Option<InterFrameContext<'_, R>> = if is_inter_frame {
         let ir = fh
             .inter_refs
             .as_ref()
@@ -840,7 +914,7 @@ fn decode_frame_spec_tiles_native<P: Pixel>(
         // r453 — MOVE the plane out of the walker (the §7.14/§7.15/
         // §7.16/§7.17 in-loop passes below operate on these caller-
         // owned buffers; nothing in the walker reads `CurrFrame`
-        // after the tile walk), saving a full-frame `i32` copy.
+        // after the tile walk), saving a full-frame native copy.
         let (rows, cols, src) = walker
             .take_curr_frame_plane(plane)
             .ok_or(Error::PartitionWalkOutOfRange)?;
@@ -1087,14 +1161,11 @@ fn decode_frame_spec_tiles_native<P: Pixel>(
         plane_dims[plane] = (out_w, out_h);
     }
 
-    // ---- §7.20 store payload: pre-grain cropped planes (u16). ----
+    // ---- §7.20 store payload: native pre-grain cropped planes. ----
     // §7.18.3 film grain applies to the OUTPUT copy only; the §7.20
     // reference store keeps the grain-free frame (the samples later
     // frames motion-compensate against).
-    let ref_planes: Vec<Vec<u16>> = plane_bufs
-        .iter()
-        .map(|buf| buf.iter().map(|&v| v.to_i32().max(0) as u16).collect())
-        .collect();
+    let ref_planes = P::snapshot(&plane_bufs);
     let ref_plane_dims: Vec<(u32, u32)> = plane_dims.clone();
 
     // ---- §7.18.3 film grain. ----
@@ -1498,7 +1569,9 @@ impl SpecDecodeSession {
     /// must start a new coded video sequence (a KEY frame), which
     /// rebuilds every slot before anything can reference it.
     pub fn reset_references(&mut self) {
+        let decode = self.refs.decode;
         self.refs = SpecRefState::new();
+        self.refs.decode = decode;
     }
 }
 
@@ -1621,69 +1694,9 @@ fn output_existing_frame(
     let slot = refs.slots[idx]
         .as_ref()
         .ok_or(Error::PartitionWalkOutOfRange)?;
-    // §7.18.3 on the OUTPUT copy only.
-    let mut grain_bufs: Option<Vec<Vec<i32>>> = None;
-    if seq.film_grain_params_present {
-        if let Some(fg) = slot.grain_params.as_ref() {
-            if fg.apply_grain {
-                let mut bufs: Vec<Vec<i32>> = slot
-                    .planes
-                    .iter()
-                    .map(|p| p.iter().map(|&v| v as i32).collect())
-                    .collect();
-                let cc = &seq.color_config;
-                let mut views: Vec<PlaneBuffer<'_>> = Vec::with_capacity(bufs.len());
-                for (buf, &(pw, ph)) in bufs.iter_mut().zip(slot.plane_dims.iter()) {
-                    views.push(PlaneBuffer {
-                        rows: ph,
-                        cols: pw,
-                        samples: buf,
-                    });
-                }
-                film_grain_synthesis(
-                    fg,
-                    slot.bit_depth,
-                    cc.num_planes,
-                    u8::from(cc.subsampling_x),
-                    u8::from(cc.subsampling_y),
-                    cc.matrix_coefficients,
-                    &mut views,
-                );
-                grain_bufs = Some(bufs);
-            }
-        }
-    }
-    let max_val: i32 = (1i32 << slot.bit_depth) - 1;
-    let planes: Vec<Vec<u8>> = match grain_bufs {
-        Some(bufs) => bufs
-            .into_iter()
-            .map(|p| {
-                if slot.bit_depth == 8 {
-                    p.into_iter().map(|v| v.clamp(0, 255) as u8).collect()
-                } else {
-                    let mut out = Vec::with_capacity(p.len() * 2);
-                    for v in p {
-                        out.extend_from_slice(&(v.clamp(0, max_val) as u16).to_le_bytes());
-                    }
-                    out
-                }
-            })
-            .collect(),
-        None => slot
-            .planes
-            .iter()
-            .map(|p| {
-                if slot.bit_depth == 8 {
-                    p.iter().map(|&v| v.min(255) as u8).collect()
-                } else {
-                    let mut out = Vec::with_capacity(p.len() * 2);
-                    for &v in p {
-                        out.extend_from_slice(&v.to_le_bytes());
-                    }
-                    out
-                }
-            })
-            .collect(),
+    let planes = match &slot.planes {
+        NativePlanes::U8(planes) => output_existing_planes(planes, slot, seq),
+        NativePlanes::U16(planes) => output_existing_planes(planes, slot, seq),
     };
     let (w, h) = *slot
         .plane_dims
@@ -1696,6 +1709,29 @@ fn output_existing_frame(
         plane_dims: slot.plane_dims.clone(),
         bit_depth: slot.bit_depth,
     })
+}
+
+fn output_existing_planes<P: Pixel>(
+    planes: &[Vec<P>], slot: &SpecRefSlot, seq: &SequenceHeader,
+) -> Vec<Vec<u8>> {
+    if seq.film_grain_params_present {
+        if let Some(fg) = slot.grain_params.as_ref().filter(|fg| fg.apply_grain) {
+            let mut bufs = planes.to_vec();
+            let cc = &seq.color_config;
+            let mut views: Vec<PlaneBuffer<'_, P>> = bufs.iter_mut().zip(&slot.plane_dims)
+                .map(|(samples, &(cols, rows))| PlaneBuffer { rows, cols, samples }).collect();
+            film_grain_synthesis(fg, slot.bit_depth, cc.num_planes,
+                u8::from(cc.subsampling_x), u8::from(cc.subsampling_y),
+                cc.matrix_coefficients, &mut views);
+            drop(views);
+            return bufs.into_iter().map(|p| P::into_bytes(p, slot.bit_depth)).collect();
+        }
+    }
+    if slot.bit_depth == 8 {
+        planes.iter().map(|p| p.iter().map(|&v| v.to_i32() as u8).collect()).collect()
+    } else {
+        planes.iter().map(|p| p.iter().flat_map(|&v| (v.to_i32() as u16).to_le_bytes()).collect()).collect()
+    }
 }
 
 /// Decode one §7.5 temporal-unit body, appending every SHOWN frame to
@@ -1778,6 +1814,7 @@ fn decode_temporal_unit_spec(
                     return Err(Error::OperatingPointOutOfRange);
                 }
                 *op_idc = sh.operating_points[idx].operating_point_idc;
+                refs.decode = frame_decoder(sh.color_config.bit_depth);
                 *seq = Some(sh);
             }
             ObuType::FrameHeader => {

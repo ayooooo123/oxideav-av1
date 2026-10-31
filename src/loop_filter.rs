@@ -149,7 +149,7 @@ impl Pixel for u16 {
     fn from_i32(value: i32) -> Self { value as u16 }
 }
 
-// Retained while the reconstruction and encoder callers migrate.
+// Signed storage remains available to encoder search and differential oracles.
 impl Pixel for i32 {
     #[inline(always)]
     fn to_i32(self) -> i32 { self }
@@ -159,7 +159,7 @@ impl Pixel for i32 {
 
 /// Mutable view of a single plane's `CurrFrame[plane]` sample buffer.
 ///
-/// The `samples` slice is row-major `rows * cols` `i32` post-`Clip1`
+/// The `samples` slice is row-major `rows * cols` native post-`Clip1` samples
 /// per av1-spec §7.12.3 step-3 — same shape produced by
 /// [`crate::PartitionWalker`] for the lazy per-plane buffers.
 #[derive(Debug)]
