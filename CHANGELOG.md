@@ -27,6 +27,8 @@ All notable changes to `oxideav-av1` are recorded here.
   filter-context callbacks are `Sync` so shared metadata is thread-safe.
 - DCT schedules use fixed-size arrays and batch four bounded column transforms
   in safe Rust; rotation products and every rounding/clamping step remain exact.
+- Interior residual merges operate on contiguous rows, retaining saturating i64
+  addition, all flip orientations, and the existing out-of-frame overhang path.
 
 ### Added
 

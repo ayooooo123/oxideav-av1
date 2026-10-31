@@ -17817,6 +17817,25 @@ impl PartitionWalker {
         let cols_buf = buf.cols;
         let rows_buf = buf.rows;
         let max = (1i32 << bit_depth) - 1;
+        if start_x <= cols_buf && w <= cols_buf - start_x
+            && start_y <= rows_buf && h <= rows_buf - start_y
+        {
+            let merge = |(dst, res): (&mut i32, &i64)| {
+                *dst = i64::from(*dst).saturating_add(*res).clamp(0, i64::from(max)) as i32;
+            };
+            let width = w as usize;
+            for (i, src) in residual.chunks_exact(width).enumerate() {
+                let yy = if flip_ud { h as usize - i - 1 } else { i };
+                let start = (start_y as usize + yy) * cols_buf as usize + start_x as usize;
+                let dst = &mut buf.samples[start..start + width];
+                if flip_lr {
+                    dst.iter_mut().rev().zip(src).for_each(merge);
+                } else {
+                    dst.iter_mut().zip(src).for_each(merge);
+                }
+            }
+            return;
+        }
         // r408: plane-0 out-of-buffer cells merge into the §7.11.5
         // [`LumaOverhang`] side store (`(dst_y, dst_x, residual)`
         // gathered here, applied after the plane borrow ends).
@@ -60841,6 +60860,36 @@ mod tests {
         let chroma_u = walker.curr_frame(1).unwrap();
         assert_eq!(chroma_u.len(), 8 * 8);
         assert!(chroma_u.iter().all(|&s| s == 0));
+    }
+
+    #[test]
+    fn curr_frame_step3_merge_interior_extremes_and_flips() {
+        let residual: Vec<i64> = (0..16).map(|i| [i64::MIN, i64::MAX, -4096, -1, 0, 1, 4096][i % 7]).collect();
+        for bit_depth in [8u8, 10, 12] {
+            let max = (1i32 << bit_depth) - 1;
+            let base: Vec<i32> = (0..256).map(|i| (i * 13) % (max + 1)).collect();
+            for tx_type in [DCT_DCT, FLIPADST_DCT, H_FLIPADST, FLIPADST_FLIPADST] {
+                let mut walker = PartitionWalker::new(4, 4, TileGeometry {
+                    mi_row_start: 0, mi_row_end: 4, mi_col_start: 0, mi_col_end: 4,
+                }).unwrap();
+                walker.ensure_curr_frame_plane(0, 16, 16);
+                walker.curr_frame[0].as_mut().unwrap().samples.copy_from_slice(&base);
+                let mut expected = base.clone();
+                let flip_ud = matches!(tx_type, FLIPADST_DCT | FLIPADST_FLIPADST);
+                let flip_lr = matches!(tx_type, H_FLIPADST | FLIPADST_FLIPADST);
+                for y in 0..4 {
+                    for x in 0..4 {
+                        let yy = if flip_ud { 3 - y } else { y };
+                        let xx = if flip_lr { 3 - x } else { x };
+                        let index = (3 + yy) * 16 + 2 + xx;
+                        expected[index] = i64::from(expected[index]).saturating_add(residual[y * 4 + x])
+                            .clamp(0, i64::from(max)) as i32;
+                    }
+                }
+                walker.curr_frame_step3_merge(0, 2, 3, TX_4X4, tx_type, &residual, bit_depth, 0, 0);
+                assert_eq!(walker.curr_frame(0).unwrap(), expected.as_slice());
+            }
+        }
     }
 
     /// §7.12.3 step-3 merge with `PlaneTxType = DCT_DCT` (no flip):
