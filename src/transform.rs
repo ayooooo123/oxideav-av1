@@ -793,6 +793,9 @@ pub fn inverse_transform_2d(
     // Row transforms.
     let mut tbuf_arr = [0i64; 64];
     for i in 0..h {
+        if i >= 32 || dequant[i * w..i * w + w.min(32)].iter().all(|&v| v == 0) {
+            continue;
+        }
         let tbuf = &mut tbuf_arr[..w];
         // Populate T[j] from Dequant[i][j], zero for j or i >= 32.
         for j in 0..w {

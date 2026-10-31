@@ -11,6 +11,8 @@ All notable changes to `oxideav-av1` are recorded here.
   border clipping no longer forces an otherwise interior row to scalar taps.
 - Integer-phase inter prediction evaluates the sole nonzero identity-filter tap,
   preserving both specification rounding stages and border extension.
+- The two-dimensional inverse transform leaves all-zero coefficient rows at
+  zero without evaluating their butterfly schedules.
 
 ### Added
 
