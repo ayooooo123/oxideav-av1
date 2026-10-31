@@ -1037,44 +1037,26 @@ pub fn block_inter_prediction(
             let y_base = start_y_int - 3;
             let min_x = start_x_int - 3;
             let max_x = start_x_int + (w as i32) + 3;
-            let min_y = y_base;
-            let max_y = y_base + (intermediate_height as i32) - 1;
-
-            if min_x >= 0 && max_x <= last_x && min_y >= 0 && max_y <= last_y {
+            if min_x >= 0 && max_x <= last_x {
                 let min_x = min_x as usize;
                 for r in 0..intermediate_height {
-                    let ry = (y_base + (r as i32)) as usize;
+                    let ry = clip3_i32(0, last_y, y_base + r as i32) as usize;
                     let row_start = ry * ref_stride + min_x;
                     let src_row = &ref_plane[row_start..row_start + w + 7];
                     let dst_row = &mut intermediate[r * w..(r + 1) * w];
                     filter_8tap_h(src_row, coeffs_h, inter_round0, dst_row, w);
                 }
             } else {
-                let round_offset = 1i32 << (inter_round0 - 1);
-                let c0 = coeffs_h[0];
-                let c1 = coeffs_h[1];
-                let c2 = coeffs_h[2];
-                let c3 = coeffs_h[3];
-                let c4 = coeffs_h[4];
-                let c5 = coeffs_h[5];
-                let c6 = coeffs_h[6];
-                let c7 = coeffs_h[7];
+                let mut edge = [0u16; 256 + 7];
                 for r in 0..intermediate_height {
-                    let ry = clip3_i32(0, last_y, y_base + (r as i32)) as usize;
+                    let ry = clip3_i32(0, last_y, y_base + r as i32) as usize;
                     let row_base = ry * ref_stride;
-                    let dst_row = &mut intermediate[r * w..(r + 1) * w];
-                    for c in 0..w {
-                        let p_int = start_x_int + (c as i32);
-                        let s = c0 * (ref_plane[row_base + clip3_i32(0, last_x, p_int - 3) as usize] as i32)
-                            + c1 * (ref_plane[row_base + clip3_i32(0, last_x, p_int - 2) as usize] as i32)
-                            + c2 * (ref_plane[row_base + clip3_i32(0, last_x, p_int - 1) as usize] as i32)
-                            + c3 * (ref_plane[row_base + clip3_i32(0, last_x, p_int) as usize] as i32)
-                            + c4 * (ref_plane[row_base + clip3_i32(0, last_x, p_int + 1) as usize] as i32)
-                            + c5 * (ref_plane[row_base + clip3_i32(0, last_x, p_int + 2) as usize] as i32)
-                            + c6 * (ref_plane[row_base + clip3_i32(0, last_x, p_int + 3) as usize] as i32)
-                            + c7 * (ref_plane[row_base + clip3_i32(0, last_x, p_int + 4) as usize] as i32);
-                        dst_row[c] = (s + round_offset) >> inter_round0;
+                    for (x, sample) in edge[..w + 7].iter_mut().enumerate() {
+                        let rx = clip3_i32(0, last_x, min_x + x as i32) as usize;
+                        *sample = ref_plane[row_base + rx];
                     }
+                    let dst_row = &mut intermediate[r * w..(r + 1) * w];
+                    filter_8tap_h(&edge[..w + 7], coeffs_h, inter_round0, dst_row, w);
                 }
             }
 
@@ -8305,6 +8287,65 @@ mod tests {
     }
 
     // ---------- §7.11.3.4 block_inter_prediction ----------
+    #[test]
+    fn unscaled_border_prediction_matches_spec_convolution() {
+        let stride = 37usize;
+        let rows = 29usize;
+        let src: Vec<u16> = (0..stride * rows)
+            .map(|i| ((i * 197 + i / stride * 91) & 4095) as u16)
+            .collect();
+        for &(w, h) in &[(4usize, 4usize), (8, 8), (16, 16), (32, 16)] {
+            for &(x, y) in &[(-13, -7), (0, 0), (5, 6), (34, 26), (50, 39)] {
+                for filter in 0..6usize {
+                    for phase in 0..16usize {
+                        let start_x = x * 1024 + phase as i32 * 64;
+                        let start_y = y * 1024 + (15 - phase) as i32 * 64;
+                        let hf = if w <= 4 {
+                            select_interp_filter_small_block(filter as u8) as usize
+                        } else {
+                            filter
+                        };
+                        let vf = if h <= 4 {
+                            select_interp_filter_small_block(filter as u8) as usize
+                        } else {
+                            filter
+                        };
+                        let mut intermediate = vec![0i32; (h + 7) * w];
+                        for r in 0..h + 7 {
+                            let ry = (y + r as i32 - 3).clamp(0, rows as i32 - 1) as usize;
+                            for c in 0..w {
+                                let sum: i64 = (0..8).map(|t| {
+                                    let rx = (x + c as i32 + t as i32 - 3)
+                                        .clamp(0, stride as i32 - 1) as usize;
+                                    i64::from(src[ry * stride + rx])
+                                        * i64::from(SUBPEL_FILTERS[hf][phase][t])
+                                }).sum();
+                                intermediate[r * w + c] = round2(sum, 3) as i32;
+                            }
+                        }
+                        let mut expected = vec![0i32; h * w];
+                        for r in 0..h {
+                            for c in 0..w {
+                                let sum: i64 = (0..8).map(|t| {
+                                    i64::from(intermediate[(r + t) * w + c])
+                                        * i64::from(SUBPEL_FILTERS[vf][15 - phase][t])
+                                }).sum();
+                                expected[r * w + c] = round2(sum, 7) as i32;
+                            }
+                        }
+                        let mut actual = vec![0i32; h * w];
+                        block_inter_prediction(
+                            0, 0, 0, &src, stride, stride as u32, rows as u32,
+                            start_x, start_y, 1024, 1024, w, h,
+                            filter as u8, filter as u8, 3, 7, &mut actual,
+                        ).unwrap();
+                        assert_eq!(actual, expected, "{w}x{h} ({x},{y}) filter {filter} phase {phase}");
+                    }
+                }
+            }
+        }
+    }
+
 
     /// §7.11.3.4 identity case: zero motion vector with an integer-
     /// aligned start position should reproduce a copy of the
