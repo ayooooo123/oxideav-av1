@@ -8019,6 +8019,21 @@ pub struct MotionFieldSlot<'a> {
     pub frame_is_intra: bool,
 }
 
+#[inline]
+fn project_motion_vector(mv: [i32; 2], multiplier: i32) -> [i32; 2] {
+    let mut out = [0i32; 2];
+    for i in 0..2 {
+        let value = mv[i] * multiplier;
+        let scaled = if value >= 0 {
+            (value + (1 << 13)) >> 14
+        } else {
+            -((-value + (1 << 13)) >> 14)
+        };
+        out[i] = scaled.clamp(-(1 << 14) + 1, (1 << 14) - 1);
+    }
+    out
+}
+
 /// §7.9 `motion_field_estimation()` — project the §7.20-saved motion
 /// vectors of up to four reference frames onto the current frame's
 /// 8×8 motion-field grid, one projected MV per (destination
@@ -8058,6 +8073,10 @@ pub fn motion_field_estimation_core(
     let mut mfmvs = MotionFieldMvs::new_invalid(mi_rows, mi_cols);
     let w8 = (mi_cols >> 1) as i32;
     let h8 = (mi_rows >> 1) as i32;
+    let destination_numerators: [i32; 8] = core::array::from_fn(|dst| {
+        get_relative_dist(order_hint, order_hints[dst], hint_bits)
+            .clamp(-MAX_FRAME_DISTANCE, MAX_FRAME_DISTANCE)
+    });
 
     // §7.9.2 projection for one source reference.
     let project_ref = |src: usize, dst_sign: i32, mfmvs: &mut MotionFieldMvs| -> bool {
@@ -8068,6 +8087,25 @@ pub fn motion_field_estimation_core(
         if slot.mi_rows != mi_rows || slot.mi_cols != mi_cols || slot.frame_is_intra {
             return false;
         }
+        let ref_to_cur = get_relative_dist(order_hints[src], order_hint, hint_bits);
+        if ref_to_cur.abs() > MAX_FRAME_DISTANCE {
+            // An eligible source still consumes its source-selection budget.
+            return true;
+        }
+        let mut valid_reference = [false; 8];
+        let mut position_multiplier = [0i32; 8];
+        let mut destination_multiplier = [[0i32; 8]; 8];
+        for source_ref in LAST_FRAME..=ALTREF_FRAME {
+            let offset = get_relative_dist(order_hints[src], slot.saved_order_hints[source_ref], hint_bits);
+            if offset <= 0 || offset > MAX_FRAME_DISTANCE { continue; }
+            valid_reference[source_ref] = true;
+            let divisor = DIV_MULT[offset as usize];
+            position_multiplier[source_ref] =
+                (ref_to_cur * dst_sign).clamp(-MAX_FRAME_DISTANCE, MAX_FRAME_DISTANCE) * divisor;
+            for dst in LAST_FRAME..=ALTREF_FRAME {
+                destination_multiplier[source_ref][dst] = destination_numerators[dst] * divisor;
+            }
+        }
         for y8 in 0..h8 {
             for x8 in 0..w8 {
                 let row = (2 * y8 + 1) as usize;
@@ -8077,40 +8115,15 @@ pub fn motion_field_estimation_core(
                 if src_ref <= 0 {
                     continue;
                 }
-                let ref_to_cur = get_relative_dist(order_hints[src], order_hint, hint_bits);
-                let ref_offset = get_relative_dist(
-                    order_hints[src],
-                    slot.saved_order_hints[src_ref as usize],
-                    hint_bits,
-                );
-                let pos_valid = ref_to_cur.abs() <= MAX_FRAME_DISTANCE
-                    && ref_offset.abs() <= MAX_FRAME_DISTANCE
-                    && ref_offset > 0;
-                if !pos_valid {
+                let source_ref = src_ref as usize;
+                if !valid_reference[source_ref] {
                     continue;
                 }
                 let mv = [
                     i32::from(slot.mf_mvs[cell * 2]),
                     i32::from(slot.mf_mvs[cell * 2 + 1]),
                 ];
-                // §7.9.3 get_mv_projection.
-                let mv_projection = |mv: [i32; 2], numerator: i32, denominator: i32| -> [i32; 2] {
-                    let clipped_den = denominator.min(MAX_FRAME_DISTANCE);
-                    let clipped_num = numerator.clamp(-MAX_FRAME_DISTANCE, MAX_FRAME_DISTANCE);
-                    let mut out = [0i32; 2];
-                    for i in 0..2 {
-                        let v = mv[i] * clipped_num * DIV_MULT[clipped_den as usize];
-                        // Round2Signed(v, 14).
-                        let scaled = if v >= 0 {
-                            (v + (1 << 13)) >> 14
-                        } else {
-                            -((-v + (1 << 13)) >> 14)
-                        };
-                        out[i] = scaled.clamp(-(1 << 14) + 1, (1 << 14) - 1);
-                    }
-                    out
-                };
-                let proj_mv = mv_projection(mv, ref_to_cur * dst_sign, ref_offset);
+                let proj_mv = project_motion_vector(mv, position_multiplier[source_ref]);
                 // §7.9.4 get_block_position.
                 let project = |v8: i32, delta: i32, max8: i32, max_off8: i32| -> (i32, bool) {
                     let base8 = (v8 >> 3) << 3;
@@ -8131,14 +8144,10 @@ pub fn motion_field_estimation_core(
                 if !(vy && vx) {
                     continue;
                 }
-                for (dst, &dst_hint) in order_hints
-                    .iter()
-                    .enumerate()
-                    .take(ALTREF_FRAME + 1)
-                    .skip(LAST_FRAME)
+                for (dst, &multiplier) in destination_multiplier[source_ref]
+                    .iter().enumerate().take(ALTREF_FRAME + 1).skip(LAST_FRAME)
                 {
-                    let ref_to_dst = get_relative_dist(order_hint, dst_hint, hint_bits);
-                    let out = mv_projection(mv, ref_to_dst, ref_offset);
+                    let out = project_motion_vector(mv, multiplier);
                     mfmvs.set(
                         dst,
                         pos_y8 as u32,
@@ -8183,6 +8192,28 @@ pub fn motion_field_estimation_core(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn project_motion_vector_matches_spec_products() {
+        for denominator in 1..=31i32 {
+            for numerator in -31..=31i32 {
+                for mv in [-4095i32, -63, -1, 0, 1, 63, 4095] {
+                    let input = [mv, -mv];
+                    let mut expected = [0i32; 2];
+                    for i in 0..2 {
+                        let value = input[i] * numerator * (16384 / denominator);
+                        let rounded = if value >= 0 {
+                            (value + 8192) >> 14
+                        } else {
+                            -((-value + 8192) >> 14)
+                        };
+                        expected[i] = rounded.clamp(-16383, 16383);
+                    }
+                    assert_eq!(project_motion_vector(input, numerator * (16384 / denominator)), expected);
+                }
+            }
+        }
+    }
 
     // ---------- §7.11.3.2 rounding_variables ----------
 

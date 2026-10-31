@@ -32,6 +32,8 @@ All notable changes to `oxideav-av1` are recorded here.
 - Vertically integer-phase inter prediction writes horizontal-filtered rows
   directly to prediction output, preserving both rounds without TLS scratch
   access or unused halo-row convolution.
+- Motion-field projection hoists reference distances, validity and exact
+  projection multipliers out of the per-cell/per-destination loops.
 
 ### Added
 
