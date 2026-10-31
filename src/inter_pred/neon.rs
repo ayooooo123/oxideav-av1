@@ -6,13 +6,32 @@ pub(super) fn horizontal<R: Pixel>(src: &[R], coeff: &[i32; 8], shift: u32, dst:
     assert!(src.len() >= w + 7 && dst.len() >= w);
     assert!((1..32).contains(&shift));
     let end = w / 8 * 8;
-    // SAFETY: the entire eight-tap row and output were checked above;
-    // every vector covers eight outputs. AV1 samples fit signed 16 bits,
-    // and all products/sums fit signed 32 bits at 8/10/12-bit depth.
+    let wide_end = if core::mem::size_of::<R>() == 1 { w / 16 * 16 } else { 0 };
+    // SAFETY: Pixel is sealed to u8/u16/i32. The complete source tap
+    // rectangle and destination were checked above. Native u8 consumes
+    // sixteen samples per input register; u16 consumes eight. Samples fit
+    // signed 16 bits and convolution products/sums retain exact i32 widths.
     unsafe {
         let offset = vdupq_n_s32(1 << (shift - 1));
         let shifts = vdupq_n_s32(-(shift as i32));
-        for x in (0..end).step_by(8) {
+        for x in (0..wide_end).step_by(16) {
+            let p = src.as_ptr().add(x).cast::<u8>();
+            let (mut a0, mut a1, mut b0, mut b1) = (offset, offset, offset, offset);
+            for (k, &c) in coeff.iter().enumerate() {
+                let bytes = vld1q_u8(p.add(k));
+                let a = vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(bytes)));
+                let b = vreinterpretq_s16_u16(vmovl_high_u8(bytes));
+                a0 = vmlal_n_s16(a0, vget_low_s16(a), c as i16);
+                a1 = vmlal_high_n_s16(a1, a, c as i16);
+                b0 = vmlal_n_s16(b0, vget_low_s16(b), c as i16);
+                b1 = vmlal_high_n_s16(b1, b, c as i16);
+            }
+            vst1q_s32(dst.as_mut_ptr().add(x), vshlq_s32(a0, shifts));
+            vst1q_s32(dst.as_mut_ptr().add(x + 4), vshlq_s32(a1, shifts));
+            vst1q_s32(dst.as_mut_ptr().add(x + 8), vshlq_s32(b0, shifts));
+            vst1q_s32(dst.as_mut_ptr().add(x + 12), vshlq_s32(b1, shifts));
+        }
+        for x in (wide_end..end).step_by(8) {
             let p = src.as_ptr().add(x);
             let mut lo = offset;
             let mut hi = offset;
