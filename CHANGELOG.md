@@ -9,6 +9,8 @@ All notable changes to `oxideav-av1` are recorded here.
 - Unscaled inter prediction gathers the clamped border once per source row,
   then uses the same contiguous eight-tap kernel as interior blocks; vertical
   border clipping no longer forces an otherwise interior row to scalar taps.
+- Integer-phase inter prediction evaluates the sole nonzero identity-filter tap,
+  preserving both specification rounding stages and border extension.
 
 ### Added
 

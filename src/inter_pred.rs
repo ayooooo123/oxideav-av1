@@ -1037,7 +1037,26 @@ pub fn block_inter_prediction(
             let y_base = start_y_int - 3;
             let min_x = start_x_int - 3;
             let max_x = start_x_int + (w as i32) + 3;
-            if min_x >= 0 && max_x <= last_x {
+            if phase_x == 0 {
+                let round_offset = 1i32 << (inter_round0 - 1);
+                for r in 0..intermediate_height {
+                    let ry = clip3_i32(0, last_y, y_base + r as i32) as usize;
+                    let row_base = ry * ref_stride;
+                    let dst_row = &mut intermediate[r * w..(r + 1) * w];
+                    if start_x_int >= 0 && start_x_int as usize + w <= plane_w {
+                        let start = row_base + start_x_int as usize;
+                        for (dst, &src) in dst_row.iter_mut().zip(&ref_plane[start..start + w]) {
+                            *dst = (128 * i32::from(src) + round_offset) >> inter_round0;
+                        }
+                    } else {
+                        for (c, dst) in dst_row.iter_mut().enumerate() {
+                            let rx = clip3_i32(0, last_x, start_x_int + c as i32) as usize;
+                            *dst = (128 * i32::from(ref_plane[row_base + rx]) + round_offset)
+                                >> inter_round0;
+                        }
+                    }
+                }
+            } else if min_x >= 0 && max_x <= last_x {
                 let min_x = min_x as usize;
                 for r in 0..intermediate_height {
                     let ry = clip3_i32(0, last_y, y_base + r as i32) as usize;
@@ -1060,9 +1079,17 @@ pub fn block_inter_prediction(
                 }
             }
 
-            for r in 0..h {
-                let dst_row = &mut pred[r * w..(r + 1) * w];
-                filter_8tap_v(intermediate, w, r, coeffs_v, inter_round1, dst_row);
+            if phase_y == 0 {
+                let round_offset = 1i32 << (inter_round1 - 1);
+                let src = &intermediate[3 * w..(h + 3) * w];
+                for (dst, &src) in pred[..h * w].iter_mut().zip(src) {
+                    *dst = (128 * src + round_offset) >> inter_round1;
+                }
+            } else {
+                for r in 0..h {
+                    let dst_row = &mut pred[r * w..(r + 1) * w];
+                    filter_8tap_v(intermediate, w, r, coeffs_v, inter_round1, dst_row);
+                }
             }
         } else {
             let y_base = (start_y >> SCALE_SUBPEL_BITS) - 3;
