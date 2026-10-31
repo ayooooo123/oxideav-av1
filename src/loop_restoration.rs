@@ -910,10 +910,10 @@ pub fn wiener_filter(
     plane: u8,
     geom: &LrBlockGeometry,
 ) {
-    let Some(_curr) = curr_planes.get(plane as usize) else {
+    let Some(curr) = curr_planes.get(plane as usize) else {
         return;
     };
-    let Some(_cdef) = cdef_planes.get(plane as usize) else {
+    let Some(cdef) = cdef_planes.get(plane as usize) else {
         return;
     };
     // av1-spec p.333 lines 18429-18433: vfilter = wiener_coefficients(
@@ -946,19 +946,16 @@ pub fn wiener_filter(
     let mut window = vec![0i32; (h + 6) * sw];
     for (r, row) in window.chunks_mut(sw).enumerate() {
         let sy = geom.y as i32 + r as i32 - 3;
-        for (c, v) in row.iter_mut().enumerate() {
-            let sx = geom.x as i32 + c as i32 - 3;
-            *v = get_source_sample(curr_planes, cdef_planes, plane, sx, sy, geom);
-        }
+        source_row(curr, cdef, geom.x as i32 - 3, sy, geom, row);
     }
     let mut intermediate = vec![0i32; (h + 6) * w];
     for r in 0..(h + 6) {
         let wrow = &window[r * sw..(r + 1) * sw];
         for c in 0..w {
-            let mut s = 0i32;
-            for (t, &hcoef) in hfilter.iter().enumerate() {
-                s += hcoef * wrow[c + t];
-            }
+            let s = hfilter[0] * (wrow[c] + wrow[c + 6])
+                + hfilter[1] * (wrow[c + 1] + wrow[c + 5])
+                + hfilter[2] * (wrow[c + 2] + wrow[c + 4])
+                + hfilter[3] * wrow[c + 3];
             let v = round2_i32(s, inter_round0);
             let clipped = clip3(-offset, limit - offset, v);
             intermediate[r * w + c] = clipped;
@@ -970,22 +967,31 @@ pub fn wiener_filter(
     let Some(lr) = lr_planes.get_mut(plane as usize) else {
         return;
     };
-    let lr_cols = lr.cols as i32;
-    let lr_rows = lr.rows as i32;
+    let x0 = geom.x as usize;
+    let width = w.min((lr.cols as usize).saturating_sub(x0));
+    if width == 0 {
+        return;
+    }
     for r in 0..h {
-        for c in 0..w {
-            let mut s = 0i32;
-            for (t, &vcoef) in vfilter.iter().enumerate() {
-                s += vcoef * intermediate[(r + t) * w + c];
-            }
-            let v = round2_i32(s, inter_round1);
-            let out = clip3(0, max_sample, v);
-            let dst_y = geom.y as i32 + r as i32;
-            let dst_x = geom.x as i32 + c as i32;
-            if dst_y < 0 || dst_y >= lr_rows || dst_x < 0 || dst_x >= lr_cols {
-                continue;
-            }
-            lr.samples[(dst_y as usize) * (lr.cols as usize) + dst_x as usize] = out;
+        let y = geom.y as usize + r;
+        if y >= lr.rows as usize {
+            continue;
+        }
+        let start = y * lr.cols as usize + x0;
+        let dst = &mut lr.samples[start..start + width];
+        let row0 = &intermediate[r * w..r * w + width];
+        let row1 = &intermediate[(r + 1) * w..(r + 1) * w + width];
+        let row2 = &intermediate[(r + 2) * w..(r + 2) * w + width];
+        let row3 = &intermediate[(r + 3) * w..(r + 3) * w + width];
+        let row4 = &intermediate[(r + 4) * w..(r + 4) * w + width];
+        let row5 = &intermediate[(r + 5) * w..(r + 5) * w + width];
+        let row6 = &intermediate[(r + 6) * w..(r + 6) * w + width];
+        for (c, out) in dst.iter_mut().enumerate() {
+            let s = vfilter[0] * (row0[c] + row6[c])
+                + vfilter[1] * (row1[c] + row5[c])
+                + vfilter[2] * (row2[c] + row4[c])
+                + vfilter[3] * row3[c];
+            *out = clip3(0, max_sample, round2_i32(s, inter_round1));
         }
     }
 }
@@ -1022,6 +1028,41 @@ pub fn wiener_coefficients(coeff: &[i32; WIENER_COEFFS]) -> [i32; 7] {
 // =====================================================================
 // §7.17.6 Get source sample process — av1-spec p.335 lines 18516-18550.
 // =====================================================================
+
+fn source_row(
+    curr: &PlaneBuffer<'_>,
+    cdef: &PlaneBuffer<'_>,
+    x: i32,
+    y: i32,
+    geom: &LrBlockGeometry,
+    dst: &mut [i32],
+) {
+    let mut y = y.clamp(0, geom.plane_end_y.max(0));
+    let src = if y < geom.stripe_start_y {
+        y = y.max(geom.stripe_start_y - 2);
+        curr
+    } else if y > geom.stripe_end_y {
+        y = y.min(geom.stripe_end_y + 2);
+        curr
+    } else {
+        cdef
+    };
+    if src.rows == 0 || src.cols == 0 {
+        dst.fill(0);
+        return;
+    }
+    let y = y.clamp(0, src.rows as i32 - 1) as usize;
+    let stride = src.cols as usize;
+    let row = &src.samples[y * stride..(y + 1) * stride];
+    let last_x = geom.plane_end_x.max(0).min(src.cols as i32 - 1);
+    if x >= 0 && x as usize + dst.len() <= last_x as usize + 1 {
+        dst.copy_from_slice(&row[x as usize..x as usize + dst.len()]);
+    } else {
+        for (c, v) in dst.iter_mut().enumerate() {
+            *v = row[(x + c as i32).clamp(0, last_x) as usize];
+        }
+    }
+}
 
 /// §7.17.6 source-sample fetch — av1-spec p.335 lines 18516-18550.
 ///
@@ -1185,6 +1226,27 @@ mod tests {
 
     fn make_plane(rows: u32, cols: u32, fill: i32) -> Vec<i32> {
         vec![fill; (rows * cols) as usize]
+    }
+
+    #[test]
+    fn source_rows_match_individual_stripe_samples() {
+        let mut curr_samples: Vec<i32> = (0..17 * 19).collect();
+        let mut cdef_samples: Vec<i32> = (0..21 * 23).map(|i| 4095 - i * 3).collect();
+        let curr = [PlaneBuffer { rows: 17, cols: 19, samples: &mut curr_samples }];
+        let cdef = [PlaneBuffer { rows: 21, cols: 23, samples: &mut cdef_samples }];
+        let geom = LrBlockGeometry {
+            unit_row: 0, unit_col: 0, x: 0, y: 0, w: 23, h: 21,
+            stripe_start_y: 4, stripe_end_y: 12, plane_end_x: 22, plane_end_y: 20,
+        };
+        for y in -5..30 {
+            for x in -7..30 {
+                let mut actual = [0i32; 31];
+                source_row(&curr[0], &cdef[0], x, y, &geom, &mut actual);
+                for (c, &sample) in actual.iter().enumerate() {
+                    assert_eq!(sample, get_source_sample(&curr, &cdef, 0, x + c as i32, y, &geom));
+                }
+            }
+        }
     }
 
     #[test]

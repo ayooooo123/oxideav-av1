@@ -13,6 +13,8 @@ All notable changes to `oxideav-av1` are recorded here.
   preserving both specification rounding stages and border extension.
 - The two-dimensional inverse transform leaves all-zero coefficient rows at
   zero without evaluating their butterfly schedules.
+- Wiener restoration selects its stripe source once per row and copies interior
+  windows contiguously; symmetric taps share their exact integer products.
 
 ### Added
 
