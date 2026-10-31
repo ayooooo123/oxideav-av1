@@ -136,7 +136,7 @@ fn walker_n(n: u32) -> PartitionWalker {
         mi_col_start: 0,
         mi_col_end: n,
     };
-    PartitionWalker::new(n, n, geom).unwrap()
+    PartitionWalker::<i32>::new(n, n, geom).unwrap()
 }
 
 /// §5.11.5 baseline path: a single keyframe / intra-only block at the

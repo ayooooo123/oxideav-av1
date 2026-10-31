@@ -124,6 +124,13 @@ mod pixel_sealed {
 pub trait Pixel: pixel_sealed::Sealed + Copy + Default + Send + Sync + std::fmt::Debug + PartialEq + 'static {
     fn to_i32(self) -> i32;
     fn from_i32(value: i32) -> Self;
+    fn into_bytes(samples: Vec<Self>, bit_depth: u8) -> Vec<u8> {
+        if bit_depth == 8 {
+            samples.into_iter().map(|v| v.to_i32().clamp(0, 255) as u8).collect()
+        } else {
+            samples.into_iter().flat_map(|v| (v.to_i32() as u16).to_le_bytes()).collect()
+        }
+    }
 }
 
 impl Pixel for u8 {
@@ -131,6 +138,8 @@ impl Pixel for u8 {
     fn to_i32(self) -> i32 { self as i32 }
     #[inline(always)]
     fn from_i32(value: i32) -> Self { value as u8 }
+    #[inline]
+    fn into_bytes(samples: Vec<Self>, _bit_depth: u8) -> Vec<u8> { samples }
 }
 
 impl Pixel for u16 {

@@ -10,7 +10,11 @@ All notable changes to `oxideav-av1` are recorded here.
   Scalar arithmetic retains the specification's signed widths; CDEF NEON loads
   and stores native `u8`/`u16` rows without an `i32` conversion buffer. Differential
   tests compare native storage with the original `i32` arithmetic at 8/10/12 bits.
-  Decoder reconstruction still uses its original storage during this first step.
+- Frame reconstruction, CfL overhang, deblocking, CDEF, super-resolution, loop
+  restoration and film grain write native `u8` (8-bit) or `u16` (10/12-bit)
+  planes. Transform coefficients/residual arithmetic keep their signed widths.
+  Eight-bit display output takes ownership of its plane allocation directly.
+  Reference snapshots retain their existing `u16` boundary during migration.
 - AArch64 inverse transforms batch four rows and columns using explicit NEON
   DCT, ADST, and identity passes. Widened products, stage precision clamps,
   rectangular scaling, and both rounding stages remain bit-exact; lossless

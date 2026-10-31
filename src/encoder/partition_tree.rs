@@ -1425,7 +1425,7 @@ impl PartitionSyntaxWriter {
         if geometry.mi_row_end > mi_rows || geometry.mi_col_end > mi_cols {
             return None;
         }
-        let mirror = PartitionWalker::new(mi_rows, mi_cols, geometry)?;
+        let mirror = PartitionWalker::<i32>::new(mi_rows, mi_cols, geometry)?;
         Some(Self {
             mi_rows,
             mi_cols,
@@ -5009,7 +5009,7 @@ mod tests {
         // (0+2) < 4 ⇒ has_rows / has_cols both true), then the
         // §5.11.5 leaf scalars in driver order.
         let mut walker =
-            PartitionWalker::new(mi_rows, mi_cols, single_tile(mi_rows, mi_cols)).unwrap();
+            PartitionWalker::<i32>::new(mi_rows, mi_cols, single_tile(mi_rows, mi_cols)).unwrap();
         let mut dec_cdfs = TileCdfContext::new_from_defaults();
         let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
         // Read the partition symbol per §5.11.4 has_rows & has_cols arm.
@@ -5050,7 +5050,7 @@ mod tests {
         .unwrap();
         let bytes = writer.finish();
         let mut walker =
-            PartitionWalker::new(mi_rows, mi_cols, single_tile(mi_rows, mi_cols)).unwrap();
+            PartitionWalker::<i32>::new(mi_rows, mi_cols, single_tile(mi_rows, mi_cols)).unwrap();
         let mut dec_cdfs = TileCdfContext::new_from_defaults();
         let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
         let bsl = MI_WIDTH_LOG2[b_size] as u32;
@@ -5085,7 +5085,7 @@ mod tests {
         let bytes = writer.finish();
 
         let mut walker =
-            PartitionWalker::new(mi_rows, mi_cols, single_tile(mi_rows, mi_cols)).unwrap();
+            PartitionWalker::<i32>::new(mi_rows, mi_cols, single_tile(mi_rows, mi_cols)).unwrap();
         let mut dec_cdfs = TileCdfContext::new_from_defaults();
         let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
         // §5.11.4 partition symbol.
@@ -5188,7 +5188,7 @@ mod tests {
 
         // ----- decode (the §5.11.4 / §5.11.5 syntax walker) -----
         let mut walker =
-            PartitionWalker::new(mi_rows, mi_cols, single_tile(mi_rows, mi_cols)).unwrap();
+            PartitionWalker::<i32>::new(mi_rows, mi_cols, single_tile(mi_rows, mi_cols)).unwrap();
         let mut dec_cdfs = TileCdfContext::new_from_defaults();
         let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
         walker
@@ -6811,7 +6811,7 @@ mod tests {
         // ----- decode (the §5.11.4 / §5.11.5 / §5.11.18 walker) -----
         let ictx = inter_ctx_for(ipp);
         let mut walker =
-            PartitionWalker::new(mi_rows, mi_cols, single_tile(mi_rows, mi_cols)).unwrap();
+            PartitionWalker::<i32>::new(mi_rows, mi_cols, single_tile(mi_rows, mi_cols)).unwrap();
         let mut dec_cdfs = TileCdfContext::new_from_defaults();
         let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
         walker
@@ -7741,7 +7741,7 @@ mod tests {
 
         // Pre-compute NE's §7.10.2 stack against a scratch walker
         // carrying NW's footer stamp.
-        let mut scratch = PartitionWalker::new(16, 16, single_tile(16, 16)).unwrap();
+        let mut scratch = PartitionWalker::<i32>::new(16, 16, single_tile(16, 16)).unwrap();
         scratch.stamp_encoder_block_syntax(&EncoderBlockSyntaxStamp {
             mi_row: 0,
             mi_col: 0,

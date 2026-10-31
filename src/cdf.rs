@@ -13945,7 +13945,7 @@ pub fn tx_size_sqr_index(tx_size: usize) -> usize {
     (side.trailing_zeros() as usize) - 2
 }
 
-impl PartitionWalker {
+impl<P: crate::loop_filter::Pixel> PartitionWalker<P> {
     /// r464 — import the per-mi grids of a `h4 × w4` rect from
     /// `src` (at `src_row`, `src_col`) into this walker at `dst_row`,
     /// `dst_col`: every per-cell grid, the `TxTypes[]` / `cdef_idx[]`
@@ -14086,7 +14086,7 @@ impl PartitionWalker {
     }
 }
 
-impl PartitionWalker {
+impl<P: crate::loop_filter::Pixel> PartitionWalker<P> {
     /// r464 — diagnostic: the names of the fields on which `self` and
     /// `other` differ (empty when equal).
     #[doc(hidden)]
@@ -14288,7 +14288,7 @@ impl PartitionWalker {
     }
 }
 
-impl PartitionWalker {
+impl<P: crate::loop_filter::Pixel> PartitionWalker<P> {
     /// `transform_type( x4, y4, txSz )` per §5.11.47 (av1-spec p.99-100).
     /// Decodes the per-luma-TU `TxType` from the bitstream and emits
     /// the value the caller stamps into `TxTypes[ y4 + j ][ x4 + i ]`.
@@ -15731,7 +15731,7 @@ const BD_STRIDE: usize = MAX_SB4 + 2;
 // r421: `Clone` so the encoder's search-side rate twin can price
 // candidate symbol sequences on a snapshot of the write-side mirror.
 #[derive(Debug, Clone)]
-pub struct PartitionWalker {
+pub struct PartitionWalker<P: crate::loop_filter::Pixel = i32> {
     mi_rows: u32,
     mi_cols: u32,
     geometry: TileGeometry,
@@ -16170,14 +16170,13 @@ pub struct PartitionWalker {
     /// identity for the §7.12.3 step-3 additive merge before any
     /// upstream §7.11.x prediction-sample writer fires (a TU with no
     /// prediction sees `CurrFrame[..][..] = Clip1(0 + Residual[i][j])`,
-    /// the spec's `prediction == 0` arm). Stored as `i32` so the
-    /// pre-`Clip1` `prediction + Residual[i][j]` sum fits without
-    /// truncation across all `BitDepth ∈ {8, 10, 12}` modes.
-    curr_frame: [Option<CurrFramePlane>; 3],
+    /// the spec's `prediction == 0` arm). Clipped samples use the
+    /// selected native storage; residual addition widens before clipping.
+    curr_frame: [Option<CurrFramePlane<P>>; 3],
     /// r408 — §7.11.5 luma TU-overhang side store (see
     /// [`LumaOverhang`]). Lazily allocated on the first clipped
     /// plane-0 write.
-    luma_overhang: Option<Box<LumaOverhang>>,
+    luma_overhang: Option<Box<LumaOverhang<P>>>,
     /// `RefLrWiener[ plane ][ pass ][ WIENER_COEFFS ]` (§5.11.2 /
     /// §5.11.58 — av1-spec p.60 / p.106). The per-plane, per-pass
     /// running reference for the §5.11.58 `decode_signed_subexp_with_ref_bool`
@@ -16257,12 +16256,12 @@ pub struct PartitionWalker {
 
 /// Per-plane `CurrFrame[plane]` sample buffer — owned `(rows, cols,
 /// samples)` triple. The flat `samples` buffer is row-major with
-/// `rows * cols` `i32` entries.
+/// `rows * cols` native clipped entries.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct CurrFramePlane {
+struct CurrFramePlane<P: crate::loop_filter::Pixel> {
     rows: u32,
     cols: u32,
-    samples: Vec<i32>,
+    samples: Vec<P>,
 }
 
 /// r408 — §7.11.5 luma TU-overhang store. The spec's `CurrFrame[ 0 ]`
@@ -16279,36 +16278,36 @@ struct CurrFramePlane {
 /// LUMA_OH)`, `corner` both. `LUMA_OH = 64` bounds the largest
 /// possible overhang (`Tx_Width ≤ 64`).
 #[derive(Debug, Clone, PartialEq)]
-struct LumaOverhang {
+struct LumaOverhang<P: crate::loop_filter::Pixel> {
     rows: u32,
     cols: u32,
     /// `rows × LUMA_OH`, row-major.
-    right: Vec<i32>,
+    right: Vec<P>,
     /// `LUMA_OH × cols`, row-major.
-    bottom: Vec<i32>,
+    bottom: Vec<P>,
     /// `LUMA_OH × LUMA_OH`, row-major.
-    corner: Vec<i32>,
+    corner: Vec<P>,
 }
 
 /// Maximum §5.11.35 luma TU overhang past the mi-padded grid.
 const LUMA_OH: u32 = 64;
 
-impl LumaOverhang {
+impl<P: crate::loop_filter::Pixel> LumaOverhang<P> {
     fn new(rows: u32, cols: u32) -> Option<Box<Self>> {
         let r = (rows as usize).checked_mul(LUMA_OH as usize)?;
         let b = (LUMA_OH as usize).checked_mul(cols as usize)?;
         let mut right = Vec::new();
         right.try_reserve_exact(r).ok()?;
-        right.resize(r, 0);
+        right.resize(r, P::default());
         let mut bottom = Vec::new();
         bottom.try_reserve_exact(b).ok()?;
-        bottom.resize(b, 0);
+        bottom.resize(b, P::default());
         Some(Box::new(Self {
             rows,
             cols,
             right,
             bottom,
-            corner: vec![0i32; (LUMA_OH as usize) * (LUMA_OH as usize)],
+            corner: vec![P::default(); (LUMA_OH as usize) * (LUMA_OH as usize)],
         }))
     }
 
@@ -16323,23 +16322,23 @@ impl LumaOverhang {
             if ox >= LUMA_OH {
                 return 0;
             }
-            return self.right[(y as usize) * (LUMA_OH as usize) + (ox as usize)];
+            return self.right[(y as usize) * (LUMA_OH as usize) + (ox as usize)].to_i32();
         }
         let oy = y - self.rows;
         if oy >= LUMA_OH {
             return 0;
         }
         if x < self.cols {
-            return self.bottom[(oy as usize) * (self.cols as usize) + (x as usize)];
+            return self.bottom[(oy as usize) * (self.cols as usize) + (x as usize)].to_i32();
         }
         let ox = x - self.cols;
         if ox >= LUMA_OH {
             return 0;
         }
-        self.corner[(oy as usize) * (LUMA_OH as usize) + (ox as usize)]
+        self.corner[(oy as usize) * (LUMA_OH as usize) + (ox as usize)].to_i32()
     }
 
-    fn slot(&mut self, y: u32, x: u32) -> Option<&mut i32> {
+    fn slot(&mut self, y: u32, x: u32) -> Option<&mut P> {
         if y < self.rows && x < self.cols {
             return None;
         }
@@ -16621,7 +16620,7 @@ pub struct TileDecodeParams<'a> {
     pub enable_intra_edge_filter: bool,
 }
 
-impl PartitionWalker {
+impl<P: crate::loop_filter::Pixel> PartitionWalker<P> {
     /// Construct a fresh walker for a frame with the given mi-unit
     /// extent and tile bounds. Every `MiSizes[]` cell starts at
     /// [`BLOCK_INVALID`] (the §5.11.4 unfilled-cell sentinel).
@@ -17038,7 +17037,7 @@ impl PartitionWalker {
     /// `plane` is `0` (Y), `1` (Cb), `2` (Cr); out-of-range `plane`
     /// returns `None`.
     #[must_use]
-    pub fn curr_frame(&self, plane: usize) -> Option<&[i32]> {
+    pub fn curr_frame(&self, plane: usize) -> Option<&[P]> {
         self.curr_frame
             .get(plane)
             .and_then(|p| p.as_ref().map(|cp| cp.samples.as_slice()))
@@ -17051,7 +17050,7 @@ impl PartitionWalker {
     /// the frame driver takes ownership instead of copying the
     /// full-frame `i32` buffer. Returns `(rows, cols, samples)`; the
     /// plane's slot is left unallocated (as before the first merge).
-    pub(crate) fn take_curr_frame_plane(&mut self, plane: usize) -> Option<(u32, u32, Vec<i32>)> {
+    pub(crate) fn take_curr_frame_plane(&mut self, plane: usize) -> Option<(u32, u32, Vec<P>)> {
         self.curr_frame
             .get_mut(plane)
             .and_then(|p| p.take())
@@ -17082,7 +17081,7 @@ impl PartitionWalker {
     /// [`LumaOverhang`] side store (lazily allocated / re-shaped to
     /// the current luma extents). Returns `None` when `(y, x)` is
     /// inside the main buffer or past the `LUMA_OH` headroom.
-    fn luma_overhang_slot(&mut self, y: u32, x: u32) -> Option<&mut i32> {
+    fn luma_overhang_slot(&mut self, y: u32, x: u32) -> Option<&mut P> {
         let (rows, cols) = {
             let b = self.curr_frame[0].as_ref()?;
             (b.rows, b.cols)
@@ -17108,11 +17107,11 @@ impl PartitionWalker {
             return;
         }
         let len = (rows as usize).saturating_mul(cols as usize);
-        let mut samples: Vec<i32> = Vec::new();
+        let mut samples: Vec<P> = Vec::new();
         if samples.try_reserve_exact(len).is_err() {
             return;
         }
-        samples.resize(len, 0);
+        samples.resize(len, P::default());
         self.curr_frame[plane] = Some(CurrFramePlane {
             rows,
             cols,
@@ -17222,7 +17221,7 @@ impl PartitionWalker {
 
         let read = |yy: u32, xx: u32| -> u16 {
             let idx = (yy as usize) * (buf_cols as usize) + (xx as usize);
-            buf.samples[idx] as u16
+            buf.samples[idx].to_i32() as u16
         };
         let Some(pred) = Self::intra_predict_block_samples(
             &read,
@@ -17270,12 +17269,12 @@ impl PartitionWalker {
                     continue;
                 }
                 let idx = (dst_y as usize) * (cols_buf as usize) + (dst_x as usize);
-                buf.samples[idx] = pred[(i as usize) * w + (j as usize)] as i32;
+                buf.samples[idx] = P::from_i32(pred[(i as usize) * w + (j as usize)] as i32);
             }
         }
         for (y, x, v) in overhang {
             if let Some(slot) = self.luma_overhang_slot(y, x) {
-                *slot = v;
+                *slot = P::from_i32(v);
             }
         }
     }
@@ -17685,7 +17684,7 @@ impl PartitionWalker {
         let overhang = self.luma_overhang.as_deref();
         let read_luma = |yy: u32, xx: u32| -> i64 {
             if yy < luma_rows && xx < luma_cols {
-                return luma.samples[(yy as usize) * (luma_cols as usize) + (xx as usize)] as i64;
+                return i64::from(luma.samples[(yy as usize) * (luma_cols as usize) + (xx as usize)].to_i32());
             }
             overhang.map_or(0, |oh| oh.get(yy, xx)) as i64
         };
@@ -17739,10 +17738,10 @@ impl PartitionWalker {
                     break;
                 }
                 let idx = (dst_y as usize) * (cols_buf as usize) + (dst_x as usize);
-                let dc = buf.samples[idx] as i64;
+                let dc = i64::from(buf.samples[idx].to_i32());
                 let l_ij = l[(i as usize) * w + (j as usize)];
                 let scaled = round2_signed((alpha as i64) * (l_ij - luma_avg), 6);
-                buf.samples[idx] = (dc + scaled).clamp(0, max_val) as i32;
+                buf.samples[idx] = P::from_i32((dc + scaled).clamp(0, max_val) as i32);
             }
         }
     }
@@ -17820,8 +17819,8 @@ impl PartitionWalker {
         if start_x <= cols_buf && w <= cols_buf - start_x
             && start_y <= rows_buf && h <= rows_buf - start_y
         {
-            let merge = |(dst, res): (&mut i32, &i64)| {
-                *dst = i64::from(*dst).saturating_add(*res).clamp(0, i64::from(max)) as i32;
+            let merge = |(dst, res): (&mut P, &i64)| {
+                *dst = P::from_i32(i64::from(dst.to_i32()).saturating_add(*res).clamp(0, i64::from(max)) as i32);
             };
             let width = w as usize;
             for (i, src) in residual.chunks_exact(width).enumerate() {
@@ -17858,7 +17857,7 @@ impl PartitionWalker {
                     continue;
                 }
                 let idx = (dst_y as usize) * (cols_buf as usize) + (dst_x as usize);
-                let cur = buf.samples[idx] as i64;
+                let cur = i64::from(buf.samples[idx].to_i32());
                 let res = residual[(i as usize) * (w as usize) + (j as usize)];
                 let sum = cur.saturating_add(res);
                 // `Clip1(x) = Clip3(0, (1 << BitDepth) - 1, x)`.
@@ -17869,13 +17868,13 @@ impl PartitionWalker {
                 } else {
                     sum as i32
                 };
-                buf.samples[idx] = clipped;
+                buf.samples[idx] = P::from_i32(clipped);
             }
         }
         for (y, x, res) in overhang {
             if let Some(slot) = self.luma_overhang_slot(y, x) {
-                let sum = (*slot as i64).saturating_add(res);
-                *slot = sum.clamp(0, max as i64) as i32;
+                let sum = i64::from(slot.to_i32()).saturating_add(res);
+                *slot = P::from_i32(sum.clamp(0, max as i64) as i32);
             }
         }
     }
@@ -17959,7 +17958,7 @@ impl PartitionWalker {
             if mirror.try_reserve_exact(cp.samples.len()).is_err() {
                 return Err(crate::Error::PartitionWalkOutOfRange);
             }
-            mirror.extend(cp.samples.iter().map(|&s| s as u16));
+            mirror.extend(cp.samples.iter().map(|&s| s.to_i32() as u16));
             mirrors.push((spec.plane, mirror, cols, rows));
         }
         // Build the per-plane reconstruction contexts over the mirrors.
@@ -18002,7 +18001,7 @@ impl PartitionWalker {
         for (p, mirror, _cols, _rows) in &mirrors {
             if let Some(cp) = self.curr_frame[*p as usize].as_mut() {
                 for (dst, &src) in cp.samples.iter_mut().zip(mirror.iter()) {
-                    *dst = src as i32;
+                    *dst = P::from_i32(src as i32);
                 }
             }
         }
@@ -18087,7 +18086,7 @@ impl PartitionWalker {
         if mirror.try_reserve_exact(cp.samples.len()).is_err() {
             return Err(crate::Error::PartitionWalkOutOfRange);
         }
-        mirror.extend(cp.samples.iter().map(|&s| s as u16));
+        mirror.extend(cp.samples.iter().map(|&s| s.to_i32() as u16));
 
         // Drive the single-ref translational reconstruction; the final
         // stitch overwrites the `w × h` footprint at `(x, y)`.
@@ -18115,7 +18114,7 @@ impl PartitionWalker {
         // walker's `i32` `curr_frame` buffer.
         if let Some(cp) = self.curr_frame[p].as_mut() {
             for (dst, &src) in cp.samples.iter_mut().zip(mirror.iter()) {
-                *dst = src as i32;
+                *dst = P::from_i32(src as i32);
             }
         }
         Ok(())
@@ -18191,7 +18190,7 @@ impl PartitionWalker {
         if mirror.try_reserve_exact(cp.samples.len()).is_err() {
             return Err(crate::Error::PartitionWalkOutOfRange);
         }
-        mirror.extend(cp.samples.iter().map(|&s| s as u16));
+        mirror.extend(cp.samples.iter().map(|&s| s.to_i32() as u16));
 
         // Drive the single-ref warped reconstruction; the final stitch
         // overwrites the `w × h` footprint at `(x, y)`.
@@ -18220,7 +18219,7 @@ impl PartitionWalker {
         // walker's `i32` `curr_frame` buffer.
         if let Some(cp) = self.curr_frame[p].as_mut() {
             for (dst, &src) in cp.samples.iter_mut().zip(mirror.iter()) {
-                *dst = src as i32;
+                *dst = P::from_i32(src as i32);
             }
         }
         Ok(())
@@ -18300,7 +18299,7 @@ impl PartitionWalker {
         if mirror.try_reserve_exact(cp.samples.len()).is_err() {
             return Err(crate::Error::PartitionWalkOutOfRange);
         }
-        mirror.extend(cp.samples.iter().map(|&s| s as u16));
+        mirror.extend(cp.samples.iter().map(|&s| s.to_i32() as u16));
 
         // Drive the single-ref OBMC reconstruction; the final stitch
         // overwrites the `w × h` footprint at `(x, y)`.
@@ -18329,7 +18328,7 @@ impl PartitionWalker {
         // walker's `i32` `curr_frame` buffer.
         if let Some(cp) = self.curr_frame[p].as_mut() {
             for (dst, &src) in cp.samples.iter_mut().zip(mirror.iter()) {
-                *dst = src as i32;
+                *dst = P::from_i32(src as i32);
             }
         }
         Ok(())
@@ -18425,7 +18424,7 @@ impl PartitionWalker {
         if mirror.try_reserve_exact(cp.samples.len()).is_err() {
             return Err(crate::Error::PartitionWalkOutOfRange);
         }
-        mirror.extend(cp.samples.iter().map(|&s| s as u16));
+        mirror.extend(cp.samples.iter().map(|&s| s.to_i32() as u16));
 
         // §7.11.3.12 DIFFWTD persistent luma-grid mask — for a single
         // (luma) bridge call the mask buffer is `w × h`. The driver fills
@@ -18471,7 +18470,7 @@ impl PartitionWalker {
         // walker's `i32` `curr_frame` buffer.
         if let Some(cp) = self.curr_frame[p].as_mut() {
             for (dst, &src) in cp.samples.iter_mut().zip(mirror.iter()) {
-                *dst = src as i32;
+                *dst = P::from_i32(src as i32);
             }
         }
         Ok(())
@@ -18609,7 +18608,7 @@ impl PartitionWalker {
             if mirror.try_reserve_exact(cp.samples.len()).is_err() {
                 return Err(crate::Error::PartitionWalkOutOfRange);
             }
-            mirror.extend(cp.samples.iter().map(|&s| s as u16));
+            mirror.extend(cp.samples.iter().map(|&s| s.to_i32() as u16));
 
             // The DIFFWTD arm receives the *shared* luma-grid mask; the
             // `plane == 0` call fills it, the chroma calls read it
@@ -18645,7 +18644,7 @@ impl PartitionWalker {
 
             if let Some(cp) = self.curr_frame[plane].as_mut() {
                 for (dst, &src) in cp.samples.iter_mut().zip(mirror.iter()) {
-                    *dst = src as i32;
+                    *dst = P::from_i32(src as i32);
                 }
             }
         }
@@ -18760,7 +18759,7 @@ impl PartitionWalker {
             if mirror.try_reserve_exact(cp.samples.len()).is_err() {
                 return Err(crate::Error::PartitionWalkOutOfRange);
             }
-            mirror.extend(cp.samples.iter().map(|&s| s as u16));
+            mirror.extend(cp.samples.iter().map(|&s| s.to_i32() as u16));
 
             crate::reconstruct_inter_block(
                 mode_info,
@@ -18784,7 +18783,7 @@ impl PartitionWalker {
 
             if let Some(cp) = self.curr_frame[plane].as_mut() {
                 for (dst, &src) in cp.samples.iter_mut().zip(mirror.iter()) {
-                    *dst = src as i32;
+                    *dst = P::from_i32(src as i32);
                 }
             }
         }
@@ -18969,7 +18968,7 @@ impl PartitionWalker {
                         let dst_row = (start_y as usize + i) * buf_cols + start_x as usize;
                         let src_row = i * w;
                         for j in 0..copy_w {
-                            cp.samples[dst_row + j] = pred[src_row + j] as i32;
+                            cp.samples[dst_row + j] = P::from_i32(pred[src_row + j] as i32);
                         }
                     }
                 }
@@ -19065,7 +19064,7 @@ impl PartitionWalker {
             let dst = (start_y as usize + i) * buf_cols + start_x as usize;
             let src = i * w;
             for j in 0..copy_w {
-                cp.samples[dst + j] = pred[src + j] as i32;
+                cp.samples[dst + j] = P::from_i32(pred[src + j] as i32);
             }
         }
         Ok(())
@@ -19300,7 +19299,7 @@ impl PartitionWalker {
             if mirror.try_reserve_exact(cp.samples.len()).is_err() {
                 return Err(crate::Error::PartitionWalkOutOfRange);
             }
-            mirror.extend(cp.samples.iter().map(|&s| s as u16));
+            mirror.extend(cp.samples.iter().map(|&s| s.to_i32() as u16));
             mirrors.push((spec.plane, mirror, buf_cols));
         }
 
@@ -19358,7 +19357,7 @@ impl PartitionWalker {
         for (p, mirror, _cols) in &mirrors {
             if let Some(cp) = self.curr_frame[*p as usize].as_mut() {
                 for (dst, &src) in cp.samples.iter_mut().zip(mirror.iter()) {
-                    *dst = src as i32;
+                    *dst = P::from_i32(src as i32);
                 }
             }
         }
@@ -19470,7 +19469,7 @@ impl PartitionWalker {
                 let start = y * r.stride + r.x0;
                 let src_row = &cp.samples[start..start + r.w];
                 let dst_row = &mut scratch[start..start + r.w];
-                crate::inter_pred::pack_prediction_samples(src_row, dst_row);
+                for (&value, dst) in src_row.iter().zip(dst_row) { *dst = value.to_i32() as u16; }
             }
         }
 
@@ -19581,7 +19580,7 @@ impl PartitionWalker {
                 let start = y * r.stride + r.x0;
                 let src_row = &scratch[start..start + r.w];
                 let dst_row = &mut cp.samples[start..start + r.w];
-                crate::inter_pred::unpack_prediction_samples(src_row, dst_row);
+                for (&value, dst) in src_row.iter().zip(dst_row) { *dst = P::from_i32(value as i32); }
             }
         }
         Ok(())
@@ -19731,7 +19730,7 @@ impl PartitionWalker {
                 for xx in x0..=x1 {
                     // `CurrFrame` samples are post-Clip1 (`0..=clip_max`),
                     // so the u16 narrowing is lossless.
-                    win.push(cp.samples[row + xx as usize] as u16);
+                    win.push(cp.samples[row + xx as usize].to_i32() as u16);
                 }
             }
             let mut pred = vec![0i32; w * h];
@@ -19778,7 +19777,7 @@ impl PartitionWalker {
                     if tx < 0 || tx > last_x {
                         continue;
                     }
-                    cp.samples[out_row + tx as usize] = pred[i * w + j].clamp(0, clip_max);
+                    cp.samples[out_row + tx as usize] = P::from_i32(pred[i * w + j].clamp(0, clip_max));
                 }
             }
         }
@@ -20737,8 +20736,8 @@ impl PartitionWalker {
         bit_depth: u8,
         subsampling_x: u8,
         subsampling_y: u8,
-        src_planes: &[crate::loop_filter::PlaneBuffer<'_>],
-        dst_planes: &mut [crate::loop_filter::PlaneBuffer<'_>],
+        src_planes: &[crate::loop_filter::PlaneBuffer<'_, P>],
+        dst_planes: &mut [crate::loop_filter::PlaneBuffer<'_, P>],
     ) {
         self.cdef_frame_from_idx_with_workers(cdef_params, num_planes, bit_depth, subsampling_x, subsampling_y, src_planes, dst_planes, 1);
     }
@@ -20751,8 +20750,8 @@ impl PartitionWalker {
         bit_depth: u8,
         subsampling_x: u8,
         subsampling_y: u8,
-        src_planes: &[crate::loop_filter::PlaneBuffer<'_>],
-        dst_planes: &mut [crate::loop_filter::PlaneBuffer<'_>],
+        src_planes: &[crate::loop_filter::PlaneBuffer<'_, P>],
+        dst_planes: &mut [crate::loop_filter::PlaneBuffer<'_, P>],
         workers: usize,
     ) {
         use crate::cdef::{cdef_frame_with_workers, CdefFrameContext};
@@ -20804,8 +20803,8 @@ impl PartitionWalker {
         bit_depth: u8,
         subsampling_x: u8,
         subsampling_y: u8,
-        src_planes: &[crate::loop_filter::PlaneBuffer<'_>],
-        dst_planes: &mut [crate::loop_filter::PlaneBuffer<'_>],
+        src_planes: &[crate::loop_filter::PlaneBuffer<'_, P>],
+        dst_planes: &mut [crate::loop_filter::PlaneBuffer<'_, P>],
     ) {
         use crate::cdef::{cdef_frame, CdefFrameContext};
         let mi_rows = self.mi_rows;
@@ -20897,7 +20896,7 @@ impl PartitionWalker {
         subsampling_y: u8,
         frame_width: u32,
         frame_height: u32,
-        planes: &mut [crate::loop_filter::PlaneBuffer<'_>],
+        planes: &mut [crate::loop_filter::PlaneBuffer<'_, P>],
     ) {
         self.loop_filter_rows_from_grid(
             lf_params,
@@ -20931,7 +20930,7 @@ impl PartitionWalker {
         subsampling_y: u8,
         frame_width: u32,
         frame_height: u32,
-        planes: &mut [crate::loop_filter::PlaneBuffer<'_>],
+        planes: &mut [crate::loop_filter::PlaneBuffer<'_, P>],
         mi_row_start: u32,
         mi_row_end: u32,
     ) {
@@ -20954,7 +20953,7 @@ impl PartitionWalker {
         subsampling_y: u8,
         frame_width: u32,
         frame_height: u32,
-        planes: &mut [crate::loop_filter::PlaneBuffer<'_>],
+        planes: &mut [crate::loop_filter::PlaneBuffer<'_, P>],
         mi_row_start: u32,
         mi_row_end: u32,
         workers: usize,
@@ -21136,9 +21135,9 @@ impl PartitionWalker {
         mi_cols: u32,
         frame_height: u32,
         upscaled_width: u32,
-        curr_planes: &[crate::loop_filter::PlaneBuffer<'_>],
-        cdef_planes: &[crate::loop_filter::PlaneBuffer<'_>],
-        lr_planes: &mut [crate::loop_filter::PlaneBuffer<'_>],
+        curr_planes: &[crate::loop_filter::PlaneBuffer<'_, P>],
+        cdef_planes: &[crate::loop_filter::PlaneBuffer<'_, P>],
+        lr_planes: &mut [crate::loop_filter::PlaneBuffer<'_, P>],
     ) {
         self.loop_restore_frame_from_grid_with_workers(
             lr_params, num_planes, bit_depth, subsampling_x, subsampling_y,
@@ -21158,9 +21157,9 @@ impl PartitionWalker {
         mi_cols: u32,
         frame_height: u32,
         upscaled_width: u32,
-        curr_planes: &[crate::loop_filter::PlaneBuffer<'_>],
-        cdef_planes: &[crate::loop_filter::PlaneBuffer<'_>],
-        lr_planes: &mut [crate::loop_filter::PlaneBuffer<'_>],
+        curr_planes: &[crate::loop_filter::PlaneBuffer<'_, P>],
+        cdef_planes: &[crate::loop_filter::PlaneBuffer<'_, P>],
+        lr_planes: &mut [crate::loop_filter::PlaneBuffer<'_, P>],
         workers: usize,
     ) {
         use crate::loop_restoration::{loop_restoration_frame_with_workers, LoopRestorationFrameContext};
@@ -36267,11 +36266,11 @@ pub struct FindMvStackResult {
 /// of any preceding decoded blocks committed into its `PaletteSizes` /
 /// `PaletteColors` grids.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn read_palette_entries_y(
+pub(crate) fn read_palette_entries_y<P: crate::loop_filter::Pixel>(
     decoder: &mut crate::symbol_decoder::SymbolDecoder<'_>,
     bit_depth: u8,
     palette_size_y: usize,
-    walker: &PartitionWalker,
+    walker: &PartitionWalker<P>,
     mi_row: u32,
     mi_col: u32,
 ) -> Result<[u16; PALETTE_COLORS], crate::Error> {
@@ -36376,11 +36375,11 @@ pub(crate) fn read_palette_entries_y(
 /// Returns a `(u, v)` tuple, each a `[u16; PALETTE_COLORS]` with the
 /// first `palette_size_uv` slots carrying the decoded entries.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn read_palette_entries_uv(
+pub(crate) fn read_palette_entries_uv<P: crate::loop_filter::Pixel>(
     decoder: &mut crate::symbol_decoder::SymbolDecoder<'_>,
     bit_depth: u8,
     palette_size_uv: usize,
-    walker: &PartitionWalker,
+    walker: &PartitionWalker<P>,
     mi_row: u32,
     mi_col: u32,
 ) -> Result<([u16; PALETTE_COLORS], [u16; PALETTE_COLORS]), crate::Error> {
@@ -40238,7 +40237,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
         // 4:2:0: luma plane 16×16, chroma plane 8×8.
         walker.ensure_curr_frame_plane(0, 16, 16);
         walker.ensure_curr_frame_plane(1, 8, 8);
@@ -40279,7 +40278,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
         walker.ensure_curr_frame_plane(0, 16, 16);
         walker.ensure_curr_frame_plane(1, 8, 8);
         // Luma gradient: sample(y, x) = 10 * y + x (in 0..255).
@@ -45580,7 +45579,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -45619,7 +45618,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Empty byte slice — any read would panic / underflow, so a
         // successful walk here proves no symbol was consumed.
@@ -45654,7 +45653,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 1];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 1, true).unwrap();
@@ -45695,7 +45694,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: mi_cols,
         };
-        let mut walker = PartitionWalker::new(mi_rows, mi_cols, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(mi_rows, mi_cols, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 1];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 1, true).unwrap();
@@ -45718,7 +45717,7 @@ mod tests {
         // walk. Re-issue with a fresh decoder and assert no PANIC, and
         // the walker emits a non-empty leaf list (the inner reads
         // against defaults will resolve to *some* partition).
-        let mut walker2 = PartitionWalker::new(mi_rows, mi_cols, geom).unwrap();
+        let mut walker2 = PartitionWalker::<i32>::new(mi_rows, mi_cols, geom).unwrap();
         let mut cdfs2 = TileCdfContext::new_from_defaults();
         let mut dec2 = SymbolDecoder::init_symbol(&[0u8; 16], 16, true).unwrap();
         walker2
@@ -45742,7 +45741,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Override partition_w16[ctx=0] to force PARTITION_NONE (idx 0).
         let rigged = force_partition_cdf_w(PARTITION_NONE, 10);
@@ -45770,7 +45769,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let rigged = force_partition_cdf_w(PARTITION_HORZ, 10);
         for ctx_idx in 0..PARTITION_CONTEXTS {
@@ -45810,7 +45809,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let rigged = force_partition_cdf_w(PARTITION_VERT, 10);
         for ctx_idx in 0..PARTITION_CONTEXTS {
@@ -45837,7 +45836,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let rigged = force_partition_cdf_w(PARTITION_HORZ_4, 10);
         for ctx_idx in 0..PARTITION_CONTEXTS {
@@ -45866,7 +45865,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let rigged = force_partition_cdf_w(PARTITION_VERT_4, 10);
         for ctx_idx in 0..PARTITION_CONTEXTS {
@@ -45895,7 +45894,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let rigged = force_partition_cdf_w(PARTITION_HORZ_A, 10);
         for ctx_idx in 0..PARTITION_CONTEXTS {
@@ -45928,7 +45927,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let rigged = force_partition_cdf_w(PARTITION_VERT_B, 10);
         for ctx_idx in 0..PARTITION_CONTEXTS {
@@ -45962,7 +45961,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Top-level BLOCK_16X16 → PARTITION_SPLIT.
         let rigged_w16 = force_partition_cdf_w(PARTITION_SPLIT, 10);
@@ -46007,7 +46006,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let rigged = force_partition_cdf_w(PARTITION_HORZ, 10);
         for ctx_idx in 0..PARTITION_CONTEXTS {
@@ -46054,7 +46053,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // 128 bytes of bitstream — plenty for the partition tree's
         // worst-case depth.
@@ -46096,7 +46095,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         // For any bsl, (r=0, c=0) -> AvailU=false, AvailL=false -> ctx=0.
         for bsl in 1..=5 {
             assert_eq!(walker.partition_ctx_for(0, 0, bsl), 0);
@@ -46115,7 +46114,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         // Fill row 0 with BLOCK_16X16 (mi_width_log2 = 2) so the
         // above-neighbour at (1, 0) is BLOCK_16X16.
         walker.decode_block(0, 0, BLOCK_16X16);
@@ -46159,7 +46158,7 @@ mod tests {
             mi_col_end: u32::MAX,
         };
         // mi_rows * mi_cols overflows usize on this platform.
-        assert!(PartitionWalker::new(u32::MAX, u32::MAX, geom).is_none());
+        assert!(PartitionWalker::<i32>::new(u32::MAX, u32::MAX, geom).is_none());
     }
 
     /// `take_blocks` drains and resets the internal buffer.
@@ -46171,7 +46170,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 1];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 1, true).unwrap();
@@ -46216,7 +46215,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -46243,7 +46242,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Force every Skip ctx row to select symbol 0.
         let rigged = force_binary_cdf(0);
@@ -46269,7 +46268,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let rigged = force_binary_cdf(1);
         for ctx_idx in 0..SKIP_CONTEXTS {
@@ -46309,7 +46308,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 1];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 1, true).unwrap();
@@ -46341,7 +46340,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         cdfs.skip[0] = force_binary_cdf(1);
         cdfs.skip[1] = force_binary_cdf(0);
@@ -46370,7 +46369,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // First fill the two BLOCK_8X8 neighbour cells with skip = 1
         // via the seg short-circuit (so no symbol bits are consumed
@@ -46413,7 +46412,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -46449,7 +46448,7 @@ mod tests {
             mi_col_start: 8,
             mi_col_end: 24,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Seed the global-grid neighbour at (7, 8) and (8, 7) so a
         // mistaken "use the global mi grid" implementation would
@@ -46487,7 +46486,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -46512,7 +46511,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 4];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 4, true).unwrap();
@@ -46541,7 +46540,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         assert_eq!(walker.skips().len(), 16 * 16);
         assert!(walker.skips().iter().all(|&v| v == 0));
     }
@@ -46572,7 +46571,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -46599,7 +46598,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -46622,7 +46621,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -46645,7 +46644,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -46667,7 +46666,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let rigged = force_skip_mode_cdf(0);
         for ctx_idx in 0..SKIP_MODE_CONTEXTS {
@@ -46693,7 +46692,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let rigged = force_skip_mode_cdf(1);
         for ctx_idx in 0..SKIP_MODE_CONTEXTS {
@@ -46733,7 +46732,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Only ctx 0 forces symbol 1; ctxs 1 and 2 force symbol 0.
         cdfs.skip_mode[0] = force_skip_mode_cdf(1);
@@ -46758,7 +46757,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Force a BLOCK_8X8 (bw4 = bh4 = 2) above-left at (0,0) to
         // stamp SkipModes[0..2][0..2] = 1.
@@ -46808,7 +46807,7 @@ mod tests {
             mi_col_start: 4,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Pre-stamp SkipModes[3][4] = SkipModes[4][3] = 1 to prove
         // the tile origin ignores them.
@@ -46836,7 +46835,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let rigged = force_skip_mode_cdf(1);
         for ctx_idx in 0..SKIP_MODE_CONTEXTS {
@@ -46867,7 +46866,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 4];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 4, true).unwrap();
@@ -46895,7 +46894,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         assert_eq!(walker.skip_modes().len(), 16 * 16);
         assert!(walker.skip_modes().iter().all(|&v| v == 0));
     }
@@ -46953,7 +46952,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         walker.set_current_q_index(120);
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 8];
@@ -46987,7 +46986,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 64,
         };
-        let mut walker = PartitionWalker::new(64, 64, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(64, 64, geom).unwrap();
         walker.set_current_q_index(64);
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 8];
@@ -47039,7 +47038,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         walker.set_current_q_index(100);
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
@@ -47073,7 +47072,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         walker.set_current_q_index(80);
         let mut cdfs = TileCdfContext::new_from_defaults();
         cdfs.delta_q = force_delta_q_cdf(0);
@@ -47095,7 +47094,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         walker.set_current_q_index(100);
         let mut cdfs = TileCdfContext::new_from_defaults();
         cdfs.delta_q = force_delta_q_cdf(1);
@@ -47120,7 +47119,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         walker.set_current_q_index(50);
         let mut cdfs = TileCdfContext::new_from_defaults();
         cdfs.delta_q = force_delta_q_cdf(1);
@@ -47171,7 +47170,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         walker.set_current_q_index(i32::MIN + 1);
         let mut cdfs = TileCdfContext::new_from_defaults();
         cdfs.delta_q = force_delta_q_cdf(1);
@@ -47193,7 +47192,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         walker.set_current_q_index(250);
         let mut cdfs = TileCdfContext::new_from_defaults();
         cdfs.delta_q = force_delta_q_cdf(2);
@@ -47219,7 +47218,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         walker.set_current_q_index(100);
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Force the symbol read to yield DELTA_Q_SMALL = 3.
@@ -47253,7 +47252,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         walker.set_current_q_index(200);
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Force the S() result to DELTA_Q_SMALL via a CDF that lands
@@ -47283,7 +47282,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         walker.set_current_q_index(100);
         let mut cdfs = TileCdfContext::new_from_defaults();
         cdfs.delta_q = force_delta_q_cdf(1);
@@ -47309,7 +47308,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         assert_eq!(walker.current_q_index(), 0);
     }
 
@@ -47324,7 +47323,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 4];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 4, true).unwrap();
@@ -47398,7 +47397,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -47433,7 +47432,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 64,
         };
-        let mut walker = PartitionWalker::new(64, 64, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(64, 64, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -47468,7 +47467,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -47503,7 +47502,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -47539,7 +47538,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         cdfs.delta_lf = force_delta_lf_cdf(1);
         let bytes = [0u8; 8];
@@ -47579,7 +47578,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         for i in 0..FRAME_LF_COUNT {
             cdfs.delta_lf_multi[i] = force_delta_lf_cdf(1);
@@ -47618,7 +47617,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         for i in 0..FRAME_LF_COUNT {
             cdfs.delta_lf_multi[i] = force_delta_lf_cdf(1);
@@ -47682,7 +47681,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         for i in 0..FRAME_LF_COUNT {
             cdfs.delta_lf_multi[i] = force_delta_lf_cdf(1);
@@ -47719,7 +47718,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         cdfs.delta_lf = force_delta_lf_cdf(0);
         let bytes = [0u8; 8];
@@ -47753,7 +47752,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         cdfs.delta_lf = force_delta_lf_cdf(1);
         let bytes = [0u8; 8];
@@ -47788,7 +47787,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         // Seed the accumulator near the upper bound. Single-LF only
         // writes slot 0 so we can pre-fill it.
         walker.current_delta_lf[0] = 60;
@@ -47831,7 +47830,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         walker.current_delta_lf[0] = i32::MIN + 1;
         let mut cdfs = TileCdfContext::new_from_defaults();
         cdfs.delta_lf = force_delta_lf_cdf(1);
@@ -47872,7 +47871,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         cdfs.delta_lf = force_delta_lf_cdf(DELTA_LF_SMALL as u8);
         let bytes = [0u8; 16];
@@ -47906,7 +47905,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         cdfs.delta_lf = force_delta_lf_cdf(1);
         let bytes = [0u8; 16];
@@ -47959,7 +47958,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         assert_eq!(walker.current_delta_lf(), &[0; FRAME_LF_COUNT]);
         // Apply a small +1 single-LF update.
         let mut cdfs = TileCdfContext::new_from_defaults();
@@ -48000,7 +47999,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         assert!(walker.cdef_idx().iter().all(|&v| v == -1));
     }
 
@@ -48014,7 +48013,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         // Pre-stamp a non-sentinel so clear is observable.
         walker.cdef_idx[5 * 32 + 7] = 4;
         walker.clear_cdef(5, 7, false);
@@ -48032,7 +48031,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 64,
         };
-        let mut walker = PartitionWalker::new(64, 64, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(64, 64, geom).unwrap();
         // Pre-stamp all four anchors so clear is observable.
         let stamps: [(u32, u32); 4] = [(0, 0), (0, 16), (16, 0), (16, 16)];
         for &(r, c) in &stamps {
@@ -48057,7 +48056,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 24,
         };
-        let mut walker = PartitionWalker::new(24, 24, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(24, 24, geom).unwrap();
         // Anchor at (16, 16) is in-grid; the (16, 32) / (32, 16) /
         // (32, 32) anchors are out-of-grid (24 < 32) and must be
         // silently skipped without panic.
@@ -48075,7 +48074,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
         let pos_before = dec.position();
@@ -48105,7 +48104,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
         let pos_before = dec.position();
@@ -48127,7 +48126,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
         let pos_before = dec.position();
@@ -48157,7 +48156,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
         let pos_before = dec.position();
@@ -48192,7 +48191,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let mut bytes = [0u8; 8];
         bytes[0] = 0b1100_0000;
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -48221,7 +48220,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let mut bytes = [0u8; 8];
         bytes[0] = 0b1100_0000;
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -48255,7 +48254,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
         let pos_before = dec.position();
@@ -48277,7 +48276,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let mut bytes = [0u8; 8];
         bytes[0] = 0b1110_0000;
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -48299,7 +48298,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let mut bytes = [0u8; 8];
         bytes[0] = 0b1000_0000;
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -48330,7 +48329,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let bytes = [0xA5u8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
         let v = walker
@@ -48363,7 +48362,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 24,
         };
-        let mut walker = PartitionWalker::new(24, 24, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(24, 24, geom).unwrap();
         let bytes = [0xA5u8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
         let v = walker
@@ -48389,7 +48388,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let mut bytes = [0u8; 8];
         bytes[0] = 0b1100_0000;
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -48415,7 +48414,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let mut bytes = [0u8; 8];
         bytes[0] = 0b1100_0000;
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -48440,7 +48439,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         // CurrFrame: a 64×64 luma ramp so a real filter would visibly
         // change it; the sentinel grid must leave it untouched.
         let (rows, cols) = (64u32, 64u32);
@@ -48477,7 +48476,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         // Stamp the (0,0) 64×64 anchor with cdef_idx = 0 and leave the
         // whole 8×8 block non-skip (skips already 0 from construction).
         walker.cdef_idx[0] = 0;
@@ -48566,7 +48565,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         walker.cdef_idx[0] = 0;
         // Mark every 4×4 cell of the top-left 8×8 anchor as skip.
         for &(r, c) in &[(0u32, 0u32), (1, 0), (0, 1), (1, 1)] {
@@ -48611,7 +48610,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         let (y_rows, y_cols) = (64u32, 64u32);
         let (c_rows, c_cols) = (32u32, 32u32); // 4:2:0
         let y_src: Vec<i32> = (0..(y_rows * y_cols)).map(|i| (i % 200) as i32).collect();
@@ -48672,7 +48671,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let bytes = [0u8; 4];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 4, true).unwrap();
         assert_eq!(
@@ -48702,7 +48701,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 4];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 4, true).unwrap();
@@ -48786,7 +48785,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         assert_eq!(walker.is_inters().len(), 16 * 16);
         assert!(walker.is_inters().iter().all(|&v| v == 0));
     }
@@ -48803,7 +48802,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -48842,7 +48841,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -48877,7 +48876,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -48909,7 +48908,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -48945,7 +48944,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -48981,7 +48980,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -49011,7 +49010,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let rigged = force_is_inter_cdf(0);
         for ctx_idx in 0..IS_INTER_CONTEXTS {
@@ -49047,7 +49046,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let rigged = force_is_inter_cdf(1);
         for ctx_idx in 0..IS_INTER_CONTEXTS {
@@ -49098,7 +49097,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // ctx 0 drives symbol 1. ctx 1, 2, 3 would drive symbol 0.
         cdfs.is_inter[0] = force_is_inter_cdf(1);
@@ -49139,7 +49138,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Force is_inter = 0 (intra) for the seed blocks via Arm 2.
         let seed_bytes = [0xFFu8; 8];
@@ -49217,7 +49216,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let seed_bytes = [0u8; 8];
         let mut seed_dec = SymbolDecoder::init_symbol(&seed_bytes, 8, true).unwrap();
@@ -49302,7 +49301,7 @@ mod tests {
             mi_col_start: 4,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let seed_bytes = [0u8; 8];
         let mut seed_dec = SymbolDecoder::init_symbol(&seed_bytes, 8, true).unwrap();
@@ -49371,7 +49370,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let rigged = force_is_inter_cdf(1);
         for ctx_idx in 0..IS_INTER_CONTEXTS {
@@ -49417,7 +49416,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 4];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 4, true).unwrap();
@@ -49480,7 +49479,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         for &cell in walker.segment_ids() {
             assert_eq!(cell, -1, "fresh-walker segment_ids[] = -1 sentinel");
         }
@@ -49498,7 +49497,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -49538,7 +49537,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Rig every ctx row to force symbol 5; the prior call is the
         // non-skip path so we need a CDF that delivers diff = 5.
@@ -49580,7 +49579,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Rig every ctx row to force symbol 3.
         let rigged = force_segment_id_cdf(3);
@@ -49620,7 +49619,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Rig every ctx row to force symbol 5 while the frame's
         // §5.9.14 derivation says LastActiveSegId = 4.
@@ -49645,7 +49644,7 @@ mod tests {
         // Boundary sanity: the same rigged symbol with
         // last_active_seg_id = 5 is conformant and decodes
         // (pred = 0 at the origin ⇒ neg_deinterleave(5, 0, 6) = 5).
-        let mut walker2 = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut walker2 = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         let mut cdfs2 = TileCdfContext::new_from_defaults();
         for ctx_idx in 0..SEGMENT_ID_CONTEXTS {
             cdfs2.segment_id[ctx_idx] = rigged;
@@ -49813,7 +49812,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         cdfs.segment_id[0] = force_segment_id_cdf(1);
         cdfs.segment_id[1] = force_segment_id_cdf(0);
@@ -49842,7 +49841,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Two BLOCK_8X8 skip stamps to seed sid = 4 into the
         // top-left 4x4 cells without touching the bitstream.
@@ -49899,7 +49898,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let rigged = force_segment_id_cdf(2);
         for ctx_idx in 0..SEGMENT_ID_CONTEXTS {
@@ -49934,7 +49933,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 4];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 4, true).unwrap();
@@ -49975,7 +49974,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -50026,7 +50025,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -50063,7 +50062,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -50113,7 +50112,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let rigged = force_segment_id_cdf(3);
         for ctx_idx in 0..SEGMENT_ID_CONTEXTS {
@@ -50158,7 +50157,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let rigged = force_segment_id_cdf(5);
         for ctx_idx in 0..SEGMENT_ID_CONTEXTS {
@@ -50197,7 +50196,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 4];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 4, true).unwrap();
@@ -50243,7 +50242,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 4];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 4, true).unwrap();
@@ -50344,7 +50343,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
 
         // Rig only the §5.11.11 skip cdf — every other inner method
@@ -50429,7 +50428,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
 
         // Rig the §5.11.9 segment_id cdf to force diff = 2 on every
@@ -50502,7 +50501,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
 
         // Rig §5.11.11 skip cdf to force symbol 1.
@@ -50566,7 +50565,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let lossless_array = [false; MAX_SEGMENTS];
 
@@ -50603,7 +50602,7 @@ mod tests {
             .unwrap();
         let pos_with_skip_bit = dec_ref.position();
 
-        let mut walker2 = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut walker2 = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
         let prefix = walker2
             .decode_intra_frame_mode_info_prefix(
@@ -50657,7 +50656,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
 
         let bytes = [0xFFu8; 8];
@@ -50708,7 +50707,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
 
         // Rig skip cdf to force 0 (so delta_q / delta_lf paths fire;
@@ -50785,7 +50784,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 4];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 4, true).unwrap();
@@ -50880,7 +50879,7 @@ mod tests {
         // `decode_skip_mode`. SkipModes[] grid stays at its
         // construction default.
         for &pre_skip in &[true, false] {
-            let mut walker_local = PartitionWalker::new(16, 16, geom).unwrap();
+            let mut walker_local = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
             let mut dec_local = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
             let prefix = walker_local
                 .decode_intra_frame_mode_info_prefix(
@@ -50928,7 +50927,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -50962,7 +50961,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         cdfs.intrabc = force_binary_cdf(0);
         let bytes = [0u8; 8];
@@ -50990,7 +50989,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         cdfs.intrabc = force_binary_cdf(1);
         let bytes = [0u8; 8];
@@ -51020,7 +51019,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 4];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 4, true).unwrap();
@@ -51055,7 +51054,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         cdfs.intrabc = force_binary_cdf(1);
 
@@ -51107,7 +51106,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         assert_eq!(walker.y_modes().len(), 16 * 16);
         for &v in walker.y_modes() {
             assert_eq!(v, 0, "fresh YModes[] = DC_PRED (== 0)");
@@ -51147,7 +51146,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -51183,7 +51182,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Force every (abovemode, leftmode) ctx pair to select symbol 0.
         let rigged = force_intra_frame_y_mode_cdf(0);
@@ -51226,7 +51225,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let rigged = force_intra_frame_y_mode_cdf(12);
         for a in 0..INTRA_MODE_CONTEXTS {
@@ -51274,7 +51273,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Rig only the [0][0] row to return symbol 7 (SMOOTH_PRED);
         // every other row keeps the §9.4 default. If the corner truly
@@ -51304,7 +51303,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // First call at (0,0), BLOCK_8X8 (2x2 footprint), force YMode=1.
         cdfs.intra_frame_y_mode[0][0] = force_intra_frame_y_mode_cdf(1);
@@ -51343,7 +51342,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // First block at (0,0), BLOCK_4X4, force YMode=4 (D203_PRED).
         cdfs.intra_frame_y_mode[0][0] = force_intra_frame_y_mode_cdf(4);
@@ -51381,7 +51380,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         cdfs.intrabc = force_binary_cdf(1);
         let bytes = [0u8; 8];
@@ -51418,7 +51417,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         assert_eq!(walker.above_seg_pred_context().len(), 16);
         assert_eq!(walker.left_seg_pred_context().len(), 16);
         for &slot in walker.above_seg_pred_context() {
@@ -51440,7 +51439,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -51497,7 +51496,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -51550,7 +51549,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -51605,7 +51604,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Poison the context arrays so the explicit `seg_id_predicted
         // = 0` write is observable (otherwise the initial-zero state
@@ -51667,7 +51666,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Rig every ctx row to force `seg_id_predicted = 1`.
         let rigged = force_binary_cdf(1);
@@ -51732,7 +51731,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Rig seg_id_predicted to `0`.
         let rigged_pred = force_binary_cdf(0);
@@ -51806,7 +51805,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let rigged = force_segment_id_cdf(2);
         for ctx_idx in 0..SEGMENT_ID_CONTEXTS {
@@ -51865,7 +51864,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 4];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 4, true).unwrap();
@@ -52189,7 +52188,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: mi_cols,
         };
-        let mut walker = PartitionWalker::new(mi_rows, mi_cols, geometry).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(mi_rows, mi_cols, geometry).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Hostile buffer the function must NOT touch on this arm.
         let buf = [0xFFu8; 4];
@@ -52245,7 +52244,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 32];
         (walker, cdfs, bytes)
@@ -52826,7 +52825,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let mut cache = [0u16; 2 * PALETTE_COLORS];
         for plane in 0..3 {
             // Even at non-superblock-top mi_row, an unwritten neighbour
@@ -52934,7 +52933,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let bytes = [0u8; 32];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 32, true).unwrap();
         let entries = read_palette_entries_y(&mut dec, 8, 2, &walker, 0, 0).unwrap();
@@ -52964,7 +52963,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let bytes = [0u8; 32];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 32, true).unwrap();
         let (u, v) = read_palette_entries_uv(&mut dec, 8, 2, &walker, 0, 0).unwrap();
@@ -52988,7 +52987,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         // Hand-stamp a luma palette into (0, 0): size 3, entries [10,
         // 50, 200]. We use the public read-only accessors to verify
         // and the private fields via tests-internal access.
@@ -53037,7 +53036,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let mi_cols = walker.mi_cols() as usize;
         // Stamp above palette at (mi_row=0, mi_col=1) so that when we
         // read at (mi_row=1, mi_col=1), the above neighbour is (0, 1)
@@ -53077,7 +53076,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         // (mi_row=0, mi_col=0) ⇒ flat index 0.
         let cell: usize = 0;
         walker.palette_sizes[cell] = 2;
@@ -53106,7 +53105,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 64,
         };
-        let walker = PartitionWalker::new(64, 64, geom).unwrap();
+        let walker = PartitionWalker::<i32>::new(64, 64, geom).unwrap();
         let mut cache = [0u16; 2 * PALETTE_COLORS];
         // mi_row = 16: 16 * MI_SIZE (= 4) = 64 → 64 % 64 = 0 → gated.
         let n_gated = walker.get_palette_cache(0, 16, 8, &mut cache);
@@ -53222,7 +53221,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -53451,7 +53450,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 32]; // hostile buffer the reader must not touch
         let mut dec = SymbolDecoder::init_symbol(&bytes, 32, true).unwrap();
@@ -53536,7 +53535,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 32];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 32, true).unwrap();
@@ -53603,7 +53602,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -53654,7 +53653,7 @@ mod tests {
         assert_eq!(walker.ref_frames()[1], -1);
 
         // Same outcome with globalmv-active path on a fresh walker.
-        let mut walker2 = PartitionWalker::new(4, 4, geom).unwrap();
+        let mut walker2 = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
         let mut cdfs2 = TileCdfContext::new_from_defaults();
         let mut dec2 = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
         let pos_before = dec2.position();
@@ -53716,7 +53715,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -53794,7 +53793,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -53872,7 +53871,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -53975,7 +53974,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -54139,7 +54138,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         // Pre-fill identity: every cell starts at [INTRA_FRAME, NONE].
         assert_eq!(walker.ref_frame_at(0, 0, 0), 0);
         assert_eq!(walker.ref_frame_at(0, 0, 1), -1);
@@ -54171,7 +54170,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 32]; // hostile — Arm 1 must not touch it.
         let mut dec = SymbolDecoder::init_symbol(&bytes, 32, true).unwrap();
@@ -54236,7 +54235,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -54308,7 +54307,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Rig §5.11.25 default arm: comp_mode = COMPOUND_REFERENCE (1).
         for row in cdfs.comp_mode.iter_mut() {
@@ -54389,7 +54388,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Rig new_mv ⇒ symbol 0 ⇒ YMode = NEWMV.
         for row in cdfs.new_mv.iter_mut() {
@@ -54464,7 +54463,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // new_mv ⇒ 1 (NEWMV not chosen).
         for row in cdfs.new_mv.iter_mut() {
@@ -54536,7 +54535,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         for row in cdfs.new_mv.iter_mut() {
             *row = [1 << 15, 1 << 15, 0];
@@ -54610,7 +54609,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // new_mv ⇒ 0 ⇒ NEWMV (triggers drl_mode loop guard).
         for row in cdfs.new_mv.iter_mut() {
@@ -54713,7 +54712,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -54773,7 +54772,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -54911,7 +54910,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 32];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 32, true).unwrap();
@@ -54989,7 +54988,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -55066,7 +55065,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Rig §5.11.23 Arm 4 single-pred for YMode = NEWMV.
         for row in cdfs.new_mv.iter_mut() {
@@ -55170,7 +55169,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // YMode = NEWMV ⇒ assign_mv invokes read_mv ⇒ read_mv_component.
         for row in cdfs.new_mv.iter_mut() {
@@ -55254,7 +55253,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Force every symbol read to 0.
         for row in cdfs.mv_sign.iter_mut() {
@@ -55305,7 +55304,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         for row in cdfs.mv_sign.iter_mut() {
             for slot in row.iter_mut() {
@@ -55362,7 +55361,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // mv_sign is the FIRST read; rig to symbol 1 via the
         // fresh-state-only `[0, 1<<15, 0]` pattern (matches
@@ -55415,7 +55414,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         for row in cdfs.mv_sign.iter_mut() {
             for slot in row.iter_mut() {
@@ -55467,7 +55466,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -55684,7 +55683,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         let (gm_type, gm_params) = identity_gm();
         let mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
         let res = walker
@@ -55727,7 +55726,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         let (gm_type, gm_params) = identity_gm();
         let mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
         let res = walker
@@ -55770,7 +55769,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let (gm_type, gm_params) = identity_gm();
         let mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
 
@@ -55882,7 +55881,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let (gm_type, gm_params) = identity_gm();
         let mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
         let r_opt_in = walker
@@ -56049,7 +56048,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let (gm_type, gm_params) = identity_gm();
         // mi_rows = mi_cols = 8 ⇒ h8 = w8 = 4. Stamp at (y8=1, x8=1).
         let mut mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
@@ -56095,7 +56094,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let (gm_type, gm_params) = identity_gm();
         let mut mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
         // Only ref 1 stamped; ref 7 stays sentinel.
@@ -56142,7 +56141,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         // Stamp a BLOCK_8X8 inter-block at (mi_row=2, mi_col=4) that
         // uses RefFrame[0] = LAST_FRAME = 1, with NEWMV mode and a
         // distinctive MV [32, 64].
@@ -56198,7 +56197,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         walker.stamp_inter_neighbour(
             4,
             2,
@@ -56245,7 +56244,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         walker.stamp_inter_neighbour(2, 4, BLOCK_8X8, [1, -1], MODE_NEARESTMV, [[10, 0], [0, 0]]);
         walker.stamp_inter_neighbour(4, 2, BLOCK_8X8, [1, -1], MODE_NEWMV, [[20, 0], [0, 0]]);
         let (gm_type, gm_params) = identity_gm();
@@ -56296,7 +56295,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         // Neighbour uses GOLDEN_FRAME (= 4); block wants LAST_FRAME
         // (= 1).
         walker.stamp_inter_neighbour(2, 4, BLOCK_8X8, [4, -1], MODE_NEWMV, [[42, 42], [0, 0]]);
@@ -56345,7 +56344,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         // Above and left both have the same RefFrame and MV.
         walker.stamp_inter_neighbour(2, 4, BLOCK_8X8, [1, -1], MODE_NEARESTMV, [[7, 7], [0, 0]]);
         walker.stamp_inter_neighbour(4, 2, BLOCK_8X8, [1, -1], MODE_NEARESTMV, [[7, 7], [0, 0]]);
@@ -56388,7 +56387,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         walker.stamp_inter_neighbour(2, 4, BLOCK_8X8, [1, -1], MODE_NEARESTMV, [[5, 5], [0, 0]]);
         let (gm_type, gm_params) = identity_gm();
         let mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
@@ -56487,7 +56486,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         walker.stamp_inter_neighbour(2, 4, BLOCK_8X8, [1, -1], MODE_NEARESTMV, [[1, 0], [0, 0]]);
         let (gm_type, gm_params) = identity_gm();
         let mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
@@ -56571,7 +56570,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         // Block at (2, 2) sees no inter neighbours.
         assert!(!walker.has_overlappable_candidates(2, 2, BLOCK_8X8));
         // Block at (0, 0) has no above / left neighbours at all.
@@ -56588,7 +56587,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         // Stamp an inter block at (0, 0..=1): RefFrames[0][1][0] =
         // LAST_FRAME > INTRA_FRAME, so the §7.10.3 above-walk for the
         // block at (2, 0) BLOCK_8X8 hits the (MiRow - 1 = 1, x4 | 1 =
@@ -56607,7 +56606,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         // Stamp an inter block at (0, 0..=1) — the block at (0, 2) of
         // BLOCK_8X8 sees (y4 | 1 = 1, MiCol - 1 = 1) as an inter
         // neighbour.
@@ -56626,7 +56625,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let ns = walker.find_warp_samples(2, 2, BLOCK_8X8, 1, [[0, 0], [0, 0]]);
         assert_eq!(ns, 0);
     }
@@ -56641,7 +56640,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         // Stamp a same-ref inter neighbour above the block at (2, 0).
         // BLOCK_8X8 = 2x2 cells; the above-walk fires
         // `add_sample(-1, 0)`. With MV = (1, 1) on neighbour and (1, 1)
@@ -56665,7 +56664,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         // Neighbour ref_frame[0] = 2 (LAST2_FRAME); query with
         // ref_frame_0 = 1 (LAST_FRAME) — `add_sample` short-circuits.
         walker.stamp_inter_neighbour(0, 0, BLOCK_8X8, [2, -1], MODE_NEARESTMV, [[0, 0], [0, 0]]);
@@ -56683,7 +56682,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -56721,7 +56720,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -56759,7 +56758,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -56799,7 +56798,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -56840,7 +56839,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -56880,7 +56879,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -56927,7 +56926,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         walker.stamp_inter_neighbour(1, 0, BLOCK_8X8, [1, -1], MODE_NEARESTMV, [[0, 0], [0, 0]]);
 
         let mut cdfs = TileCdfContext::new_from_defaults();
@@ -56988,7 +56987,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         walker.stamp_inter_neighbour(1, 0, BLOCK_8X8, [1, -1], MODE_NEARESTMV, [[0, 0], [0, 0]]);
 
         let mut cdfs = TileCdfContext::new_from_defaults();
@@ -57043,7 +57042,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         walker.stamp_inter_neighbour(1, 0, BLOCK_8X8, [1, -1], MODE_NEARESTMV, [[0, 0], [0, 0]]);
 
         let mut cdfs = TileCdfContext::new_from_defaults();
@@ -57096,7 +57095,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -57172,7 +57171,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -57204,7 +57203,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -57233,7 +57232,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -57262,7 +57261,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -57284,7 +57283,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -57306,7 +57305,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Force interintra S() ⇒ 0 for the ctx = Size_Group[BLOCK_16X16]
         // - 1 = 2 - 1 = 1 row.
@@ -57348,7 +57347,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let ctx = interintra_ctx(BLOCK_16X16).unwrap();
         // Force interintra S() ⇒ 1 ⇒ enter inner arm.
@@ -57403,7 +57402,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let ctx = interintra_ctx(BLOCK_16X16).unwrap();
         // Bias both rows toward 1; CDF adaptation will keep them there.
@@ -57485,7 +57484,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let walker = PartitionWalker::new(4, 4, geom).unwrap();
+        let walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -57509,7 +57508,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -57589,7 +57588,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let ctx = interintra_ctx(BLOCK_16X16).unwrap();
         let inter_intra_before = cdfs.inter_intra[ctx];
@@ -57849,7 +57848,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -57895,7 +57894,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -57939,7 +57938,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -57982,7 +57981,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -58025,7 +58024,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -58070,7 +58069,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // §8.3.2 `comp_group_idx_ctx` with all-zero neighbours = 0.
         let ctx = 0usize;
@@ -58128,7 +58127,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let ctx = 0usize;
         cdfs.comp_group_idx[ctx] = force_binary_cdf(1);
@@ -58194,7 +58193,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let ctx = 0usize;
         cdfs.comp_group_idx[ctx] = force_binary_cdf(1);
@@ -58251,7 +58250,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let ctx = 0usize;
         cdfs.comp_group_idx[ctx] = force_binary_cdf(1);
@@ -58287,7 +58286,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // §8.3.2 `compound_idx_ctx` with !dist_equal + closed neighbours = 0.
         let ctx = 0usize;
@@ -58333,7 +58332,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let ctx = 0usize;
         cdfs.compound_idx[ctx] = force_binary_cdf(0);
@@ -58377,7 +58376,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // dist_equal seeds ctx = 3 (no neighbour contributions on
         // closed-both arm).
@@ -58430,7 +58429,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let walker = PartitionWalker::new(4, 4, geom).unwrap();
+        let walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Force the comp_group_idx S() → 1 + the `compound_type` S()
         // path: with `mi_size = BLOCK_SIZES` (out of range),
@@ -58485,7 +58484,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -58585,7 +58584,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -58629,7 +58628,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -58672,7 +58671,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -58711,7 +58710,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -58775,7 +58774,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Rig every interp_filter CDF row to force symbol 1
         // (EIGHTTAP_SMOOTH).
@@ -58830,7 +58829,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         for row in cdfs.interp_filter.iter_mut() {
             *row = force_interp_filter_row(EIGHTTAP_SHARP);
@@ -58870,7 +58869,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -58940,7 +58939,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -59015,7 +59014,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 32];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 32, true).unwrap();
@@ -59122,7 +59121,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Force every txb_skip ctx row to select symbol 1 (all_zero = 1).
         for sz in 0..TX_SIZES {
@@ -59178,7 +59177,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Force txb_skip to symbol 0 (first read; sym-0 wins from value=32767).
         for sz in 0..TX_SIZES {
@@ -59244,7 +59243,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Force txb_skip to symbol 0 across all rows.
         for sz in 0..TX_SIZES {
@@ -59292,7 +59291,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -59429,7 +59428,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 64,
         };
-        let mut walker = PartitionWalker::new(64, 64, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(64, 64, geom).unwrap();
         for tx in &[TX_4X4, TX_8X8, TX_16X16, TX_32X32, TX_64X64] {
             let mut cdfs = TileCdfContext::new_from_defaults();
             // Force txb_skip to symbol 1 (gate closed — quickest path).
@@ -59480,7 +59479,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -59605,7 +59604,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -59667,7 +59666,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         // §5.11.3 reset first (the tile walk runs this before the SB).
         walker.clear_block_decoded_flags(0, 0, 16, 3, 0, 0);
         let mut cdfs = TileCdfContext::new_from_defaults();
@@ -59727,7 +59726,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         walker.clear_block_decoded_flags(0, 0, 16, 3, 0, 0);
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 16];
@@ -59776,7 +59775,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Force §5.11.39 `all_zero` S() to return 1 for every TU.
         for sz in 0..TX_SIZES {
@@ -59834,7 +59833,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -59878,7 +59877,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -59918,7 +59917,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -59969,7 +59968,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 8];
 
@@ -60119,7 +60118,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -60173,7 +60172,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Force §5.11.39 `all_zero` S() to return 0 for every TU
         // (cascade fires; eob >= 1).
@@ -60540,7 +60539,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -60570,7 +60569,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -60597,7 +60596,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Force the §8.3.2 intra_tx_type CDF to return symbol 0
         // (= IDTX after inversion) deterministically.
@@ -60672,7 +60671,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         walker.stamp_tx_type(2, 3, 2, 2, ADST_ADST as u8);
         for r in 0i32..8 {
             for c in 0i32..8 {
@@ -60695,7 +60694,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let walker = PartitionWalker::new(4, 4, geom).unwrap();
+        let walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
         assert_eq!(walker.tx_type_at(-1, 0), DCT_DCT as u8);
         assert_eq!(walker.tx_type_at(0, -1), DCT_DCT as u8);
         assert_eq!(walker.tx_type_at(4, 0), DCT_DCT as u8);
@@ -60733,7 +60732,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Force `all_zero == 1` for every TU at TX_4X4.
         for ctx in 0..TXB_SKIP_CONTEXTS {
@@ -60821,7 +60820,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let walker = PartitionWalker::new(4, 4, geom).unwrap();
+        let walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
         for plane in 0..3 {
             assert!(walker.curr_frame(plane).is_none());
             assert!(walker.curr_frame_dims(plane).is_none());
@@ -60843,7 +60842,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
         // Luma: 4 mi rows × 4 mi cols × MI_SIZE = 16 × 16.
         walker.ensure_curr_frame_plane(0, 16, 16);
         assert_eq!(walker.curr_frame_dims(0), Some((16, 16)));
@@ -60865,7 +60864,7 @@ mod tests {
             let max = (1i32 << bit_depth) - 1;
             let base: Vec<i32> = (0..256).map(|i| (i * 13) % (max + 1)).collect();
             for tx_type in [DCT_DCT, FLIPADST_DCT, H_FLIPADST, FLIPADST_FLIPADST] {
-                let mut walker = PartitionWalker::new(4, 4, TileGeometry {
+                let mut walker = PartitionWalker::<i32>::new(4, 4, TileGeometry {
                     mi_row_start: 0, mi_row_end: 4, mi_col_start: 0, mi_col_end: 4,
                 }).unwrap();
                 walker.ensure_curr_frame_plane(0, 16, 16);
@@ -60901,7 +60900,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
         // 4×4 residual with i*4 + j+1 in each cell (1..=16).
         let residual: Vec<i64> = (0..16).map(|k| (k + 1) as i64).collect();
         walker.curr_frame_step3_merge(
@@ -60950,7 +60949,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
         walker.predict_intra_into_curr_frame(
             /* plane */ 0, /* start_x */ 0, /* start_y */ 0, TX_4X4, DC_PRED,
             /* angle_delta */ 0, /* bit_depth */ 8, /* sub_x */ 0,
@@ -60979,7 +60978,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
         // Allocate the plane + seed row 3 (the row above start_y = 4)
         // with samples 10, 20, 30, 40 in cols 0..4.
         walker.ensure_curr_frame_plane(0, 16, 16);
@@ -61017,7 +61016,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
         walker.ensure_curr_frame_plane(0, 16, 16);
         {
             let buf = walker.curr_frame[0].as_mut().unwrap();
@@ -61083,7 +61082,7 @@ mod tests {
         ];
         for (mode, delta, fim) in cases {
             for (tx_sz, sx, sy) in [(TX_8X8, 8u32, 8u32), (TX_16X8, 8, 16), (TX_4X16, 12, 4)] {
-                let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+                let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
                 walker.ensure_curr_frame_plane(0, 32, 32);
                 {
                     let buf = walker.curr_frame[0].as_mut().unwrap();
@@ -61100,10 +61099,8 @@ mod tests {
 
                 let mut out = vec![0u16; 32 * 32];
                 let neigh = |y: u32, x: u32| -> u16 { fill(y as usize, x as usize) };
-                PartitionWalker::predict_intra_into_u16_plane(
-                    &neigh, &mut out, 32, 31, 31, sx, sy, tx_sz, mode, delta, 8, true, true, true,
-                    false, true, 1, fim,
-                );
+                PartitionWalker::<i32>::predict_intra_into_u16_plane(&neigh, &mut out, 32, 31, 31, sx, sy, tx_sz, mode, delta, 8, true, true, true,
+                false, true, 1, fim,);
                 let (w, h) = (TX_WIDTH[tx_sz], TX_HEIGHT[tx_sz]);
                 for i in 0..h {
                     for j in 0..w {
@@ -61132,7 +61129,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
         walker.predict_intra_into_curr_frame(
             0, 0, 0, TX_4X4, DC_PRED, 0, 8, 0, 0, false, false, false, false, false, 0, None,
         );
@@ -61158,7 +61155,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
         walker.predict_intra_into_curr_frame(
             0,
             0,
@@ -61195,7 +61192,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
         // First TU: DC_PRED (128) + residual +50 = 178 across the 4×4.
         walker.predict_intra_into_curr_frame(
             0, 0, 0, TX_4X4, DC_PRED, 0, 8, 0, 0, false, false, false, false, false, 0, None,
@@ -61233,7 +61230,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
         // Luma block at (MiRow = 1, MiCol = 1). Above neighbour is
         // (0, 1), left neighbour is (1, 0). Both default to DC_PRED
         // (= 0), so get_filter_type is 0 even with avail flags set.
@@ -61275,7 +61272,7 @@ mod tests {
         // `c = MiCol = 2`; `subX && !(MiCol & 1)` is true (MiCol 2 even)
         // so `c++` ⇒ (1, 3). Stamp SMOOTH_V_PRED there and assert the
         // chroma filterType flips to 1.
-        let mut walker2 = PartitionWalker::new(4, 4, geom).unwrap();
+        let mut walker2 = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
         // No smooth UV neighbour yet.
         assert_eq!(
             walker2.get_filter_type(1, 2, 2, true, true, 1, 1),
@@ -61329,7 +61326,7 @@ mod tests {
                 buf.samples[3 * 32 + j] = if j % 2 == 0 { 0 } else { 255 };
             }
         };
-        let mut walker_off = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut walker_off = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         seed_above(&mut walker_off);
         walker_off.predict_intra_into_curr_frame(
             0, 0, 4, TX_16X16, D45_PRED, 0, 8, 0, 0, /* have_above */ true,
@@ -61338,7 +61335,7 @@ mod tests {
             /* filter_type */ 0, /* filter_intra_mode */ None,
         );
 
-        let mut walker_on = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut walker_on = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         seed_above(&mut walker_on);
         walker_on.predict_intra_into_curr_frame(
             0, 0, 4, TX_16X16, D45_PRED, 0, 8, 0, 0, /* have_above */ true,
@@ -61401,7 +61398,7 @@ mod tests {
                 buf.samples[3 * 16 + j] = (30 * j) as i32;
             }
         };
-        let mut walker_off = PartitionWalker::new(4, 4, geom).unwrap();
+        let mut walker_off = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
         seed_above(&mut walker_off);
         walker_off.predict_intra_into_curr_frame(
             0, 0, 4, TX_4X4, D67_PRED, 0, 8, 0, 0, /* have_above */ true,
@@ -61410,7 +61407,7 @@ mod tests {
             /* filter_type */ 0, /* filter_intra_mode */ None,
         );
 
-        let mut walker_on = PartitionWalker::new(4, 4, geom).unwrap();
+        let mut walker_on = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
         seed_above(&mut walker_on);
         walker_on.predict_intra_into_curr_frame(
             0, 0, 4, TX_4X4, D67_PRED, 0, 8, 0, 0, /* have_above */ true,
@@ -61453,7 +61450,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
         // Allocate then pre-fill the (0, 0) cell with 200 — simulating
         // an upstream §7.11.x prediction sample already in the buffer.
         walker.ensure_curr_frame_plane(0, 16, 16);
@@ -61482,7 +61479,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
         walker.ensure_curr_frame_plane(0, 16, 16);
         walker.curr_frame[0].as_mut().unwrap().samples[0] = 800;
         let mut residual = vec![0i64; 16];
@@ -61506,7 +61503,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
         // Residual: row i carries value 10 + i (constant across the
         // row). Source rows 0..3 → values 10, 11, 12, 13.
         let mut residual = vec![0i64; 16];
@@ -61544,7 +61541,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
         // Residual: col j carries value 10 + j (constant down the
         // col). Source cols 0..3 → values 10, 11, 12, 13.
         let mut residual = vec![0i64; 16];
@@ -61582,7 +61579,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
         let residual: Vec<i64> = (0..16).map(|k| k as i64).collect();
         walker.curr_frame_step3_merge(0, 0, 0, TX_4X4, FLIPADST_FLIPADST, &residual, 8, 0, 0);
         let buf = walker.curr_frame(0).unwrap();
@@ -61613,7 +61610,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
         let residual = vec![7i64; 16]; // 4×4, all 7s.
         walker.curr_frame_step3_merge(
             0, /* start_x = */ 8, /* start_y = */ 4, TX_4X4, DCT_DCT, &residual, 8, 0, 0,
@@ -61643,7 +61640,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
         let residual = vec![3i64; 16];
         walker.curr_frame_step3_merge(0, 0, 0, TX_4X4, DCT_DCT, &residual, 8, 0, 0);
         walker.curr_frame_step3_merge(0, 0, 0, TX_4X4, DCT_DCT, &residual, 8, 0, 0);
@@ -61668,7 +61665,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
         let residual = vec![5i64; 16];
         walker.curr_frame_step3_merge(
             0, /* start_x = */ 14, /* start_y = */ 0, TX_4X4, DCT_DCT, &residual, 8, 0, 0,
@@ -61692,7 +61689,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
         let residual = vec![1i64; 16];
         walker.curr_frame_step3_merge(3, 0, 0, TX_4X4, DCT_DCT, &residual, 8, 0, 0);
         for plane in 0..3 {
@@ -61710,7 +61707,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
         // TX_4X4 expects w*h = 16; pass 8.
         let residual = vec![1i64; 8];
         walker.curr_frame_step3_merge(0, 0, 0, TX_4X4, DCT_DCT, &residual, 8, 0, 0);
@@ -61728,7 +61725,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
         let residual = vec![2i64; 16];
         walker.curr_frame_step3_merge(
             /* plane = */ 1, 0, 0, TX_4X4, DCT_DCT, &residual, 8, /* sub_x = */ 1,
@@ -61764,7 +61761,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Force §5.11.39 `all_zero` S() = 1 ⇒ eob = 0 per TU.
         for sz in 0..TX_SIZES {
@@ -61833,7 +61830,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -62310,7 +62307,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: mi_cols,
         };
-        PartitionWalker::new(mi_rows, mi_cols, geom).unwrap()
+        PartitionWalker::<i32>::new(mi_rows, mi_cols, geom).unwrap()
     }
 
     /// §8.3.2 luma `all_zero` ladder (av1-spec p.370-371) — every arm,
@@ -62583,7 +62580,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 2,
         };
-        let mut walker = PartitionWalker::new(2, 2, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(2, 2, geom).unwrap();
         // Seed CurrFrame[0] with the intra half (what the §7.12.3
         // step-3 merge writes before the blend). Buffer is i32.
         walker.ensure_curr_frame_plane(0, curr_h as u32, curr_w as u32);
@@ -62687,7 +62684,7 @@ mod tests {
         };
 
         // Empty plane_refs.
-        let mut w = PartitionWalker::new(2, 2, geom).unwrap();
+        let mut w = PartitionWalker::<i32>::new(2, 2, geom).unwrap();
         w.ensure_curr_frame_plane(0, 8, 8);
         assert!(matches!(
             w.reconstruct_inter_intra_into_curr_frame(&readout, &leaf, &ref_frame_idx, 8, &[]),
@@ -62716,7 +62713,7 @@ mod tests {
 
         // Plane with no tracked buffer (intra half not written): a
         // fresh walker has no allocated curr_frame[0].
-        let mut w2 = PartitionWalker::new(2, 2, geom).unwrap();
+        let mut w2 = PartitionWalker::<i32>::new(2, 2, geom).unwrap();
         let plane_refs = [PlaneRefSpec {
             plane: 0,
             subsampling_x: 0,
@@ -62815,7 +62812,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 2,
         };
-        let mut walker = PartitionWalker::new(2, 2, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(2, 2, geom).unwrap();
         // Fresh walker: curr_frame[0] is unallocated. The single-ref
         // bridge must allocate it (no intra-half prerequisite).
         assert!(walker.curr_frame(0).is_none());
@@ -62941,7 +62938,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 2,
         };
-        let mut walker = PartitionWalker::new(2, 2, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(2, 2, geom).unwrap();
         // Stamp the §5.11 grids as the inter-syntax cascade would for a
         // single-ref translational BLOCK_8X8 leaf at (0, 0).
         walker.stamp_encoder_block_syntax(&EncoderBlockSyntaxStamp {
@@ -63031,7 +63028,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         // A committed inter neighbour ABOVE the trial rect (row 0-1)
         // so find_mv_stack has a real §7.10.2.2 row-scan candidate.
         walker.stamp_encoder_block_syntax(&EncoderBlockSyntaxStamp {
@@ -63312,7 +63309,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::new(2, 4, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(2, 4, geom).unwrap();
         for (mi_col, mv) in [(0u32, mv_a), (2u32, mv_b)] {
             walker.stamp_encoder_block_syntax(&EncoderBlockSyntaxStamp {
                 mi_row: 0,
@@ -63427,7 +63424,7 @@ mod tests {
         ];
 
         let build = |force_simple: bool| -> Vec<u16> {
-            let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+            let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
             for &(mr, mc, mv, mm) in &leaves {
                 let mode = if force_simple { MOTION_MODE_SIMPLE } else { mm };
                 walker.stamp_encoder_block_syntax(&EncoderBlockSyntaxStamp {
@@ -63540,14 +63537,14 @@ mod tests {
         };
 
         // Empty plane_refs.
-        let mut w0 = PartitionWalker::new(2, 2, geom).unwrap();
+        let mut w0 = PartitionWalker::<i32>::new(2, 2, geom).unwrap();
         assert!(matches!(
             w0.reconstruct_inter_frame_into_curr_frame(&ref_frame_idx, 8, &[]),
             Err(crate::Error::PartitionWalkOutOfRange)
         ));
 
         // Out-of-range plane.
-        let mut w1 = PartitionWalker::new(2, 2, geom).unwrap();
+        let mut w1 = PartitionWalker::<i32>::new(2, 2, geom).unwrap();
         let bad_plane = PlaneRefSpec {
             plane: 3,
             subsampling_x: 0,
@@ -63563,7 +63560,7 @@ mod tests {
 
         // Inter leaf with INTRA_FRAME RefFrame[0] — rejected by the
         // downstream §7.11.3.1 driver.
-        let mut w2 = PartitionWalker::new(2, 2, geom).unwrap();
+        let mut w2 = PartitionWalker::<i32>::new(2, 2, geom).unwrap();
         w2.stamp_encoder_block_syntax(&EncoderBlockSyntaxStamp {
             mi_row: 0,
             mi_col: 0,
@@ -63645,7 +63642,7 @@ mod tests {
         };
 
         // Out-of-range plane.
-        let mut w = PartitionWalker::new(2, 2, geom).unwrap();
+        let mut w = PartitionWalker::<i32>::new(2, 2, geom).unwrap();
         let bad_plane = PlaneRefSpec {
             plane: 3,
             subsampling_x: 0,
@@ -63680,7 +63677,7 @@ mod tests {
         };
 
         // Negative origin (rejected by reconstruct_inter_block).
-        let mut w2 = PartitionWalker::new(2, 2, geom).unwrap();
+        let mut w2 = PartitionWalker::<i32>::new(2, 2, geom).unwrap();
         assert!(matches!(
             w2.reconstruct_inter_block_into_curr_frame(
                 good_mode,
@@ -63698,7 +63695,7 @@ mod tests {
         ));
 
         // INTRA_FRAME RefFrame[0] (0): not an inter reference.
-        let mut w3 = PartitionWalker::new(2, 2, geom).unwrap();
+        let mut w3 = PartitionWalker::<i32>::new(2, 2, geom).unwrap();
         let intra_mode = InterModeInfo {
             ref_frame: 0,
             mv: [0, 0],
@@ -63832,7 +63829,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 2,
         };
-        let mut walker = PartitionWalker::new(2, 2, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(2, 2, geom).unwrap();
         assert!(walker.curr_frame(0).is_none());
         let ref_spec = PlaneRefSpec {
             plane: 0,
@@ -63918,7 +63915,7 @@ mod tests {
         };
 
         // Out-of-range plane.
-        let mut w = PartitionWalker::new(2, 2, geom).unwrap();
+        let mut w = PartitionWalker::<i32>::new(2, 2, geom).unwrap();
         let bad_plane = PlaneRefSpec {
             plane: 3,
             subsampling_x: 0,
@@ -63945,7 +63942,7 @@ mod tests {
         ));
 
         // Negative origin.
-        let mut w2 = PartitionWalker::new(2, 2, geom).unwrap();
+        let mut w2 = PartitionWalker::<i32>::new(2, 2, geom).unwrap();
         let good_plane = PlaneRefSpec {
             plane: 0,
             subsampling_x: 0,
@@ -64118,7 +64115,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
         assert!(walker.curr_frame(0).is_none());
         let ref_spec = PlaneRefSpec {
             plane: 0,
@@ -64212,7 +64209,7 @@ mod tests {
         };
 
         // Out-of-range plane.
-        let mut w = PartitionWalker::new(2, 2, geom).unwrap();
+        let mut w = PartitionWalker::<i32>::new(2, 2, geom).unwrap();
         let bad_plane = PlaneRefSpec {
             plane: 3,
             subsampling_x: 0,
@@ -64239,7 +64236,7 @@ mod tests {
         ));
 
         // Negative origin.
-        let mut w2 = PartitionWalker::new(2, 2, geom).unwrap();
+        let mut w2 = PartitionWalker::<i32>::new(2, 2, geom).unwrap();
         let good_plane = PlaneRefSpec {
             plane: 0,
             subsampling_x: 0,
@@ -64396,7 +64393,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
         let ref_spec = PlaneRefSpec {
             plane: 0,
             subsampling_x: 0,
@@ -64550,7 +64547,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
         let ref_spec = PlaneRefSpec {
             plane: 1,
             subsampling_x: 1,
@@ -64692,7 +64689,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 2,
         };
-        let mut walker = PartitionWalker::new(2, 2, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(2, 2, geom).unwrap();
         // Fresh walker: curr_frame[0] is unallocated. The compound bridge
         // must allocate it (no intra-half prerequisite).
         assert!(walker.curr_frame(0).is_none());
@@ -64782,7 +64779,7 @@ mod tests {
         };
 
         // Out-of-range plane.
-        let mut w = PartitionWalker::new(2, 2, geom).unwrap();
+        let mut w = PartitionWalker::<i32>::new(2, 2, geom).unwrap();
         let bad_plane = PlaneRefSpec {
             plane: 3,
             subsampling_x: 0,
@@ -64818,7 +64815,7 @@ mod tests {
         };
 
         // Negative origin (rejected by reconstruct_inter_block_compound).
-        let mut w2 = PartitionWalker::new(2, 2, geom).unwrap();
+        let mut w2 = PartitionWalker::<i32>::new(2, 2, geom).unwrap();
         assert!(matches!(
             w2.reconstruct_inter_block_compound_into_curr_frame(
                 good_mode,
@@ -64837,7 +64834,7 @@ mod tests {
         ));
 
         // INTRA_FRAME RefFrame[1] (0): not a compound inter reference.
-        let mut w3 = PartitionWalker::new(2, 2, geom).unwrap();
+        let mut w3 = PartitionWalker::<i32>::new(2, 2, geom).unwrap();
         let intra_ref1 = CompoundInterModeInfo {
             ref_frame_0: last,
             ref_frame_1: 0,
@@ -65043,7 +65040,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 2,
         };
-        let mut walker = PartitionWalker::new(2, 2, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(2, 2, geom).unwrap();
         assert!(walker.curr_frame(0).is_none());
 
         let spec_y = PlaneRefSpec {
@@ -65214,7 +65211,7 @@ mod tests {
         ];
 
         // Invalid num_planes (2).
-        let mut w = PartitionWalker::new(2, 2, geom).unwrap();
+        let mut w = PartitionWalker::<i32>::new(2, 2, geom).unwrap();
         assert!(matches!(
             w.reconstruct_inter_block_compound_multiplane_into_curr_frame(
                 good_mode,
@@ -65233,7 +65230,7 @@ mod tests {
         ));
 
         // Out-of-range mi_size.
-        let mut w2 = PartitionWalker::new(2, 2, geom).unwrap();
+        let mut w2 = PartitionWalker::<i32>::new(2, 2, geom).unwrap();
         assert!(matches!(
             w2.reconstruct_inter_block_compound_multiplane_into_curr_frame(
                 good_mode,
@@ -65252,7 +65249,7 @@ mod tests {
         ));
 
         // plane_specs too short for num_planes (1 spec, num_planes 3).
-        let mut w3 = PartitionWalker::new(2, 2, geom).unwrap();
+        let mut w3 = PartitionWalker::<i32>::new(2, 2, geom).unwrap();
         let one_spec = [PlaneRefSpec { plane: 0, ..spec }];
         assert!(matches!(
             w3.reconstruct_inter_block_compound_multiplane_into_curr_frame(
@@ -65272,7 +65269,7 @@ mod tests {
         ));
 
         // INTRA_FRAME RefFrame[1] (driver rejects on the first plane).
-        let mut w4 = PartitionWalker::new(2, 2, geom).unwrap();
+        let mut w4 = PartitionWalker::<i32>::new(2, 2, geom).unwrap();
         let intra_ref1 = CompoundInterModeInfo {
             ref_frame_1: 0,
             ..good_mode
@@ -65424,7 +65421,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 2,
         };
-        let mut walker = PartitionWalker::new(2, 2, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(2, 2, geom).unwrap();
         assert!(walker.curr_frame(0).is_none());
 
         let spec_y = PlaneRefSpec {
@@ -65491,7 +65488,7 @@ mod tests {
         assert_eq!(got_cr, ocr, "Cr plane must match the per-block oracle");
 
         // num_planes == 1 reconstructs only luma; chroma untouched.
-        let mut wluma = PartitionWalker::new(2, 2, geom).unwrap();
+        let mut wluma = PartitionWalker::<i32>::new(2, 2, geom).unwrap();
         wluma
             .reconstruct_inter_block_multiplane_into_curr_frame(
                 mode_info,
@@ -65574,7 +65571,7 @@ mod tests {
         ];
 
         // Invalid num_planes (2).
-        let mut w = PartitionWalker::new(2, 2, geom).unwrap();
+        let mut w = PartitionWalker::<i32>::new(2, 2, geom).unwrap();
         assert!(matches!(
             w.reconstruct_inter_block_multiplane_into_curr_frame(
                 good_mode,
@@ -65592,7 +65589,7 @@ mod tests {
         ));
 
         // Out-of-range mi_size.
-        let mut w2 = PartitionWalker::new(2, 2, geom).unwrap();
+        let mut w2 = PartitionWalker::<i32>::new(2, 2, geom).unwrap();
         assert!(matches!(
             w2.reconstruct_inter_block_multiplane_into_curr_frame(
                 good_mode,
@@ -65610,7 +65607,7 @@ mod tests {
         ));
 
         // plane_specs too short for num_planes (1 spec, num_planes 3).
-        let mut w3 = PartitionWalker::new(2, 2, geom).unwrap();
+        let mut w3 = PartitionWalker::<i32>::new(2, 2, geom).unwrap();
         let one_spec = [PlaneRefSpec { plane: 0, ..spec }];
         assert!(matches!(
             w3.reconstruct_inter_block_multiplane_into_curr_frame(
@@ -65629,7 +65626,7 @@ mod tests {
         ));
 
         // INTRA_FRAME RefFrame[0] (driver rejects on the first plane).
-        let mut w4 = PartitionWalker::new(2, 2, geom).unwrap();
+        let mut w4 = PartitionWalker::<i32>::new(2, 2, geom).unwrap();
         let intra_ref0 = InterModeInfo {
             ref_frame: 0,
             ..good_mode
@@ -65790,7 +65787,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
         // §5.11.46 palette stamped at the block anchor (0, 0): 3 colours.
         walker
             .stamp_palette_for_test(0, 0, 0, &[11, 22, 33])
@@ -65835,7 +65832,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
         walker
             .stamp_palette_for_test(0, 0, 0, &[7, 70, 140])
             .unwrap();
@@ -65883,7 +65880,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
         // V plane (plane 2) palette at (0, 0).
         walker.stamp_palette_for_test(2, 0, 0, &[3, 9]).unwrap();
         let map = DecodedPaletteMap {
@@ -65921,7 +65918,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
         let map = DecodedPaletteMap {
             data: vec![0u8; 16],
             stride: 4,

@@ -83,7 +83,7 @@
 //!   reference loop here mirrors the spec's per-sample formulation.
 
 use crate::cdf::MI_SIZE;
-use crate::loop_filter::PlaneBuffer;
+use crate::loop_filter::{Pixel, PlaneBuffer};
 use crate::uncompressed_header_tail::{FrameRestorationType, LrParams};
 
 // =====================================================================
@@ -265,11 +265,11 @@ impl std::fmt::Debug for LoopRestorationFrameContext<'_> {
 /// "copy `LrFrame = UpscaledCdefFrame`" prelude is materialised by
 /// copying `cdef_planes ↦ lr_planes` up-front; on `UsesLr == 0` the
 /// driver returns immediately after the copy.
-pub fn loop_restoration_frame(
+pub fn loop_restoration_frame<P: Pixel>(
     ctx: &LoopRestorationFrameContext<'_>,
-    curr_planes: &[PlaneBuffer<'_>],
-    cdef_planes: &[PlaneBuffer<'_>],
-    lr_planes: &mut [PlaneBuffer<'_>],
+    curr_planes: &[PlaneBuffer<'_, P>],
+    cdef_planes: &[PlaneBuffer<'_, P>],
+    lr_planes: &mut [PlaneBuffer<'_, P>],
 ) {
     let num_planes = ctx
         .num_planes
@@ -305,11 +305,11 @@ pub fn loop_restoration_frame(
     }
 }
 
-pub(crate) fn loop_restoration_frame_with_workers(
+pub(crate) fn loop_restoration_frame_with_workers<P: Pixel>(
     ctx: &LoopRestorationFrameContext<'_>,
-    curr_planes: &[PlaneBuffer<'_>],
-    cdef_planes: &[PlaneBuffer<'_>],
-    lr_planes: &mut [PlaneBuffer<'_>],
+    curr_planes: &[PlaneBuffer<'_, P>],
+    cdef_planes: &[PlaneBuffer<'_, P>],
+    lr_planes: &mut [PlaneBuffer<'_, P>],
     workers: usize,
 ) {
     #[cfg(not(target_arch = "wasm32"))]
@@ -430,11 +430,11 @@ pub fn stripe_unit_rects(ctx: &LoopRestorationFrameContext<'_>, plane: u8) -> Ve
 /// (see [`stripe_unit_rects`]): `rType = LrType[plane][unitRow]
 /// [unitCol]` dispatches to the Wiener / self-guided / no-op arm
 /// exactly like [`loop_restore_block`].
-pub fn loop_restore_rect(
+pub fn loop_restore_rect<P: Pixel>(
     ctx: &LoopRestorationFrameContext<'_>,
-    curr_planes: &[PlaneBuffer<'_>],
-    cdef_planes: &[PlaneBuffer<'_>],
-    lr_planes: &mut [PlaneBuffer<'_>],
+    curr_planes: &[PlaneBuffer<'_, P>],
+    cdef_planes: &[PlaneBuffer<'_, P>],
+    lr_planes: &mut [PlaneBuffer<'_, P>],
     plane: u8,
     geom: &LrBlockGeometry,
 ) {
@@ -442,11 +442,11 @@ pub fn loop_restore_rect(
     loop_restore_rect_at(ctx, curr_planes, cdef_planes, lr, plane, geom, 0);
 }
 
-fn loop_restore_rect_at(
+fn loop_restore_rect_at<P: Pixel>(
     ctx: &LoopRestorationFrameContext<'_>,
-    curr_planes: &[PlaneBuffer<'_>],
-    cdef_planes: &[PlaneBuffer<'_>],
-    lr: &mut PlaneBuffer<'_>,
+    curr_planes: &[PlaneBuffer<'_, P>],
+    cdef_planes: &[PlaneBuffer<'_, P>],
+    lr: &mut PlaneBuffer<'_, P>,
     plane: u8,
     geom: &LrBlockGeometry,
     origin_y: u32,
@@ -470,7 +470,7 @@ fn loop_restore_rect_at(
 /// the §7.17 driver's `LrFrame = UpscaledCdefFrame` prelude. Both
 /// buffers carry the same `(rows, cols)` shape; on a mismatch the copy
 /// honours the smaller extent on each axis.
-fn copy_plane(src_planes: &[PlaneBuffer<'_>], dst_planes: &mut [PlaneBuffer<'_>], plane: u8) {
+fn copy_plane<P: Pixel>(src_planes: &[PlaneBuffer<'_, P>], dst_planes: &mut [PlaneBuffer<'_, P>], plane: u8) {
     let p = plane as usize;
     let Some(src) = src_planes.get(p) else { return };
     let Some(dst) = dst_planes.get_mut(p) else {
@@ -587,11 +587,11 @@ pub fn derive_block_geometry(
 /// Computes the block's `(unitRow, unitCol, x, y, w, h, ...)`
 /// geometry, fetches `rType = LrType[plane][unitRow][unitCol]`, and
 /// dispatches to the Wiener / self-guided / no-op arm.
-pub fn loop_restore_block(
+pub fn loop_restore_block<P: Pixel>(
     ctx: &LoopRestorationFrameContext<'_>,
-    curr_planes: &[PlaneBuffer<'_>],
-    cdef_planes: &[PlaneBuffer<'_>],
-    lr_planes: &mut [PlaneBuffer<'_>],
+    curr_planes: &[PlaneBuffer<'_, P>],
+    cdef_planes: &[PlaneBuffer<'_, P>],
+    lr_planes: &mut [PlaneBuffer<'_, P>],
     plane: u8,
     row: u32,
     col: u32,
@@ -642,11 +642,11 @@ pub fn loop_restore_block(
 ///
 /// `w2` is derived as `(1 << SGRPROJ_PRJ_BITS) - w0 - w1` per av1-spec
 /// p.330 line 18255.
-pub fn self_guided_filter(
+pub fn self_guided_filter<P: Pixel>(
     ctx: &LoopRestorationFrameContext<'_>,
-    curr_planes: &[PlaneBuffer<'_>],
-    cdef_planes: &[PlaneBuffer<'_>],
-    lr_planes: &mut [PlaneBuffer<'_>],
+    curr_planes: &[PlaneBuffer<'_, P>],
+    cdef_planes: &[PlaneBuffer<'_, P>],
+    lr_planes: &mut [PlaneBuffer<'_, P>],
     plane: u8,
     geom: &LrBlockGeometry,
 ) {
@@ -654,11 +654,11 @@ pub fn self_guided_filter(
     self_guided_filter_at(ctx, curr_planes, cdef_planes, lr, plane, geom, 0);
 }
 
-fn self_guided_filter_at(
+fn self_guided_filter_at<P: Pixel>(
     ctx: &LoopRestorationFrameContext<'_>,
-    curr_planes: &[PlaneBuffer<'_>],
-    cdef_planes: &[PlaneBuffer<'_>],
-    lr: &mut PlaneBuffer<'_>,
+    curr_planes: &[PlaneBuffer<'_, P>],
+    cdef_planes: &[PlaneBuffer<'_, P>],
+    lr: &mut PlaneBuffer<'_, P>,
     plane: u8,
     geom: &LrBlockGeometry,
     origin_y: u32,
@@ -717,7 +717,7 @@ fn self_guided_filter_at(
             let px = geom.x as i32 + j as i32;
             // av1-spec p.330 line 18260: u = CDEF[y + i][x + j] << RST_BITS.
             let u = if py >= 0 && py < cdef_rows && px >= 0 && px < cdef_cols {
-                cdef.samples[(py as usize) * cdef_cols_usize + px as usize] << SGRPROJ_RST_BITS
+                cdef.samples[(py as usize) * cdef_cols_usize + px as usize].to_i32() << SGRPROJ_RST_BITS
             } else {
                 0
             };
@@ -735,7 +735,7 @@ fn self_guided_filter_at(
             if dst_y < 0 || dst_y >= lr_rows || px < 0 || px >= lr_cols {
                 continue;
             }
-            lr.samples[(dst_y as usize) * lr_cols_usize + px as usize] = out;
+            lr.samples[(dst_y as usize) * lr_cols_usize + px as usize] = P::from_i32(out);
         }
     }
 }
@@ -779,9 +779,9 @@ pub fn sgr_project(
 /// spec's sample for sample) instead of re-fetching the window per
 /// output position.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn box_filter(
-    curr_planes: &[PlaneBuffer<'_>],
-    cdef_planes: &[PlaneBuffer<'_>],
+pub(crate) fn box_filter<P: Pixel>(
+    curr_planes: &[PlaneBuffer<'_, P>],
+    cdef_planes: &[PlaneBuffer<'_, P>],
     plane: u8,
     geom: &LrBlockGeometry,
     bit_depth: u8,
@@ -954,7 +954,7 @@ pub(crate) fn box_filter(
             // av1-spec p.332 line 18382: v = a * UpscaledCdefFrame[..] + b.
             let px = geom.x as i32 + j as i32;
             let u = if py >= 0 && py < cdef_rows && px >= 0 && px < cdef_cols {
-                cdef.samples[(py as usize) * cdef_cols_usize + px as usize] as i64
+                i64::from(cdef.samples[(py as usize) * cdef_cols_usize + px as usize].to_i32())
             } else {
                 0
             };
@@ -979,11 +979,11 @@ pub(crate) fn box_filter(
 /// `LrFrame[plane][y + r][x + c]` via the 7-tap vertical filter.
 /// `(InterRound0, InterRound1)` follow the §7.11.3.2 single-ref
 /// schedule (`isCompound = 0`).
-pub fn wiener_filter(
+pub fn wiener_filter<P: Pixel>(
     ctx: &LoopRestorationFrameContext<'_>,
-    curr_planes: &[PlaneBuffer<'_>],
-    cdef_planes: &[PlaneBuffer<'_>],
-    lr_planes: &mut [PlaneBuffer<'_>],
+    curr_planes: &[PlaneBuffer<'_, P>],
+    cdef_planes: &[PlaneBuffer<'_, P>],
+    lr_planes: &mut [PlaneBuffer<'_, P>],
     plane: u8,
     geom: &LrBlockGeometry,
 ) {
@@ -991,11 +991,11 @@ pub fn wiener_filter(
     wiener_filter_at(ctx, curr_planes, cdef_planes, lr, plane, geom, 0);
 }
 
-fn wiener_filter_at(
+fn wiener_filter_at<P: Pixel>(
     ctx: &LoopRestorationFrameContext<'_>,
-    curr_planes: &[PlaneBuffer<'_>],
-    cdef_planes: &[PlaneBuffer<'_>],
-    lr: &mut PlaneBuffer<'_>,
+    curr_planes: &[PlaneBuffer<'_, P>],
+    cdef_planes: &[PlaneBuffer<'_, P>],
+    lr: &mut PlaneBuffer<'_, P>,
     plane: u8,
     geom: &LrBlockGeometry,
     origin_y: u32,
@@ -1080,7 +1080,7 @@ fn wiener_filter_at(
                 + vfilter[1] * (row1[c] + row5[c])
                 + vfilter[2] * (row2[c] + row4[c])
                 + vfilter[3] * row3[c];
-            *out = clip3(0, max_sample, round2_i32(s, inter_round1));
+            *out = P::from_i32(clip3(0, max_sample, round2_i32(s, inter_round1)));
         }
     }
 }
@@ -1118,9 +1118,9 @@ pub fn wiener_coefficients(coeff: &[i32; WIENER_COEFFS]) -> [i32; 7] {
 // §7.17.6 Get source sample process — av1-spec p.335 lines 18516-18550.
 // =====================================================================
 
-fn source_row(
-    curr: &PlaneBuffer<'_>,
-    cdef: &PlaneBuffer<'_>,
+fn source_row<P: Pixel>(
+    curr: &PlaneBuffer<'_, P>,
+    cdef: &PlaneBuffer<'_, P>,
     x: i32,
     y: i32,
     geom: &LrBlockGeometry,
@@ -1145,10 +1145,10 @@ fn source_row(
     let row = &src.samples[y * stride..(y + 1) * stride];
     let last_x = geom.plane_end_x.max(0).min(src.cols as i32 - 1);
     if x >= 0 && x as usize + dst.len() <= last_x as usize + 1 {
-        dst.copy_from_slice(&row[x as usize..x as usize + dst.len()]);
+        for (dst, &src) in dst.iter_mut().zip(&row[x as usize..]) { *dst = src.to_i32(); }
     } else {
         for (c, v) in dst.iter_mut().enumerate() {
-            *v = row[(x + c as i32).clamp(0, last_x) as usize];
+            *v = row[(x + c as i32).clamp(0, last_x) as usize].to_i32();
         }
     }
 }
@@ -1160,9 +1160,9 @@ fn source_row(
 /// `StripeStartY` or below `StripeEndY`, with the cropped
 /// `StripeStartY - 2` / `StripeEndY + 2` neighbour-line reach) or
 /// `UpscaledCdefFrame[plane]` (when `y` lands inside the stripe).
-pub fn get_source_sample(
-    curr_planes: &[PlaneBuffer<'_>],
-    cdef_planes: &[PlaneBuffer<'_>],
+pub fn get_source_sample<P: Pixel>(
+    curr_planes: &[PlaneBuffer<'_, P>],
+    cdef_planes: &[PlaneBuffer<'_, P>],
     plane: u8,
     x: i32,
     y: i32,
@@ -1190,7 +1190,7 @@ pub fn get_source_sample(
 /// `[StripeStartY - 2, StripeEndY + 2]` — but the planes the caller
 /// passes in may be sized differently, so the fetch here clamps
 /// defensively to the buffer's `[0, rows-1] × [0, cols-1]` extent.
-fn sample_at(planes: &[PlaneBuffer<'_>], plane: usize, x: i32, y: i32) -> i32 {
+fn sample_at<P: Pixel>(planes: &[PlaneBuffer<'_, P>], plane: usize, x: i32, y: i32) -> i32 {
     let Some(buf) = planes.get(plane) else {
         return 0;
     };
@@ -1199,7 +1199,7 @@ fn sample_at(planes: &[PlaneBuffer<'_>], plane: usize, x: i32, y: i32) -> i32 {
     }
     let yc = y.clamp(0, buf.rows as i32 - 1) as usize;
     let xc = x.clamp(0, buf.cols as i32 - 1) as usize;
-    buf.samples[yc * (buf.cols as usize) + xc]
+    buf.samples[yc * (buf.cols as usize) + xc].to_i32()
 }
 
 // =====================================================================

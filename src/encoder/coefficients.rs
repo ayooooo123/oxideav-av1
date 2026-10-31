@@ -2110,7 +2110,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        PartitionWalker::new(8, 8, geom).expect("walker construction")
+        PartitionWalker::<i32>::new(8, 8, geom).expect("walker construction")
     }
 
     /// Helper: encode `quant_in` with the driver, then decode the bytes

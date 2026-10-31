@@ -47,7 +47,7 @@ use crate::frame_header::{
     parse_frame_header_with_refs, FrameHeader, RefInfo, NUM_REF_FRAMES, PRIMARY_REF_NONE,
 };
 use crate::inter_pred::get_relative_dist;
-use crate::loop_filter::PlaneBuffer;
+use crate::loop_filter::{Pixel, PlaneBuffer};
 use crate::obu::{ObuIter, ObuType};
 use crate::sequence_header::{parse_sequence_header, SequenceHeader};
 use crate::symbol_decoder::SymbolDecoder;
@@ -319,6 +319,29 @@ fn decode_frame_spec_tiles(
     refs: Option<&SpecRefState>,
     exec: &oxideav_core::ExecutionContext,
 ) -> Result<DecodedFrameInternal, Error> {
+    let decoded = match seq.color_config.bit_depth {
+        8 => decode_frame_spec_tiles_native::<u8>(seq, fh, tiles, refs, exec),
+        10 | 12 => decode_frame_spec_tiles_native::<u16>(seq, fh, tiles, refs, exec),
+        _ => Err(Error::PartitionWalkOutOfRange),
+    }?;
+    #[cfg(test)]
+    {
+        // Keep the original widened-storage arithmetic as an independent
+        // monomorphization for every unit-test stream and coded frame.
+        let original = decode_frame_spec_tiles_native::<i32>(seq, fh, tiles, refs, exec)?;
+        assert_eq!(decoded.frame, original.frame, "native reconstruction output");
+        assert_eq!(decoded.ref_planes, original.ref_planes, "native reference samples");
+    }
+    Ok(decoded)
+}
+
+fn decode_frame_spec_tiles_native<P: Pixel>(
+    seq: &SequenceHeader,
+    fh: &FrameHeader,
+    tiles: &[TilePayload],
+    refs: Option<&SpecRefState>,
+    exec: &oxideav_core::ExecutionContext,
+) -> Result<DecodedFrameInternal, Error> {
     if fh.show_existing_frame {
         // §7.21 output-existing path is the caller's (no tile group).
         return Err(Error::PartitionWalkOutOfRange);
@@ -486,16 +509,14 @@ fn decode_frame_spec_tiles(
     let mi_rows = fs.mi_rows;
     let mi_cols = fs.mi_cols;
     let workers = exec.effective_workers(mi_rows.div_ceil(16) as usize);
-    let mut walker = PartitionWalker::new(
-        mi_rows,
-        mi_cols,
-        TileGeometry {
-            mi_row_start: 0,
-            mi_row_end: mi_rows,
-            mi_col_start: 0,
-            mi_col_end: mi_cols,
-        },
-    )
+    let mut walker = PartitionWalker::<P>::new(mi_rows,
+    mi_cols,
+    TileGeometry {
+        mi_row_start: 0,
+        mi_row_end: mi_rows,
+        mi_col_start: 0,
+        mi_col_end: mi_cols,
+    },)
     .ok_or(Error::PartitionWalkOutOfRange)?;
 
     // ---- Inter-frame state: §5.11.18 context + §7.11.3 ref pixels. ----
@@ -813,7 +834,7 @@ fn decode_frame_spec_tiles(
     let sub_x = u8::from(cc.subsampling_x) as u32;
     let sub_y = u8::from(cc.subsampling_y) as u32;
     let num_planes = cc.num_planes as usize;
-    let mut plane_bufs: Vec<Vec<i32>> = Vec::with_capacity(num_planes);
+    let mut plane_bufs: Vec<Vec<P>> = Vec::with_capacity(num_planes);
     let mut plane_dims: Vec<(u32, u32)> = Vec::with_capacity(num_planes);
     for plane in 0..num_planes {
         // r453 — MOVE the plane out of the walker (the §7.14/§7.15/
@@ -849,7 +870,7 @@ fn decode_frame_spec_tiles(
             && !coded_lossless
             && !fh.allow_intrabc
         {
-            let mut bufs: Vec<PlaneBuffer<'_>> = Vec::with_capacity(num_planes);
+            let mut bufs: Vec<PlaneBuffer<'_, P>> = Vec::with_capacity(num_planes);
             for (buf, &(pw, ph)) in plane_bufs.iter_mut().zip(plane_dims.iter()) {
                 bufs.push(PlaneBuffer {
                     rows: ph,
@@ -879,7 +900,7 @@ fn decode_frame_spec_tiles(
     // `UpscaledCurrFrame` — no superres on this path) and the CDEF
     // output (`UpscaledCdefFrame`), so keep the pre-CDEF copy around
     // when restoration is active.
-    let mut deblocked: Option<Vec<Vec<i32>>> = if lr.uses_lr {
+    let mut deblocked: Option<Vec<Vec<P>>> = if lr.uses_lr {
         Some(plane_bufs.clone())
     } else {
         None
@@ -890,12 +911,12 @@ fn decode_frame_spec_tiles(
             // §7.17 is active the `deblocked` copy above IS that
             // frame (CDEF only reads its source), so borrow it
             // instead of cloning a third full-frame buffer.
-            let mut fallback: Option<Vec<Vec<i32>>> = None;
-            let src_owned: &mut Vec<Vec<i32>> = match deblocked {
+            let mut fallback: Option<Vec<Vec<P>>> = None;
+            let src_owned: &mut Vec<Vec<P>> = match deblocked {
                 Some(ref mut d) => d,
                 None => fallback.insert(plane_bufs.clone()),
             };
-            let mut src: Vec<PlaneBuffer<'_>> = Vec::with_capacity(num_planes);
+            let mut src: Vec<PlaneBuffer<'_, P>> = Vec::with_capacity(num_planes);
             for (buf, &(pw, ph)) in src_owned.iter_mut().zip(plane_dims.iter()) {
                 src.push(PlaneBuffer {
                     rows: ph,
@@ -903,7 +924,7 @@ fn decode_frame_spec_tiles(
                     samples: buf,
                 });
             }
-            let mut dst: Vec<PlaneBuffer<'_>> = Vec::with_capacity(num_planes);
+            let mut dst: Vec<PlaneBuffer<'_, P>> = Vec::with_capacity(num_planes);
             for (buf, &(pw, ph)) in plane_bufs.iter_mut().zip(plane_dims.iter()) {
                 dst.push(PlaneBuffer {
                     rows: ph,
@@ -953,9 +974,9 @@ fn decode_frame_spec_tiles(
             };
             new_dims.push((out_w, out_h));
         }
-        let upscale_set = |bufs: &mut Vec<Vec<i32>>| -> Result<(), Error> {
+        let upscale_set = |bufs: &mut Vec<Vec<P>>| -> Result<(), Error> {
             let mut inputs_owned = std::mem::take(bufs);
-            let mut inputs: Vec<PlaneBuffer<'_>> = Vec::with_capacity(num_planes);
+            let mut inputs: Vec<PlaneBuffer<'_, P>> = Vec::with_capacity(num_planes);
             for (buf, &(pw, ph)) in inputs_owned.iter_mut().zip(plane_dims.iter()) {
                 inputs.push(PlaneBuffer {
                     rows: ph,
@@ -963,12 +984,12 @@ fn decode_frame_spec_tiles(
                     samples: buf,
                 });
             }
-            let mut outputs_owned: Vec<Vec<i32>> = new_dims
+            let mut outputs_owned: Vec<Vec<P>> = new_dims
                 .iter()
-                .map(|&(pw, ph)| vec![0i32; (pw as usize) * (ph as usize)])
+                .map(|&(pw, ph)| vec![P::default(); (pw as usize) * (ph as usize)])
                 .collect();
             {
-                let mut outputs: Vec<PlaneBuffer<'_>> = Vec::with_capacity(num_planes);
+                let mut outputs: Vec<PlaneBuffer<'_, P>> = Vec::with_capacity(num_planes);
                 for (buf, &(pw, ph)) in outputs_owned.iter_mut().zip(new_dims.iter()) {
                     outputs.push(PlaneBuffer {
                         rows: ph,
@@ -993,8 +1014,8 @@ fn decode_frame_spec_tiles(
     // UpscaledCdefFrame) into LrFrame. The §5.11.57 units were decoded
     // by the tile walk's `read_lr` interleave above.
     if let Some(mut curr_owned) = deblocked {
-        let mut cdef_owned: Vec<Vec<i32>> = plane_bufs.clone();
-        let mut curr: Vec<PlaneBuffer<'_>> = Vec::with_capacity(num_planes);
+        let mut cdef_owned: Vec<Vec<P>> = plane_bufs.clone();
+        let mut curr: Vec<PlaneBuffer<'_, P>> = Vec::with_capacity(num_planes);
         for (buf, &(pw, ph)) in curr_owned.iter_mut().zip(plane_dims.iter()) {
             curr.push(PlaneBuffer {
                 rows: ph,
@@ -1002,7 +1023,7 @@ fn decode_frame_spec_tiles(
                 samples: buf,
             });
         }
-        let mut cdef_bufs: Vec<PlaneBuffer<'_>> = Vec::with_capacity(num_planes);
+        let mut cdef_bufs: Vec<PlaneBuffer<'_, P>> = Vec::with_capacity(num_planes);
         for (buf, &(pw, ph)) in cdef_owned.iter_mut().zip(plane_dims.iter()) {
             cdef_bufs.push(PlaneBuffer {
                 rows: ph,
@@ -1010,7 +1031,7 @@ fn decode_frame_spec_tiles(
                 samples: buf,
             });
         }
-        let mut lr_out: Vec<PlaneBuffer<'_>> = Vec::with_capacity(num_planes);
+        let mut lr_out: Vec<PlaneBuffer<'_, P>> = Vec::with_capacity(num_planes);
         for (buf, &(pw, ph)) in plane_bufs.iter_mut().zip(plane_dims.iter()) {
             lr_out.push(PlaneBuffer {
                 rows: ph,
@@ -1057,7 +1078,7 @@ fn decode_frame_spec_tiles(
             return Err(Error::PartitionWalkOutOfRange);
         }
         let src = &plane_bufs[plane];
-        let mut buf = vec![0i32; (out_w as usize) * (out_h as usize)];
+        let mut buf = vec![P::default(); (out_w as usize) * (out_h as usize)];
         for y in 0..out_h as usize {
             let row = &src[y * pw as usize..y * pw as usize + out_w as usize];
             buf[y * out_w as usize..(y + 1) * out_w as usize].copy_from_slice(row);
@@ -1072,7 +1093,7 @@ fn decode_frame_spec_tiles(
     // frames motion-compensate against).
     let ref_planes: Vec<Vec<u16>> = plane_bufs
         .iter()
-        .map(|buf| buf.iter().map(|&v| v.max(0) as u16).collect())
+        .map(|buf| buf.iter().map(|&v| v.to_i32().max(0) as u16).collect())
         .collect();
     let ref_plane_dims: Vec<(u32, u32)> = plane_dims.clone();
 
@@ -1100,7 +1121,7 @@ fn decode_frame_spec_tiles(
         };
     if let Some(fg) = effective_grain.as_ref() {
         if fg.apply_grain {
-            let mut bufs: Vec<PlaneBuffer<'_>> = Vec::with_capacity(num_planes);
+            let mut bufs: Vec<PlaneBuffer<'_, P>> = Vec::with_capacity(num_planes);
             for (buf, &(pw, ph)) in plane_bufs.iter_mut().zip(plane_dims.iter()) {
                 bufs.push(PlaneBuffer {
                     rows: ph,
@@ -1123,22 +1144,8 @@ fn decode_frame_spec_tiles(
     // ---- Narrow to the output layout: one byte per sample at
     // 8-bit, packed little-endian `u16` at 10/12-bit (the
     // `yuv4xxp1{0,2}le` layout), clamped to `(1 << BitDepth) - 1`. ----
-    let max_val: i32 = (1 << cc.bit_depth) - 1;
-    let planes: Vec<Vec<u8>> = plane_bufs
-        .into_iter()
-        .map(|buf| {
-            if cc.bit_depth == 8 {
-                buf.into_iter().map(|v| v.clamp(0, 255) as u8).collect()
-            } else {
-                let mut out = Vec::with_capacity(buf.len() * 2);
-                for v in buf {
-                    let v = v.clamp(0, max_val) as u16;
-                    out.extend_from_slice(&v.to_le_bytes());
-                }
-                out
-            }
-        })
-        .collect();
+    let planes: Vec<Vec<u8>> = plane_bufs.into_iter()
+        .map(|buf| P::into_bytes(buf, cc.bit_depth)).collect();
 
     // ---- §7.19 motion field motion vector storage. ----
     // Filter the §5.11.5 `Mvs[]` / `RefFrames[]` grids down to the

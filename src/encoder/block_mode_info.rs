@@ -7329,7 +7329,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
         let cdfs = TileCdfContext::new_from_defaults();
         (walker, cdfs)
     }
@@ -12124,7 +12124,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        PartitionWalker::new(32, 32, geom).unwrap()
+        PartitionWalker::<i32>::new(32, 32, geom).unwrap()
     }
 
     /// 2-entry palette `[0, 1]` at 8 bit-depth, fresh walker (empty
@@ -18407,7 +18407,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
         walker.stamp_inter_neighbour(1, 0, BLOCK_8X8, [1, -1], MODE_NEARESTMV, [[0, 0], [0, 0]]);
         walker
     }
@@ -19228,7 +19228,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let mut dec_cdfs = TileCdfContext::new_from_defaults();
         let got = walker
             .read_interpolation_filter(
@@ -19707,7 +19707,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let mut dec = SymbolDecoder::init_symbol(bytes, bytes.len(), false).unwrap();
         let mfmvs = crate::cdf::MotionFieldMvs::new_invalid(8, 8);
@@ -19787,7 +19787,7 @@ mod tests {
         for blk in 0..n_blocks {
             // Encoder-side mirror walker carrying the prefix stamps.
             let walker = if blk == 0 {
-                PartitionWalker::new(8, 8, geom).unwrap()
+                PartitionWalker::<i32>::new(8, 8, geom).unwrap()
             } else {
                 rt_decode_blocks(&rt_encode_blocks(blk), blk).0
             };

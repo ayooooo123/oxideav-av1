@@ -65,7 +65,7 @@
 //!   that is purely implementation-side).
 
 use crate::film_grain_tables::GAUSSIAN_SEQUENCE;
-use crate::loop_filter::PlaneBuffer;
+use crate::loop_filter::{Pixel, PlaneBuffer};
 use crate::uncompressed_header_tail::FilmGrainParams;
 
 // =====================================================================
@@ -567,7 +567,7 @@ pub fn scale_lut(lut: &ScalingLut, plane: u8, index: i32, bit_depth: u8) -> i32 
 /// `out_planes[1]` / `out_planes[2]` are Cb / Cr. For monochrome
 /// (`num_planes == 1`) only the luma blend runs.
 #[allow(clippy::too_many_arguments)]
-pub fn add_noise_synthesis(
+pub fn add_noise_synthesis<P: Pixel>(
     fg: &FilmGrainParams,
     grain: &GrainArrays,
     lut: &ScalingLut,
@@ -576,7 +576,7 @@ pub fn add_noise_synthesis(
     sub_x: u8,
     sub_y: u8,
     matrix_coefficients: u8,
-    out_planes: &mut [PlaneBuffer<'_>],
+    out_planes: &mut [PlaneBuffer<'_, P>],
 ) {
     if out_planes.is_empty() {
         return;
@@ -766,7 +766,7 @@ pub fn add_noise_synthesis(
                 let luma_next_x = (luma_x + 1).min((w as usize) - 1);
                 let out_y = &out_planes[0];
                 let y_at =
-                    |x: usize, y: usize| -> i32 { out_y.samples[y * (out_y.cols as usize) + x] };
+                    |x: usize, y: usize| -> i32 { out_y.samples[y * (out_y.cols as usize) + x].to_i32() };
                 let avg_luma = if sub_x != 0 {
                     round2(y_at(luma_x, luma_y) + y_at(luma_next_x, luma_y), 1)
                 } else {
@@ -775,7 +775,7 @@ pub fn add_noise_synthesis(
 
                 // Cb path.
                 if fg.num_cb_points > 0 || fg.chroma_scaling_from_luma {
-                    let orig = out_planes[1].samples[yy * (out_planes[1].cols as usize) + xx];
+                    let orig = out_planes[1].samples[yy * (out_planes[1].cols as usize) + xx].to_i32();
                     let merged = if fg.chroma_scaling_from_luma {
                         avg_luma
                     } else {
@@ -789,12 +789,12 @@ pub fn add_noise_synthesis(
                     let noise = noise_image[1][yy * plane_w_c + xx];
                     let noise = round2(scale_lut(lut, 1, merged, bit_depth) * noise, scaling_shift);
                     out_planes[1].samples[yy * (out_planes[1].cols as usize) + xx] =
-                        clip3(min_value, max_chroma, orig + noise);
+                        P::from_i32(clip3(min_value, max_chroma, orig + noise));
                 }
 
                 // Cr path.
                 if fg.num_cr_points > 0 || fg.chroma_scaling_from_luma {
-                    let orig = out_planes[2].samples[yy * (out_planes[2].cols as usize) + xx];
+                    let orig = out_planes[2].samples[yy * (out_planes[2].cols as usize) + xx].to_i32();
                     let merged = if fg.chroma_scaling_from_luma {
                         avg_luma
                     } else {
@@ -808,7 +808,7 @@ pub fn add_noise_synthesis(
                     let noise = noise_image[2][yy * plane_w_c + xx];
                     let noise = round2(scale_lut(lut, 2, merged, bit_depth) * noise, scaling_shift);
                     out_planes[2].samples[yy * (out_planes[2].cols as usize) + xx] =
-                        clip3(min_value, max_chroma, orig + noise);
+                        P::from_i32(clip3(min_value, max_chroma, orig + noise));
                 }
             }
         }
@@ -818,11 +818,11 @@ pub fn add_noise_synthesis(
     if fg.num_y_points > 0 {
         for yy in 0..(h as usize) {
             for xx in 0..(w as usize) {
-                let orig = out_planes[0].samples[yy * (out_planes[0].cols as usize) + xx];
+                let orig = out_planes[0].samples[yy * (out_planes[0].cols as usize) + xx].to_i32();
                 let noise = noise_image[0][yy * (w as usize) + xx];
                 let noise = round2(scale_lut(lut, 0, orig, bit_depth) * noise, scaling_shift);
                 out_planes[0].samples[yy * (out_planes[0].cols as usize) + xx] =
-                    clip3(min_value, max_luma, orig + noise);
+                    P::from_i32(clip3(min_value, max_luma, orig + noise));
             }
         }
     }
@@ -845,14 +845,14 @@ pub fn add_noise_synthesis(
 ///
 /// On `!fg.apply_grain` the call is a no-op — the spec gates the
 /// entire §7.18.3 process on `apply_grain == 1`.
-pub fn film_grain_synthesis(
+pub fn film_grain_synthesis<P: Pixel>(
     fg: &FilmGrainParams,
     bit_depth: u8,
     num_planes: u8,
     sub_x: u8,
     sub_y: u8,
     matrix_coefficients: u8,
-    out_planes: &mut [PlaneBuffer<'_>],
+    out_planes: &mut [PlaneBuffer<'_, P>],
 ) {
     if !fg.apply_grain {
         return;

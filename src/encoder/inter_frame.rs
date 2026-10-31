@@ -5303,16 +5303,14 @@ impl PSearchCtx {
             ref_frames[cell * 2] = 0; // INTRA_FRAME pre-fill
             ref_frames[cell * 2 + 1] = -1; // NONE
         }
-        let mirror = PartitionWalker::new(
-            mi_rows,
-            mi_cols,
-            TileGeometry {
-                mi_row_start: 0,
-                mi_row_end: mi_rows,
-                mi_col_start: 0,
-                mi_col_end: mi_cols,
-            },
-        )
+        let mirror = PartitionWalker::<i32>::new(mi_rows,
+        mi_cols,
+        TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: mi_rows,
+            mi_col_start: 0,
+            mi_col_end: mi_cols,
+        },)
         .ok_or(Error::PartitionWalkOutOfRange)?;
         if ref_dims.len() != refs.len() {
             return Err(Error::PartitionWalkOutOfRange);
@@ -6198,26 +6196,24 @@ impl PSearchCtx {
                 // the neutral pair matches the decode walker's output
                 // sample-for-sample regardless of the sequence's
                 // `enable_intra_edge_filter`.
-                PartitionWalker::predict_intra_into_u16_plane(
-                    &read,
-                    out,
-                    pw,
-                    (pw - 1) as u32,
-                    (ph - 1) as u32,
-                    base_x as u32,
-                    base_y as u32,
-                    tx_sz,
-                    mode,
-                    /* angle_delta = */ 0,
-                    self.bit_depth,
-                    avail_u,
-                    avail_l,
-                    have_ar,
-                    have_bl,
-                    /* enable_intra_edge_filter = */ false,
-                    /* filter_type = */ 0,
-                    /* filter_intra_mode = */ None,
-                );
+                PartitionWalker::<i32>::predict_intra_into_u16_plane(&read,
+                out,
+                pw,
+                (pw - 1) as u32,
+                (ph - 1) as u32,
+                base_x as u32,
+                base_y as u32,
+                tx_sz,
+                mode,
+                /* angle_delta = */ 0,
+                self.bit_depth,
+                avail_u,
+                avail_l,
+                have_ar,
+                have_bl,
+                /* enable_intra_edge_filter = */ false,
+                /* filter_type = */ 0,
+                /* filter_intra_mode = */ None,);
             }
         }
 

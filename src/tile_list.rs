@@ -552,16 +552,14 @@ fn decode_camera_tile(
     // ---- §7.3.2: one §5.11.2 tile decode, no post-processing. ----
     let mi_rows = fs.mi_rows;
     let mi_cols = fs.mi_cols;
-    let mut walker = PartitionWalker::new(
-        mi_rows,
-        mi_cols,
-        TileGeometry {
-            mi_row_start: 0,
-            mi_row_end: mi_rows,
-            mi_col_start: 0,
-            mi_col_end: mi_cols,
-        },
-    )
+    let mut walker = PartitionWalker::<i32>::new(mi_rows,
+    mi_cols,
+    TileGeometry {
+        mi_row_start: 0,
+        mi_row_end: mi_rows,
+        mi_col_start: 0,
+        mi_col_end: mi_cols,
+    },)
     .ok_or(Error::TileListInvalid)?;
     let row = usize::from(entry.anchor_tile_row);
     let col = usize::from(entry.anchor_tile_col);
