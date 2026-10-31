@@ -200,41 +200,41 @@ pub struct LoopFilterFrameContext<'a> {
     /// `FrameHeight` per §5.9.5.
     pub frame_height: u32,
     /// `RefFrames[row][col][0] <= INTRA_FRAME` per §7.14.2 line 17073.
-    pub is_intra: &'a dyn Fn(u32, u32) -> bool,
+    pub is_intra: &'a (dyn Fn(u32, u32) -> bool + Sync),
     /// `Skips[row][col]` per §7.14.2 line 17071.
-    pub skip: &'a dyn Fn(u32, u32) -> bool,
+    pub skip: &'a (dyn Fn(u32, u32) -> bool + Sync),
     /// `RefFrames[row][col][0]` per §7.14.4 line 17181 — the
     /// reference-frame ordinal in `0..=TOTAL_REFS_PER_FRAME`.
-    pub ref_frame: &'a dyn Fn(u32, u32) -> u8,
+    pub ref_frame: &'a (dyn Fn(u32, u32) -> u8 + Sync),
     /// `YModes[row][col]` per §7.14.4 line 17183 — the per-block
     /// mode ordinal used to classify §7.14.4's `modeType`.
-    pub mode: &'a dyn Fn(u32, u32) -> u8,
+    pub mode: &'a (dyn Fn(u32, u32) -> u8 + Sync),
     /// `SegmentIds[row][col]` per §7.14.4 line 17179 — `-1` (signalled
     /// as `u8::MAX`) for cells without a segment id.
-    pub segment_id: &'a dyn Fn(u32, u32) -> u8,
+    pub segment_id: &'a (dyn Fn(u32, u32) -> u8 + Sync),
     /// `DeltaLFs[row][col][idx]` per §7.14.4 line 17195-17198. `idx`
     /// is `0` for `delta_lf_multi == 0`; otherwise `(plane == 0) ?
     /// pass : (plane + 1)` (so `0..=3`).
-    pub delta_lf: &'a dyn Fn(u32, u32, usize) -> i8,
+    pub delta_lf: &'a (dyn Fn(u32, u32, usize) -> i8 + Sync),
     /// `seg_feature_active_idx(segment, feature)` per §7.14.5 line
     /// 17259. `feature ∈ {SEG_LVL_ALT_LF_Y_V, +Y_H, +U, +V}` (i.e.
     /// `1..=4`).
-    pub seg_feature_active: &'a dyn Fn(u32, usize) -> bool,
+    pub seg_feature_active: &'a (dyn Fn(u32, usize) -> bool + Sync),
     /// `FeatureData[segment][feature]` per §7.14.5 line 17266 — the
     /// signed alt-LF offset that gets added to `lvlSeg` when
     /// `seg_feature_active(segment, feature) == 1`.
-    pub seg_feature_data: &'a dyn Fn(u32, usize) -> i16,
+    pub seg_feature_data: &'a (dyn Fn(u32, usize) -> i16 + Sync),
     /// `LoopfilterTxSizes[plane][row >> subY][col >> subX]` per
     /// §7.14.2 line 17067 — the per-plane transform-size index in
     /// `0..=TX_SIZES_ALL`.
-    pub lf_tx_size: &'a dyn Fn(usize, u32, u32) -> usize,
+    pub lf_tx_size: &'a (dyn Fn(usize, u32, u32) -> usize + Sync),
     /// `MiSizes[row][col]` per §7.14.2 line 17065 — the per-mi block
     /// size ordinal. Combined with `plane` via
     /// [`crate::cdf::get_plane_residual_size`]-equivalent: for the
     /// driver, this is consumed by [`block_width`] / [`block_height`]
     /// for the §7.14.2 `Block_Width[planeSize]` /
     /// `Block_Height[planeSize]` compare.
-    pub mi_size: &'a dyn Fn(u32, u32) -> usize,
+    pub mi_size: &'a (dyn Fn(u32, u32) -> usize + Sync),
 }
 
 impl std::fmt::Debug for LoopFilterFrameContext<'_> {
@@ -308,6 +308,77 @@ pub fn loop_filter_rows(
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn split_row_bands<'a>(
+    planes: &'a mut [PlaneBuffer<'_>],
+    luma_rows: u32,
+    subsampling_y: u8,
+) -> Vec<Vec<PlaneBuffer<'a>>> {
+    let count = planes[0].rows.div_ceil(luma_rows) as usize;
+    let mut bands: Vec<Vec<PlaneBuffer<'a>>> = (0..count).map(|_| Vec::with_capacity(planes.len())).collect();
+    for (p, plane) in planes.iter_mut().enumerate() {
+        let rows = luma_rows >> if p == 0 { 0 } else { subsampling_y };
+        let cols = plane.cols;
+        for (band, samples) in bands.iter_mut().zip(plane.samples.chunks_mut(rows as usize * cols as usize)) {
+            band.push(PlaneBuffer { rows: (samples.len() / cols as usize) as u32, cols, samples });
+        }
+    }
+    bands
+}
+
+pub(crate) fn loop_filter_frame_with_workers(
+    ctx: &LoopFilterFrameContext<'_>,
+    planes: &mut [PlaneBuffer<'_>],
+    workers: usize,
+) {
+    #[cfg(not(target_arch = "wasm32"))]
+    if workers > 1 && !planes.is_empty() && planes[0].rows >= 128 {
+        let num_planes = usize::from(ctx.num_planes).min(planes.len());
+        let planes = &mut planes[..num_planes];
+        let band_rows = planes[0].rows.div_ceil(workers as u32).div_ceil(64) * 64;
+        let bands = split_row_bands(planes, band_rows, ctx.subsampling_y);
+        std::thread::scope(|scope| {
+            for (b, mut band) in bands.into_iter().enumerate() {
+                scope.spawn(move || {
+                    let start = b as u32 * band_rows / MI_SIZE as u32;
+                    let end = (start + band_rows / MI_SIZE as u32).min(ctx.mi_rows);
+                    for (p, plane_buf) in band.iter_mut().enumerate() {
+                        if p > 0 && ctx.loop_filter_level[1 + p] == 0 { continue; }
+                        let (sub_x, sub_y) = subsampling_for_plane(p as u8, ctx.subsampling_x, ctx.subsampling_y);
+                        for row in (start..end).step_by(1 << sub_y) {
+                            for col in (0..ctx.mi_cols).step_by(1 << sub_x) {
+                                loop_filter_edge_at(ctx, plane_buf, p as u8, 0, row, col, ((b as u32 * band_rows) >> sub_y) as i32);
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        // Horizontal edges retain their complete top-to-bottom dependency chain.
+        // Different planes are independent, so this pass needs no column packing.
+        let planes_per_worker = num_planes.div_ceil(workers);
+        std::thread::scope(|scope| {
+            for (b, chunk) in planes.chunks_mut(planes_per_worker).enumerate() {
+                scope.spawn(move || {
+                    for (i, plane_buf) in chunk.iter_mut().enumerate() {
+                        let p = b * planes_per_worker + i;
+                        if p > 0 && ctx.loop_filter_level[1 + p] == 0 { continue; }
+                        let (sub_x, sub_y) = subsampling_for_plane(p as u8, ctx.subsampling_x, ctx.subsampling_y);
+                        for row in (0..ctx.mi_rows).step_by(1 << sub_y) {
+                            for col in (0..ctx.mi_cols).step_by(1 << sub_x) {
+                                loop_filter_edge_at(ctx, plane_buf, p as u8, 1, row, col, 0);
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        return;
+    }
+    let _ = workers;
+    loop_filter_frame(ctx, planes);
+}
+
 /// §7.14.2 per-edge driver — av1-spec p.307-310 lines 16994-17126.
 ///
 /// `plane` is `0` (Y), `1` (U), `2` (V). `pass` is `0` for vertical
@@ -321,6 +392,20 @@ pub fn loop_filter_edge(
     pass: u8,
     row: u32,
     col: u32,
+) {
+    let Some(plane_buf) = planes.get_mut(plane as usize) else { return };
+    loop_filter_edge_at(ctx, plane_buf, plane, pass, row, col, 0);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn loop_filter_edge_at(
+    ctx: &LoopFilterFrameContext<'_>,
+    plane_buf: &mut PlaneBuffer<'_>,
+    plane: u8,
+    pass: u8,
+    row: u32,
+    col: u32,
+    origin_y: i32,
 ) {
     let (sub_x, sub_y) = subsampling_for_plane(plane, ctx.subsampling_x, ctx.subsampling_y);
     let (dx, dy) = if pass == 0 {
@@ -412,15 +497,12 @@ pub fn loop_filter_edge(
     if !apply_filter || strength.lvl == 0 {
         return;
     }
-    let Some(plane_buf) = planes.get_mut(plane as usize) else {
-        return;
-    };
     // av1-spec p.309 line 17118-17122: walk i = 0..MI_SIZE-1 along
     // the edge (the boundary spans `MI_SIZE` samples for the 4×4
     // grid).
     for i in 0..(MI_SIZE as i32) {
         let sx = x_p + dy * i;
-        let sy = y_p + dx * i;
+        let sy = y_p - origin_y + dx * i;
         sample_filtering(
             plane_buf,
             sx,
@@ -938,6 +1020,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn threaded_deblock_axes_match_serial_across_formats() {
+        for bit_depth in [8u8, 10, 12] {
+            for (sub_x, sub_y) in [(0u8, 0u8), (1, 0), (1, 1)] {
+                let dims: Vec<(u32, u32)> = (0..3).map(|p| {
+                    if p == 0 { (152, 264) } else { (152 >> sub_x, 264 >> sub_y) }
+                }).collect();
+                let source: Vec<Vec<i32>> = dims.iter().map(|&(w, h)| {
+                    (0..w * h).map(|i| ((128 + ((i % w) / 8 + (i / w) / 8) % 3) as i32) << (bit_depth - 8)).collect()
+                }).collect();
+                let mut ctx = make_ctx(66, 38, [32, 32, 24, 24],
+                    &|_, _| true, &|_, _| false, &|_, _| INTRA_FRAME as u8,
+                    &|_, _| 0, &|_, _| 0, &|_, _, _| 0, &|_, _| false, &|_, _| 0,
+                    &|_, r, c| if (r / 2 + c / 2) % 3 == 0 { crate::cdf::TX_4X4 } else { crate::cdf::TX_16X16 },
+                    &|_, _| crate::cdf::BLOCK_16X16);
+                ctx.bit_depth = bit_depth;
+                ctx.subsampling_x = sub_x;
+                ctx.subsampling_y = sub_y;
+                let mut expected = source.clone();
+                {
+                    let mut dst: Vec<_> = expected.iter_mut().zip(&dims).map(|(samples, &(cols, rows))| PlaneBuffer { rows, cols, samples }).collect();
+                    loop_filter_frame(&ctx, &mut dst);
+                }
+                for workers in [2, 4, 10] {
+                    let mut actual = source.clone();
+                    {
+                        let mut dst: Vec<_> = actual.iter_mut().zip(&dims).map(|(samples, &(cols, rows))| PlaneBuffer { rows, cols, samples }).collect();
+                        loop_filter_frame_with_workers(&ctx, &mut dst, workers);
+                    }
+                    assert_eq!(actual, expected, "deblock {bit_depth}-bit {sub_x}:{sub_y}, {workers} workers");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn wide_filter_matches_direct_spec_taps() {
         for bit_depth in [8u8, 10, 12] {
             let mask = (1i32 << bit_depth) - 1;
@@ -979,16 +1096,16 @@ mod tests {
         mi_rows: u32,
         mi_cols: u32,
         loop_filter_level: [u8; 4],
-        is_intra: &'a dyn Fn(u32, u32) -> bool,
-        skip: &'a dyn Fn(u32, u32) -> bool,
-        ref_frame: &'a dyn Fn(u32, u32) -> u8,
-        mode: &'a dyn Fn(u32, u32) -> u8,
-        segment_id: &'a dyn Fn(u32, u32) -> u8,
-        delta_lf: &'a dyn Fn(u32, u32, usize) -> i8,
-        seg_feature_active: &'a dyn Fn(u32, usize) -> bool,
-        seg_feature_data: &'a dyn Fn(u32, usize) -> i16,
-        lf_tx_size: &'a dyn Fn(usize, u32, u32) -> usize,
-        mi_size: &'a dyn Fn(u32, u32) -> usize,
+        is_intra: &'a (dyn Fn(u32, u32) -> bool + Sync),
+        skip: &'a (dyn Fn(u32, u32) -> bool + Sync),
+        ref_frame: &'a (dyn Fn(u32, u32) -> u8 + Sync),
+        mode: &'a (dyn Fn(u32, u32) -> u8 + Sync),
+        segment_id: &'a (dyn Fn(u32, u32) -> u8 + Sync),
+        delta_lf: &'a (dyn Fn(u32, u32, usize) -> i8 + Sync),
+        seg_feature_active: &'a (dyn Fn(u32, usize) -> bool + Sync),
+        seg_feature_data: &'a (dyn Fn(u32, usize) -> i16 + Sync),
+        lf_tx_size: &'a (dyn Fn(usize, u32, u32) -> usize + Sync),
+        mi_size: &'a (dyn Fn(u32, u32) -> usize + Sync),
     ) -> LoopFilterFrameContext<'a> {
         LoopFilterFrameContext {
             loop_filter_level,
@@ -1244,10 +1361,10 @@ mod tests {
 
     #[test]
     fn driver_iterates_correct_edge_count_for_2x2_mi_grid() {
-        use std::cell::Cell;
-        let edges: Cell<u32> = Cell::new(0);
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let edges = AtomicU32::new(0);
         let ctr = |_r: u32, _c: u32| {
-            edges.set(edges.get() + 1);
+            edges.fetch_add(1, Ordering::Relaxed);
             false
         };
         let ctx = LoopFilterFrameContext {
@@ -1289,7 +1406,7 @@ mod tests {
         // (2 cells), so the `is_intra` predicate fires on the
         // remaining 2 + 2 = 4 cells.
         assert_eq!(
-            edges.get(),
+            edges.load(Ordering::Relaxed),
             4,
             "expected 4 on-screen edges across both passes"
         );

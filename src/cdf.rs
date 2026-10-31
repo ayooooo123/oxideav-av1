@@ -20725,7 +20725,22 @@ impl PartitionWalker {
         src_planes: &[crate::loop_filter::PlaneBuffer<'_>],
         dst_planes: &mut [crate::loop_filter::PlaneBuffer<'_>],
     ) {
-        use crate::cdef::{cdef_frame, CdefFrameContext};
+        self.cdef_frame_from_idx_with_workers(cdef_params, num_planes, bit_depth, subsampling_x, subsampling_y, src_planes, dst_planes, 1);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn cdef_frame_from_idx_with_workers(
+        &self,
+        cdef_params: &crate::uncompressed_header_tail::CdefParams,
+        num_planes: u8,
+        bit_depth: u8,
+        subsampling_x: u8,
+        subsampling_y: u8,
+        src_planes: &[crate::loop_filter::PlaneBuffer<'_>],
+        dst_planes: &mut [crate::loop_filter::PlaneBuffer<'_>],
+        workers: usize,
+    ) {
+        use crate::cdef::{cdef_frame_with_workers, CdefFrameContext};
         let mi_rows = self.mi_rows;
         let mi_cols = self.mi_cols;
         let skips = &self.skips;
@@ -20752,7 +20767,7 @@ impl PartitionWalker {
                 }
             },
         };
-        cdef_frame(&ctx, src_planes, dst_planes);
+        cdef_frame_with_workers(&ctx, src_planes, dst_planes, workers);
     }
 
     /// r429 — [`Self::cdef_frame_from_idx`] with the §5.11.56
@@ -20905,7 +20920,31 @@ impl PartitionWalker {
         mi_row_start: u32,
         mi_row_end: u32,
     ) {
-        use crate::loop_filter::{loop_filter_rows, LoopFilterFrameContext};
+        self.loop_filter_rows_from_grid_with_workers(
+            lf_params, seg_params, delta_lf_multi, num_planes, bit_depth,
+            subsampling_x, subsampling_y, frame_width, frame_height,
+            planes, mi_row_start, mi_row_end, 1,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn loop_filter_rows_from_grid_with_workers(
+        &self,
+        lf_params: &crate::uncompressed_header_tail::LoopFilterParams,
+        seg_params: &crate::uncompressed_header_tail::SegmentationParams,
+        delta_lf_multi: bool,
+        num_planes: u8,
+        bit_depth: u8,
+        subsampling_x: u8,
+        subsampling_y: u8,
+        frame_width: u32,
+        frame_height: u32,
+        planes: &mut [crate::loop_filter::PlaneBuffer<'_>],
+        mi_row_start: u32,
+        mi_row_end: u32,
+        workers: usize,
+    ) {
+        use crate::loop_filter::{loop_filter_frame_with_workers, loop_filter_rows, LoopFilterFrameContext};
         let ctx = LoopFilterFrameContext {
             loop_filter_level: lf_params.loop_filter_level,
             loop_filter_sharpness: lf_params.loop_filter_sharpness,
@@ -20983,7 +21022,11 @@ impl PartitionWalker {
             // §7.14.2 line 17065: `MiSizes[ row ][ col ]`.
             mi_size: &|r, c| self.mi_size_at(r as i32, c as i32),
         };
-        loop_filter_rows(&ctx, planes, mi_row_start, mi_row_end);
+        if workers > 1 && mi_row_start == 0 && mi_row_end >= self.mi_rows {
+            loop_filter_frame_with_workers(&ctx, planes, workers);
+        } else {
+            loop_filter_rows(&ctx, planes, mi_row_start, mi_row_end);
+        }
     }
 
     /// Reconstruct `LoopfilterTxSizes[ plane ][ subRow ][ subCol ]` from
@@ -21082,7 +21125,30 @@ impl PartitionWalker {
         cdef_planes: &[crate::loop_filter::PlaneBuffer<'_>],
         lr_planes: &mut [crate::loop_filter::PlaneBuffer<'_>],
     ) {
-        use crate::loop_restoration::{loop_restoration_frame, LoopRestorationFrameContext};
+        self.loop_restore_frame_from_grid_with_workers(
+            lr_params, num_planes, bit_depth, subsampling_x, subsampling_y,
+            mi_rows, mi_cols, frame_height, upscaled_width, curr_planes, cdef_planes, lr_planes, 1,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn loop_restore_frame_from_grid_with_workers(
+        &self,
+        lr_params: &crate::uncompressed_header_tail::LrParams,
+        num_planes: u8,
+        bit_depth: u8,
+        subsampling_x: u8,
+        subsampling_y: u8,
+        mi_rows: u32,
+        mi_cols: u32,
+        frame_height: u32,
+        upscaled_width: u32,
+        curr_planes: &[crate::loop_filter::PlaneBuffer<'_>],
+        cdef_planes: &[crate::loop_filter::PlaneBuffer<'_>],
+        lr_planes: &mut [crate::loop_filter::PlaneBuffer<'_>],
+        workers: usize,
+    ) {
+        use crate::loop_restoration::{loop_restoration_frame_with_workers, LoopRestorationFrameContext};
         let ctx = LoopRestorationFrameContext {
             mi_rows,
             mi_cols,
@@ -21120,7 +21186,7 @@ impl PartitionWalker {
                 self.lr_unit(plane as usize, unit_row, unit_col).sgr_xqd[i]
             },
         };
-        loop_restoration_frame(&ctx, curr_planes, cdef_planes, lr_planes);
+        loop_restoration_frame_with_workers(&ctx, curr_planes, cdef_planes, lr_planes, workers);
     }
 
     /// Helper to read `SkipModes[ r ][ c ]`. Returns `0` for

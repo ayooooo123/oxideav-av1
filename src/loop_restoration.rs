@@ -214,23 +214,23 @@ pub struct LoopRestorationFrameContext<'a> {
     pub lr_params: &'a LrParams,
     /// `LrType[plane][unitRow][unitCol]` per §5.11.58 — `RESTORE_NONE`
     /// / `RESTORE_WIENER` / `RESTORE_SGRPROJ`.
-    pub lr_type: &'a dyn Fn(u8, u32, u32) -> FrameRestorationType,
+    pub lr_type: &'a (dyn Fn(u8, u32, u32) -> FrameRestorationType + Sync),
     /// `LrWiener[plane][unitRow][unitCol][pass][i]` per §5.11.58 —
     /// `pass ∈ {0, 1}` selects vertical / horizontal coefficient sets;
     /// `i ∈ {0, 1, 2}` selects one of the three transmitted Wiener
     /// coefficients. Only consulted when the per-unit `LrType` is
     /// `RESTORE_WIENER`.
-    pub lr_wiener: &'a dyn Fn(u8, u32, u32, u8, usize) -> i32,
+    pub lr_wiener: &'a (dyn Fn(u8, u32, u32, u8, usize) -> i32 + Sync),
     /// `LrSgrSet[plane][unitRow][unitCol]` per §5.11.58 — index in
     /// `[0, 16)` into [`SGR_PARAMS`]. Only consulted when the per-unit
     /// `LrType` is `RESTORE_SGRPROJ`.
-    pub lr_sgr_set: &'a dyn Fn(u8, u32, u32) -> u8,
+    pub lr_sgr_set: &'a (dyn Fn(u8, u32, u32) -> u8 + Sync),
     /// `LrSgrXqd[plane][unitRow][unitCol][i]` per §5.11.58 —
     /// `i ∈ {0, 1}` selects one of the two transmitted self-guided
     /// projection weights (`w0` / `w1`); `w2` is derived as
     /// `(1 << SGRPROJ_PRJ_BITS) - w0 - w1`. Only consulted when the
     /// per-unit `LrType` is `RESTORE_SGRPROJ`.
-    pub lr_sgr_xqd: &'a dyn Fn(u8, u32, u32, usize) -> i32,
+    pub lr_sgr_xqd: &'a (dyn Fn(u8, u32, u32, usize) -> i32 + Sync),
 }
 
 impl std::fmt::Debug for LoopRestorationFrameContext<'_> {
@@ -303,6 +303,59 @@ pub fn loop_restoration_frame(
             loop_restore_rect(ctx, curr_planes, cdef_planes, lr_planes, plane, &geom);
         }
     }
+}
+
+pub(crate) fn loop_restoration_frame_with_workers(
+    ctx: &LoopRestorationFrameContext<'_>,
+    curr_planes: &[PlaneBuffer<'_>],
+    cdef_planes: &[PlaneBuffer<'_>],
+    lr_planes: &mut [PlaneBuffer<'_>],
+    workers: usize,
+) {
+    #[cfg(not(target_arch = "wasm32"))]
+    if workers > 1 && !lr_planes.is_empty() && lr_planes[0].rows >= 128 {
+        let rows = lr_planes[0].rows.div_ceil(workers as u32).div_ceil(64) * 64;
+        let bands = crate::loop_filter::split_row_bands(lr_planes, rows, ctx.subsampling_y);
+        let rectangles: Vec<_> = (0..ctx.num_planes).map(|plane| {
+            if ctx.lr_params.uses_lr && ctx.lr_params.frame_restoration_type[plane as usize] != FrameRestorationType::None {
+                stripe_unit_rects(ctx, plane)
+            } else {
+                Vec::new()
+            }
+        }).collect();
+        std::thread::scope(|scope| {
+            let rectangles = &rectangles;
+            for (b, mut band) in bands.into_iter().enumerate() {
+                scope.spawn(move || {
+                    for (p, dst) in band.iter_mut().enumerate().take(ctx.num_planes as usize) {
+                        let sub_y = if p == 0 { 0 } else { ctx.subsampling_y };
+                        let origin = (b as u32 * rows) >> sub_y;
+                        let src = &cdef_planes[p];
+                        let start = origin as usize * src.cols as usize;
+                        let len = dst.samples.len().min(src.samples.len().saturating_sub(start));
+                        dst.samples[..len].copy_from_slice(&src.samples[start..start + len]);
+                        if !ctx.lr_params.uses_lr || ctx.lr_params.frame_restoration_type[p] == FrameRestorationType::None {
+                            continue;
+                        }
+                        for &geom in &rectangles[p] {
+                            let mut geom = geom;
+                            let start = geom.y.max(origin);
+                            let end = (geom.y + geom.h).min(origin + dst.rows);
+                            if start >= end { continue; }
+                            // Aligned bands preserve the self-guided pass-0 row parity.
+                            debug_assert_eq!((start - geom.y) & 1, 0);
+                            geom.y = start;
+                            geom.h = end - start;
+                            loop_restore_rect_at(ctx, curr_planes, cdef_planes, dst, p as u8, &geom, origin);
+                        }
+                    }
+                });
+            }
+        });
+        return;
+    }
+    let _ = workers;
+    loop_restoration_frame(ctx, curr_planes, cdef_planes, lr_planes);
 }
 
 /// r464 — the (stripe, restoration-unit) rectangles of `plane`, each
@@ -385,16 +438,29 @@ pub fn loop_restore_rect(
     plane: u8,
     geom: &LrBlockGeometry,
 ) {
+    let Some(lr) = lr_planes.get_mut(plane as usize) else { return };
+    loop_restore_rect_at(ctx, curr_planes, cdef_planes, lr, plane, geom, 0);
+}
+
+fn loop_restore_rect_at(
+    ctx: &LoopRestorationFrameContext<'_>,
+    curr_planes: &[PlaneBuffer<'_>],
+    cdef_planes: &[PlaneBuffer<'_>],
+    lr: &mut PlaneBuffer<'_>,
+    plane: u8,
+    geom: &LrBlockGeometry,
+    origin_y: u32,
+) {
     if geom.w == 0 || geom.h == 0 {
         return;
     }
     let r_type = (ctx.lr_type)(plane, geom.unit_row, geom.unit_col);
     match r_type {
         FrameRestorationType::Wiener => {
-            wiener_filter(ctx, curr_planes, cdef_planes, lr_planes, plane, geom);
+            wiener_filter_at(ctx, curr_planes, cdef_planes, lr, plane, geom, origin_y);
         }
         FrameRestorationType::SgrProj => {
-            self_guided_filter(ctx, curr_planes, cdef_planes, lr_planes, plane, geom);
+            self_guided_filter_at(ctx, curr_planes, cdef_planes, lr, plane, geom, origin_y);
         }
         FrameRestorationType::None | FrameRestorationType::Switchable => {}
     }
@@ -584,6 +650,19 @@ pub fn self_guided_filter(
     plane: u8,
     geom: &LrBlockGeometry,
 ) {
+    let Some(lr) = lr_planes.get_mut(plane as usize) else { return };
+    self_guided_filter_at(ctx, curr_planes, cdef_planes, lr, plane, geom, 0);
+}
+
+fn self_guided_filter_at(
+    ctx: &LoopRestorationFrameContext<'_>,
+    curr_planes: &[PlaneBuffer<'_>],
+    cdef_planes: &[PlaneBuffer<'_>],
+    lr: &mut PlaneBuffer<'_>,
+    plane: u8,
+    geom: &LrBlockGeometry,
+    origin_y: u32,
+) {
     if geom.w == 0 || geom.h == 0 {
         return;
     }
@@ -623,9 +702,6 @@ pub fn self_guided_filter(
     // av1-spec p.330 lines 18258-18272: per-sample projection.
     let h = geom.h as usize;
     let w = geom.w as usize;
-    let Some(lr) = lr_planes.get_mut(plane as usize) else {
-        return;
-    };
     let lr_rows = lr.rows as i32;
     let lr_cols = lr.cols as i32;
     let lr_cols_usize = lr.cols as usize;
@@ -655,10 +731,11 @@ pub fn self_guided_filter(
                 r1,
                 ctx.bit_depth,
             );
-            if py < 0 || py >= lr_rows || px < 0 || px >= lr_cols {
+            let dst_y = py - origin_y as i32;
+            if dst_y < 0 || dst_y >= lr_rows || px < 0 || px >= lr_cols {
                 continue;
             }
-            lr.samples[(py as usize) * lr_cols_usize + px as usize] = out;
+            lr.samples[(dst_y as usize) * lr_cols_usize + px as usize] = out;
         }
     }
 }
@@ -910,6 +987,19 @@ pub fn wiener_filter(
     plane: u8,
     geom: &LrBlockGeometry,
 ) {
+    let Some(lr) = lr_planes.get_mut(plane as usize) else { return };
+    wiener_filter_at(ctx, curr_planes, cdef_planes, lr, plane, geom, 0);
+}
+
+fn wiener_filter_at(
+    ctx: &LoopRestorationFrameContext<'_>,
+    curr_planes: &[PlaneBuffer<'_>],
+    cdef_planes: &[PlaneBuffer<'_>],
+    lr: &mut PlaneBuffer<'_>,
+    plane: u8,
+    geom: &LrBlockGeometry,
+    origin_y: u32,
+) {
     let Some(curr) = curr_planes.get(plane as usize) else {
         return;
     };
@@ -964,16 +1054,15 @@ pub fn wiener_filter(
     // av1-spec p.334 lines 18476-18484: vertical pass writes
     // `LrFrame[plane][y + r][x + c]`.
     let max_sample = (1i32 << bit_depth) - 1;
-    let Some(lr) = lr_planes.get_mut(plane as usize) else {
-        return;
-    };
     let x0 = geom.x as usize;
     let width = w.min((lr.cols as usize).saturating_sub(x0));
     if width == 0 {
         return;
     }
     for r in 0..h {
-        let y = geom.y as usize + r;
+        let global_y = geom.y as usize + r;
+        if global_y < origin_y as usize { continue; }
+        let y = global_y - origin_y as usize;
         if y >= lr.rows as usize {
             continue;
         }
@@ -1211,6 +1300,50 @@ fn inter_round1(bit_depth: u8) -> u32 {
 mod tests {
     use super::*;
     use crate::uncompressed_header_tail::RESTORATION_TILESIZE_MAX;
+
+    #[test]
+    fn threaded_restoration_bands_match_serial_across_formats() {
+        for bit_depth in [8u8, 10, 12] {
+            for (sub_x, sub_y) in [(0u8, 0u8), (1, 0), (1, 1)] {
+                let dims: Vec<(u32, u32)> = (0..3).map(|p| {
+                    if p == 0 { (152, 264) } else { (152 >> sub_x, 264 >> sub_y) }
+                }).collect();
+                let mask = (1i32 << bit_depth) - 1;
+                let mut curr: Vec<Vec<i32>> = dims.iter().map(|&(w, h)| (0..w * h).map(|i| (i as i32 * 197 + 19) & mask).collect()).collect();
+                let mut cdef: Vec<Vec<i32>> = dims.iter().map(|&(w, h)| (0..w * h).map(|i| (i as i32 * 73 + 61) & mask).collect()).collect();
+                let curr: Vec<_> = curr.iter_mut().zip(&dims).map(|(samples, &(cols, rows))| PlaneBuffer { rows, cols, samples }).collect();
+                let cdef: Vec<_> = cdef.iter_mut().zip(&dims).map(|(samples, &(cols, rows))| PlaneBuffer { rows, cols, samples }).collect();
+                let mut params = make_lr_params(true, [64, 64 >> sub_y, 64 >> sub_y]);
+                params.frame_restoration_type = [FrameRestorationType::Switchable; 3];
+                let ctx = LoopRestorationFrameContext {
+                    mi_rows: 66, mi_cols: 38, num_planes: 3, bit_depth,
+                    subsampling_x: sub_x, subsampling_y: sub_y, frame_height: 259,
+                    upscaled_width: 149, lr_params: &params,
+                    lr_type: &|p, r, c| match (u32::from(p) + r + c) % 3 {
+                        0 => FrameRestorationType::Wiener,
+                        1 => FrameRestorationType::SgrProj,
+                        _ => FrameRestorationType::None,
+                    },
+                    lr_wiener: &|_, _, _, pass, i| if pass == 0 { [1, -3, 9][i] } else { [3, -7, 15][i] },
+                    lr_sgr_set: &|p, r, c| ((u32::from(p) + r + c) % 16) as u8,
+                    lr_sgr_xqd: &|_, _, _, i| [-16, 48][i],
+                };
+                let mut expected: Vec<Vec<i32>> = dims.iter().map(|&(w, h)| vec![0; (w * h) as usize]).collect();
+                {
+                    let mut dst: Vec<_> = expected.iter_mut().zip(&dims).map(|(samples, &(cols, rows))| PlaneBuffer { rows, cols, samples }).collect();
+                    loop_restoration_frame(&ctx, &curr, &cdef, &mut dst);
+                }
+                for workers in [2, 4, 10] {
+                    let mut actual: Vec<Vec<i32>> = dims.iter().map(|&(w, h)| vec![0; (w * h) as usize]).collect();
+                    {
+                        let mut dst: Vec<_> = actual.iter_mut().zip(&dims).map(|(samples, &(cols, rows))| PlaneBuffer { rows, cols, samples }).collect();
+                        loop_restoration_frame_with_workers(&ctx, &curr, &cdef, &mut dst, workers);
+                    }
+                    assert_eq!(actual, expected, "restoration {bit_depth}-bit {sub_x}:{sub_y}, {workers} workers");
+                }
+            }
+        }
+    }
 
     fn make_lr_params(uses_lr: bool, sizes: [u32; 3]) -> LrParams {
         LrParams {

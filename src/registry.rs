@@ -211,6 +211,10 @@ impl Decoder for Av1Decoder {
         &self.codec_id
     }
 
+    fn set_execution_context(&mut self, ctx: &ExecutionContext) {
+        self.session.set_execution_context(ctx);
+    }
+
     fn send_packet(&mut self, packet: &Packet) -> CoreResult<()> {
         let mut push = |frames: Vec<SpecFrame>| {
             for frame in &frames {

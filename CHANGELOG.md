@@ -20,6 +20,11 @@ All notable changes to `oxideav-av1` are recorded here.
   filtering and all constrain/clipping arithmetic remain exact.
 - Wide deblocking uses one gathered tap window and exact prefix sums instead of
   refetching overlapping taps; its output staging uses a fixed stack array.
+- Decoder post-filters honor the caller's `ExecutionContext`: vertical deblock,
+  CDEF and restoration use disjoint superblock-row bands with joins between
+  stages. Horizontal deblock preserves each plane's ordered row dependencies
+  and only runs independent planes concurrently. WebAssembly remains serial;
+  filter-context callbacks are `Sync` so shared metadata is thread-safe.
 
 ### Added
 

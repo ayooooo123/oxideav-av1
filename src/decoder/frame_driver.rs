@@ -299,7 +299,7 @@ fn decode_frame_spec_full(
         .as_ref()
         .ok_or(Error::PartitionWalkOutOfRange)?;
     let tiles = parse_whole_frame_tile_group(ti, tile_group_body, false)?;
-    decode_frame_spec_tiles(seq, fh, &tiles, refs)
+    decode_frame_spec_tiles(seq, fh, &tiles, refs, &oxideav_core::ExecutionContext::serial())
 }
 
 /// The frame decode proper, over already-parsed per-tile §8.2
@@ -312,6 +312,7 @@ fn decode_frame_spec_tiles(
     fh: &FrameHeader,
     tiles: &[TilePayload],
     refs: Option<&SpecRefState>,
+    exec: &oxideav_core::ExecutionContext,
 ) -> Result<DecodedFrameInternal, Error> {
     if fh.show_existing_frame {
         // §7.21 output-existing path is the caller's (no tile group).
@@ -479,6 +480,7 @@ fn decode_frame_spec_tiles(
 
     let mi_rows = fs.mi_rows;
     let mi_cols = fs.mi_cols;
+    let workers = exec.effective_workers(mi_rows.div_ceil(16) as usize);
     let mut walker = PartitionWalker::new(
         mi_rows,
         mi_cols,
@@ -850,7 +852,7 @@ fn decode_frame_spec_tiles(
                     samples: buf,
                 });
             }
-            walker.loop_filter_frame_from_grid(
+            walker.loop_filter_rows_from_grid_with_workers(
                 lf,
                 sp,
                 dlf.delta_lf_multi,
@@ -861,6 +863,9 @@ fn decode_frame_spec_tiles(
                 fs.frame_width,
                 fs.frame_height,
                 &mut bufs,
+                0,
+                mi_rows,
+                workers,
             );
         }
     }
@@ -901,7 +906,7 @@ fn decode_frame_spec_tiles(
                     samples: buf,
                 });
             }
-            walker.cdef_frame_from_idx(
+            walker.cdef_frame_from_idx_with_workers(
                 cdef,
                 cc.num_planes,
                 cc.bit_depth,
@@ -909,6 +914,7 @@ fn decode_frame_spec_tiles(
                 sub_y as u8,
                 &src,
                 &mut dst,
+                workers,
             );
         }
     }
@@ -1007,7 +1013,7 @@ fn decode_frame_spec_tiles(
                 samples: buf,
             });
         }
-        walker.loop_restore_frame_from_grid(
+        walker.loop_restore_frame_from_grid_with_workers(
             lr,
             cc.num_planes,
             cc.bit_depth,
@@ -1020,6 +1026,7 @@ fn decode_frame_spec_tiles(
             &curr,
             &cdef_bufs,
             &mut lr_out,
+            workers,
         );
     }
 
@@ -1338,6 +1345,7 @@ pub struct SpecDecodeSession {
     /// every parsed frame header before frame-sized storage is
     /// reserved. Defaults to [`MAX_PICTURE_SIZE`].
     max_picture_size: u32,
+    exec: oxideav_core::ExecutionContext,
 }
 
 impl Default for SpecDecodeSession {
@@ -1356,7 +1364,13 @@ impl SpecDecodeSession {
             chosen_op: 0,
             op_idc: 0,
             max_picture_size: MAX_PICTURE_SIZE,
+            exec: oxideav_core::ExecutionContext::serial(),
         }
+    }
+
+    /// Set the caller-granted budget for dependency-separated post-filter stages.
+    pub fn set_execution_context(&mut self, exec: &oxideav_core::ExecutionContext) {
+        self.exec = exec.clone();
     }
 
     /// r452 — lower (or raise) the picture-size ceiling
@@ -1462,6 +1476,7 @@ impl SpecDecodeSession {
             self.chosen_op,
             &mut self.op_idc,
             self.max_picture_size,
+            &self.exec,
         )?;
         Ok(out)
     }
@@ -1683,6 +1698,7 @@ fn decode_temporal_unit_spec(
     chosen_op: u8,
     op_idc: &mut u16,
     max_picture_size: u32,
+    exec: &oxideav_core::ExecutionContext,
 ) -> Result<(), Error> {
     // §5.9.1 `SeenFrameHeader` state: `Some` between a frame's
     // `OBU_FRAME_HEADER` and the tile group whose `tg_end ==
@@ -1855,7 +1871,7 @@ fn decode_temporal_unit_spec(
                 // `tg_end == NumTiles - 1`.
                 if parsed.tg_end + 1 == num_tiles {
                     let pf = pending.take().expect("pending frame checked above");
-                    let decoded = decode_frame_spec_tiles(s, &pf.fh, &pf.tiles, Some(refs))?;
+                    let decoded = decode_frame_spec_tiles(s, &pf.fh, &pf.tiles, Some(refs), exec)?;
                     let frame = reference_frame_update(refs, &pf.fh, decoded)?;
                     if pf.fh.show_frame {
                         out.push(frame);
@@ -1885,7 +1901,7 @@ fn decode_temporal_unit_spec(
                     .as_ref()
                     .ok_or(Error::PartitionWalkOutOfRange)?;
                 let tiles = parse_whole_frame_tile_group(ti, tg_body, true)?;
-                let decoded = decode_frame_spec_tiles(s, &fh, &tiles, Some(refs))?;
+                let decoded = decode_frame_spec_tiles(s, &fh, &tiles, Some(refs), exec)?;
                 let frame = reference_frame_update(refs, &fh, decoded)?;
                 if fh.show_frame {
                     out.push(frame);
