@@ -1009,6 +1009,68 @@ pub fn block_inter_prediction(
         interp_filter_x as usize
     };
 
+    let is_unscaled = step_x == (1 << SCALE_SUBPEL_BITS) && step_y == (1 << SCALE_SUBPEL_BITS);
+    let phase_x = ((start_x >> (SCALE_SUBPEL_BITS - SUBPEL_BITS)) as u32 & SUBPEL_MASK) as usize;
+    let y_frac_mask = (1i32 << SCALE_SUBPEL_BITS) - 1;
+    let phase_y = (((start_y & y_frac_mask) >> (SCALE_SUBPEL_BITS - SUBPEL_BITS)) as u32 & SUBPEL_MASK) as usize;
+    if is_unscaled && phase_y == 0 {
+        let x_int = start_x >> SCALE_SUBPEL_BITS;
+        let y_int = start_y >> SCALE_SUBPEL_BITS;
+        let round0 = 1i32 << (inter_round0 - 1);
+        let round1 = 1i32 << (inter_round1 - 1);
+        let finish = |row: &mut [i32]| {
+            for value in row {
+                *value = (128 * *value + round1) >> inter_round1;
+            }
+        };
+        if phase_x == 0 {
+            let inside_x = x_int >= 0 && x_int as usize + w <= plane_w;
+            for r in 0..h {
+                let ry = clip3_i32(0, last_y, y_int + r as i32) as usize;
+                let base = ry * ref_stride;
+                let dst = &mut pred[r * w..(r + 1) * w];
+                if inside_x {
+                    let start = base + x_int as usize;
+                    for (out, &sample) in dst.iter_mut().zip(&ref_plane[start..start + w]) {
+                        let horizontal = (128 * i32::from(sample) + round0) >> inter_round0;
+                        *out = (128 * horizontal + round1) >> inter_round1;
+                    }
+                } else {
+                    for (c, out) in dst.iter_mut().enumerate() {
+                        let x = clip3_i32(0, last_x, x_int + c as i32) as usize;
+                        let horizontal = (128 * i32::from(ref_plane[base + x]) + round0) >> inter_round0;
+                        *out = (128 * horizontal + round1) >> inter_round1;
+                    }
+                }
+            }
+        } else {
+            let coeffs = &SUBPEL_FILTERS[h_filter][phase_x];
+            let min_x = x_int - 3;
+            if min_x >= 0 && x_int + w as i32 + 3 <= last_x {
+                for r in 0..h {
+                    let ry = clip3_i32(0, last_y, y_int + r as i32) as usize;
+                    let start = ry * ref_stride + min_x as usize;
+                    let dst = &mut pred[r * w..(r + 1) * w];
+                    filter_8tap_h(&ref_plane[start..start + w + 7], coeffs, inter_round0, dst, w);
+                    finish(dst);
+                }
+            } else {
+                let mut edge = [0u16; 256 + 7];
+                for r in 0..h {
+                    let ry = clip3_i32(0, last_y, y_int + r as i32) as usize;
+                    let base = ry * ref_stride;
+                    for (c, sample) in edge[..w + 7].iter_mut().enumerate() {
+                        *sample = ref_plane[base + clip3_i32(0, last_x, min_x + c as i32) as usize];
+                    }
+                    let dst = &mut pred[r * w..(r + 1) * w];
+                    filter_8tap_h(&edge[..w + 7], coeffs, inter_round0, dst, w);
+                    finish(dst);
+                }
+            }
+        }
+        return Ok(());
+    }
+
     // §7.11.3.4 vertical filter small-block remap (lines 14626-14632).
     let v_filter = if h <= 4 {
         select_interp_filter_small_block(interp_filter_y) as usize
@@ -1024,11 +1086,7 @@ pub fn block_inter_prediction(
         }
         let intermediate = &mut buf[..needed];
 
-        let is_unscaled = step_x == (1 << SCALE_SUBPEL_BITS) && step_y == (1 << SCALE_SUBPEL_BITS);
         if is_unscaled {
-            let phase_x = ((start_x >> (SCALE_SUBPEL_BITS - SUBPEL_BITS)) as u32 & SUBPEL_MASK) as usize;
-            let y_frac_mask: i32 = (1i32 << SCALE_SUBPEL_BITS) - 1;
-            let phase_y = (((start_y & y_frac_mask) >> (SCALE_SUBPEL_BITS - SUBPEL_BITS)) as u32 & SUBPEL_MASK) as usize;
             let coeffs_h = &SUBPEL_FILTERS[h_filter][phase_x];
             let coeffs_v = &SUBPEL_FILTERS[v_filter][phase_y];
 
@@ -1079,17 +1137,9 @@ pub fn block_inter_prediction(
                 }
             }
 
-            if phase_y == 0 {
-                let round_offset = 1i32 << (inter_round1 - 1);
-                let src = &intermediate[3 * w..(h + 3) * w];
-                for (dst, &src) in pred[..h * w].iter_mut().zip(src) {
-                    *dst = (128 * src + round_offset) >> inter_round1;
-                }
-            } else {
-                for r in 0..h {
-                    let dst_row = &mut pred[r * w..(r + 1) * w];
-                    filter_8tap_v(intermediate, w, r, coeffs_v, inter_round1, dst_row);
-                }
+            for r in 0..h {
+                let dst_row = &mut pred[r * w..(r + 1) * w];
+                filter_8tap_v(intermediate, w, r, coeffs_v, inter_round1, dst_row);
             }
         } else {
             let y_base = (start_y >> SCALE_SUBPEL_BITS) - 3;
@@ -8325,48 +8375,50 @@ mod tests {
             for &(x, y) in &[(-13, -7), (0, 0), (5, 6), (34, 26), (50, 39)] {
                 for filter in 0..6usize {
                     for phase in 0..16usize {
-                        let start_x = x * 1024 + phase as i32 * 64;
-                        let start_y = y * 1024 + (15 - phase) as i32 * 64;
-                        let hf = if w <= 4 {
-                            select_interp_filter_small_block(filter as u8) as usize
-                        } else {
-                            filter
-                        };
-                        let vf = if h <= 4 {
-                            select_interp_filter_small_block(filter as u8) as usize
-                        } else {
-                            filter
-                        };
-                        let mut intermediate = vec![0i32; (h + 7) * w];
-                        for r in 0..h + 7 {
-                            let ry = (y + r as i32 - 3).clamp(0, rows as i32 - 1) as usize;
-                            for c in 0..w {
-                                let sum: i64 = (0..8).map(|t| {
-                                    let rx = (x + c as i32 + t as i32 - 3)
-                                        .clamp(0, stride as i32 - 1) as usize;
-                                    i64::from(src[ry * stride + rx])
-                                        * i64::from(SUBPEL_FILTERS[hf][phase][t])
-                                }).sum();
-                                intermediate[r * w + c] = round2(sum, 3) as i32;
+                        for phase_y in [0, 15 - phase] {
+                            let start_x = x * 1024 + phase as i32 * 64 + 32;
+                            let start_y = y * 1024 + phase_y as i32 * 64 + 32;
+                            let hf = if w <= 4 {
+                                select_interp_filter_small_block(filter as u8) as usize
+                            } else {
+                                filter
+                            };
+                            let vf = if h <= 4 {
+                                select_interp_filter_small_block(filter as u8) as usize
+                            } else {
+                                filter
+                            };
+                            let mut intermediate = vec![0i32; (h + 7) * w];
+                            for r in 0..h + 7 {
+                                let ry = (y + r as i32 - 3).clamp(0, rows as i32 - 1) as usize;
+                                for c in 0..w {
+                                    let sum: i64 = (0..8).map(|t| {
+                                        let rx = (x + c as i32 + t as i32 - 3)
+                                            .clamp(0, stride as i32 - 1) as usize;
+                                        i64::from(src[ry * stride + rx])
+                                            * i64::from(SUBPEL_FILTERS[hf][phase][t])
+                                    }).sum();
+                                    intermediate[r * w + c] = round2(sum, 3) as i32;
+                                }
                             }
-                        }
-                        let mut expected = vec![0i32; h * w];
-                        for r in 0..h {
-                            for c in 0..w {
-                                let sum: i64 = (0..8).map(|t| {
-                                    i64::from(intermediate[(r + t) * w + c])
-                                        * i64::from(SUBPEL_FILTERS[vf][15 - phase][t])
-                                }).sum();
-                                expected[r * w + c] = round2(sum, 7) as i32;
+                            let mut expected = vec![0i32; h * w];
+                            for r in 0..h {
+                                for c in 0..w {
+                                    let sum: i64 = (0..8).map(|t| {
+                                        i64::from(intermediate[(r + t) * w + c])
+                                            * i64::from(SUBPEL_FILTERS[vf][phase_y][t])
+                                    }).sum();
+                                    expected[r * w + c] = round2(sum, 7) as i32;
+                                }
                             }
+                            let mut actual = vec![0i32; h * w];
+                            block_inter_prediction(
+                                0, 0, 0, &src, stride, stride as u32, rows as u32,
+                                start_x, start_y, 1024, 1024, w, h,
+                                filter as u8, filter as u8, 3, 7, &mut actual,
+                            ).unwrap();
+                            assert_eq!(actual, expected, "{w}x{h} ({x},{y}) filter {filter} phase {phase}:{phase_y}");
                         }
-                        let mut actual = vec![0i32; h * w];
-                        block_inter_prediction(
-                            0, 0, 0, &src, stride, stride as u32, rows as u32,
-                            start_x, start_y, 1024, 1024, w, h,
-                            filter as u8, filter as u8, 3, 7, &mut actual,
-                        ).unwrap();
-                        assert_eq!(actual, expected, "{w}x{h} ({x},{y}) filter {filter} phase {phase}");
                     }
                 }
             }

@@ -29,6 +29,9 @@ All notable changes to `oxideav-av1` are recorded here.
   in safe Rust; rotation products and every rounding/clamping step remain exact.
 - Interior residual merges operate on contiguous rows, retaining saturating i64
   addition, all flip orientations, and the existing out-of-frame overhang path.
+- Vertically integer-phase inter prediction writes horizontal-filtered rows
+  directly to prediction output, preserving both rounds without TLS scratch
+  access or unused halo-row convolution.
 
 ### Added
 
