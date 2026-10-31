@@ -595,66 +595,20 @@ thread_local! {
 }
 
 #[cfg(target_arch = "aarch64")]
-#[inline]
-unsafe fn filter_8tap_h_neon(
-    src: &[u16],
-    coeffs: &[i32; 8],
-    inter_round0: u32,
-    dst: &mut [i32],
-    w: usize,
-) {
-    use core::arch::aarch64::*;
-    let c0 = coeffs[0] as i16;
-    let c1 = coeffs[1] as i16;
-    let c2 = coeffs[2] as i16;
-    let c3 = coeffs[3] as i16;
-    let c4 = coeffs[4] as i16;
-    let c5 = coeffs[5] as i16;
-    let c6 = coeffs[6] as i16;
-    let c7 = coeffs[7] as i16;
+mod neon;
 
-    let round_offset = vdupq_n_s32(1i32 << (inter_round0 - 1));
-    let shift_vec = vdupq_n_s32(-(inter_round0 as i32));
+pub(crate) fn pack_prediction_samples(src: &[i32], dst: &mut [u16]) {
+    #[cfg(target_arch = "aarch64")]
+    neon::pack(src, dst);
+    #[cfg(not(target_arch = "aarch64"))]
+    for (dst, &src) in dst.iter_mut().zip(src) { *dst = src as u16; }
+}
 
-    let mut c = 0;
-    while c + 4 <= w {
-        let ptr = src.as_ptr().add(c);
-        let s0 = vreinterpret_s16_u16(vld1_u16(ptr));
-        let s1 = vreinterpret_s16_u16(vld1_u16(ptr.add(1)));
-        let s2 = vreinterpret_s16_u16(vld1_u16(ptr.add(2)));
-        let s3 = vreinterpret_s16_u16(vld1_u16(ptr.add(3)));
-        let s4 = vreinterpret_s16_u16(vld1_u16(ptr.add(4)));
-        let s5 = vreinterpret_s16_u16(vld1_u16(ptr.add(5)));
-        let s6 = vreinterpret_s16_u16(vld1_u16(ptr.add(6)));
-        let s7 = vreinterpret_s16_u16(vld1_u16(ptr.add(7)));
-
-        let mut acc = vmull_n_s16(s0, c0);
-        acc = vmlal_n_s16(acc, s1, c1);
-        acc = vmlal_n_s16(acc, s2, c2);
-        acc = vmlal_n_s16(acc, s3, c3);
-        acc = vmlal_n_s16(acc, s4, c4);
-        acc = vmlal_n_s16(acc, s5, c5);
-        acc = vmlal_n_s16(acc, s6, c6);
-        acc = vmlal_n_s16(acc, s7, c7);
-
-        acc = vaddq_s32(acc, round_offset);
-        acc = vshlq_s32(acc, shift_vec);
-
-        vst1q_s32(dst.as_mut_ptr().add(c), acc);
-        c += 4;
-    }
-    while c < w {
-        let s = coeffs[0] * (src[c] as i32)
-            + coeffs[1] * (src[c + 1] as i32)
-            + coeffs[2] * (src[c + 2] as i32)
-            + coeffs[3] * (src[c + 3] as i32)
-            + coeffs[4] * (src[c + 4] as i32)
-            + coeffs[5] * (src[c + 5] as i32)
-            + coeffs[6] * (src[c + 6] as i32)
-            + coeffs[7] * (src[c + 7] as i32);
-        dst[c] = (s + (1i32 << (inter_round0 - 1))) >> inter_round0;
-        c += 1;
-    }
+pub(crate) fn unpack_prediction_samples(src: &[u16], dst: &mut [i32]) {
+    #[cfg(target_arch = "aarch64")]
+    neon::unpack(src, dst);
+    #[cfg(not(target_arch = "aarch64"))]
+    for (dst, &src) in dst.iter_mut().zip(src) { *dst = i32::from(src); }
 }
 
 #[allow(dead_code)]
@@ -697,84 +651,11 @@ fn filter_8tap_h(
     w: usize,
 ) {
     #[cfg(target_arch = "aarch64")]
-    unsafe {
-        filter_8tap_h_neon(src, coeffs, inter_round0, dst, w);
-    }
+    neon::horizontal(src, coeffs, inter_round0, dst, w);
     #[cfg(not(target_arch = "aarch64"))]
     filter_8tap_h_scalar(src, coeffs, inter_round0, dst, w);
 }
 
-#[cfg(target_arch = "aarch64")]
-#[inline]
-unsafe fn filter_8tap_v_neon(
-    intermediate: &[i32],
-    w: usize,
-    r: usize,
-    coeffs: &[i32; 8],
-    inter_round1: u32,
-    dst_row: &mut [i32],
-) {
-    use core::arch::aarch64::*;
-    let c0 = coeffs[0];
-    let c1 = coeffs[1];
-    let c2 = coeffs[2];
-    let c3 = coeffs[3];
-    let c4 = coeffs[4];
-    let c5 = coeffs[5];
-    let c6 = coeffs[6];
-    let c7 = coeffs[7];
-
-    let p0 = intermediate.as_ptr().add(r * w);
-    let p1 = intermediate.as_ptr().add((r + 1) * w);
-    let p2 = intermediate.as_ptr().add((r + 2) * w);
-    let p3 = intermediate.as_ptr().add((r + 3) * w);
-    let p4 = intermediate.as_ptr().add((r + 4) * w);
-    let p5 = intermediate.as_ptr().add((r + 5) * w);
-    let p6 = intermediate.as_ptr().add((r + 6) * w);
-    let p7 = intermediate.as_ptr().add((r + 7) * w);
-
-    let round_offset = vdupq_n_s32(1i32 << (inter_round1 - 1));
-    let shift_vec = vdupq_n_s32(-(inter_round1 as i32));
-
-    let mut c = 0;
-    while c + 4 <= w {
-        let v0 = vld1q_s32(p0.add(c));
-        let v1 = vld1q_s32(p1.add(c));
-        let v2 = vld1q_s32(p2.add(c));
-        let v3 = vld1q_s32(p3.add(c));
-        let v4 = vld1q_s32(p4.add(c));
-        let v5 = vld1q_s32(p5.add(c));
-        let v6 = vld1q_s32(p6.add(c));
-        let v7 = vld1q_s32(p7.add(c));
-
-        let mut acc = vmulq_n_s32(v0, c0);
-        acc = vmlaq_n_s32(acc, v1, c1);
-        acc = vmlaq_n_s32(acc, v2, c2);
-        acc = vmlaq_n_s32(acc, v3, c3);
-        acc = vmlaq_n_s32(acc, v4, c4);
-        acc = vmlaq_n_s32(acc, v5, c5);
-        acc = vmlaq_n_s32(acc, v6, c6);
-        acc = vmlaq_n_s32(acc, v7, c7);
-
-        acc = vaddq_s32(acc, round_offset);
-        acc = vshlq_s32(acc, shift_vec);
-
-        vst1q_s32(dst_row.as_mut_ptr().add(c), acc);
-        c += 4;
-    }
-    while c < w {
-        let s = c0 * *p0.add(c)
-            + c1 * *p1.add(c)
-            + c2 * *p2.add(c)
-            + c3 * *p3.add(c)
-            + c4 * *p4.add(c)
-            + c5 * *p5.add(c)
-            + c6 * *p6.add(c)
-            + c7 * *p7.add(c);
-        dst_row[c] = (s + (1i32 << (inter_round1 - 1))) >> inter_round1;
-        c += 1;
-    }
-}
 
 #[allow(dead_code)]
 #[inline]
@@ -828,37 +709,11 @@ fn filter_8tap_v(
     dst_row: &mut [i32],
 ) {
     #[cfg(target_arch = "aarch64")]
-    unsafe {
-        filter_8tap_v_neon(intermediate, w, r, coeffs, inter_round1, dst_row);
-    }
+    neon::vertical(intermediate, w, r, coeffs, inter_round1, dst_row);
     #[cfg(not(target_arch = "aarch64"))]
     filter_8tap_v_scalar(intermediate, w, r, coeffs, inter_round1, dst_row);
 }
 
-#[cfg(target_arch = "aarch64")]
-#[inline]
-unsafe fn clip1_single_ref_neon(bit_depth: u8, pred: &[i32], out: &mut [u16]) {
-    use core::arch::aarch64::*;
-    let max_val = (1i32 << bit_depth) - 1;
-    let zero = vdupq_n_s32(0);
-    let max_v = vdupq_n_s32(max_val);
-    let mut i = 0;
-    while i + 8 <= pred.len() {
-        let v0 = vld1q_s32(pred.as_ptr().add(i));
-        let v1 = vld1q_s32(pred.as_ptr().add(i + 4));
-        let c0 = vminq_s32(vmaxq_s32(v0, zero), max_v);
-        let c1 = vminq_s32(vmaxq_s32(v1, zero), max_v);
-        let n0 = vqmovun_s32(c0);
-        let n1 = vqmovun_s32(c1);
-        let combined = vcombine_u16(n0, n1);
-        vst1q_u16(out.as_mut_ptr().add(i), combined);
-        i += 8;
-    }
-    while i < pred.len() {
-        out[i] = clip3_i32(0, max_val, pred[i]) as u16;
-        i += 1;
-    }
-}
 
 /// §7.11.3.4 (av1-spec p.261-265): the translational 8-tap horizontal
 /// + vertical convolution kernel.
@@ -1199,9 +1054,7 @@ pub fn clip1_single_ref(bit_depth: u8, pred: &[i32], out: &mut [u16]) -> Result<
         return Err(crate::Error::PartitionWalkOutOfRange);
     }
     #[cfg(target_arch = "aarch64")]
-    unsafe {
-        clip1_single_ref_neon(bit_depth, pred, out);
-    }
+    neon::clip(bit_depth, pred, out);
     #[cfg(not(target_arch = "aarch64"))]
     {
         let max = (1i32 << bit_depth) - 1;
@@ -1711,6 +1564,10 @@ fn predict_inter_compound_blend(
             //   CurrFrame[plane][y+i][x+j] =
             //       Clip1(Round2(preds[0][i][j] + preds[1][i][j],
             //                    1 + InterPostRound))
+            #[cfg(target_arch = "aarch64")]
+            neon::average(bit_depth, 1 + inter_post_round, &pred0[..w * h], &pred1[..w * h], pred_out);
+            #[cfg(not(target_arch = "aarch64"))]
+            {
             let max: i32 = (1i32 << bit_depth) - 1;
             let shift: u32 = 1 + inter_post_round;
             for i in 0..h {
@@ -1719,6 +1576,7 @@ fn predict_inter_compound_blend(
                     let rounded = round2(acc, shift) as i32;
                     pred_out[i * w + j] = clip3_i32(0, max, rounded) as u16;
                 }
+            }
             }
             Ok(())
         }

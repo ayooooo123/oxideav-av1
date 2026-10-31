@@ -6,6 +6,10 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Changed
 
+- AArch64 motion compensation processes eight horizontal/vertical outputs per
+  NEON iteration and combines average compounds without wide scalar loops.
+  Dedicated checked SIMD helpers also narrow/widen the inter-leaf bridge;
+  all interpolation phases, bit depths, and scalar odd-width tails stay exact.
 - AArch64 CDEF uses explicit NEON for interior four/eight-sample filters and
   eight-direction projection sums, with exact 8/10/12-bit arithmetic. Frame
   edges and other architectures retain the scalar specification path;

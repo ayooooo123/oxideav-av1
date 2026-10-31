@@ -19470,9 +19470,7 @@ impl PartitionWalker {
                 let start = y * r.stride + r.x0;
                 let src_row = &cp.samples[start..start + r.w];
                 let dst_row = &mut scratch[start..start + r.w];
-                for (dst, &src) in dst_row.iter_mut().zip(src_row.iter()) {
-                    *dst = src as u16;
-                }
+                crate::inter_pred::pack_prediction_samples(src_row, dst_row);
             }
         }
 
@@ -19583,9 +19581,7 @@ impl PartitionWalker {
                 let start = y * r.stride + r.x0;
                 let src_row = &scratch[start..start + r.w];
                 let dst_row = &mut cp.samples[start..start + r.w];
-                for (dst, &src) in dst_row.iter_mut().zip(src_row.iter()) {
-                    *dst = src as i32;
-                }
+                crate::inter_pred::unpack_prediction_samples(src_row, dst_row);
             }
         }
         Ok(())
