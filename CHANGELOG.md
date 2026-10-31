@@ -6,6 +6,11 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Changed
 
+- AArch64 CDEF uses explicit NEON for interior four/eight-sample filters and
+  eight-direction projection sums, with exact 8/10/12-bit arithmetic. Frame
+  edges and other architectures retain the scalar specification path;
+  differential tests cover full-depth random samples, extrema, every strength
+  and direction, both widths, odd heights, and damping-shift boundaries.
 - Unscaled inter prediction gathers the clamped border once per source row,
   then uses the same contiguous eight-tap kernel as interior blocks; vertical
   border clipping no longer forces an otherwise interior row to scalar taps.

@@ -56,6 +56,9 @@ use crate::cdf::{MI_SIZE, MI_SIZE_LOG2};
 use crate::loop_filter::PlaneBuffer;
 use crate::uncompressed_header_tail::CdefParams;
 
+#[cfg(target_arch = "aarch64")]
+mod neon;
+
 // =====================================================================
 // §7.15 constant lookup tables — av1-spec p.320-324.
 // =====================================================================
@@ -471,6 +474,16 @@ pub fn cdef_direction(
     r: u32,
     c: u32,
 ) -> (i32, i32) {
+    cdef_direction_impl(ctx, src_planes, r, c, cfg!(target_arch = "aarch64"))
+}
+
+fn cdef_direction_impl(
+    ctx: &CdefFrameContext<'_>,
+    src_planes: &[PlaneBuffer<'_>],
+    r: u32,
+    c: u32,
+    simd: bool,
+) -> (i32, i32) {
     let Some(plane0) = src_planes.first() else {
         return (0, 0);
     };
@@ -484,7 +497,12 @@ pub fn cdef_direction(
     // av1-spec p.321 lines 17756-17768: per-pixel projection-sum
     // accumulator across the 8×8 luma block.
     let in_bounds = x0 >= 0 && x0 + 8 <= plane0.cols as i32 && y0 >= 0 && y0 + 8 <= plane0.rows as i32;
-    if in_bounds {
+    #[cfg(target_arch = "aarch64")]
+    if in_bounds && simd {
+        partial = neon::partial(plane0.samples, y0 as usize * plane0.cols as usize + x0 as usize,
+            plane0.cols as usize, shift);
+    }
+    if in_bounds && !simd {
         let stride = plane0.cols as usize;
         let x0 = x0 as usize;
         let y0 = y0 as usize;
@@ -508,7 +526,7 @@ pub fn cdef_direction(
                 partial[3][3 + i - j] += pair;
             }
         }
-    } else {
+    } else if !in_bounds {
         for i in 0..8i32 {
             for j in 0..8i32 {
                 let sx = (x0 + j).clamp(0, plane0.cols as i32 - 1) as usize;
@@ -715,6 +733,20 @@ fn cdef_filter_block_at(
             }
         }
 
+        #[cfg(target_arch = "aarch64")]
+        {
+            let base = y0 * src_cols + x0;
+            let target = &mut dst.samples[(y0 - dst_y0) * dst_cols + x0..];
+            if w == 8 {
+                neon::filter::<8>(src.samples, base, src_cols, target, dst_cols, h,
+                    &pri_offs, &sec_offs, pri_str, sec_str, pri_adj, sec_adj);
+            } else {
+                neon::filter::<4>(src.samples, base, src_cols, target, dst_cols, h,
+                    &pri_offs, &sec_offs, pri_str, sec_str, pri_adj, sec_adj);
+            }
+        }
+
+        #[cfg(not(target_arch = "aarch64"))]
         for i in 0..h {
             let py = y0 + i;
             let src_row_base = py * src_cols + x0;
@@ -777,6 +809,7 @@ fn cdef_filter_block_at(
     }
 }
 
+#[cfg_attr(all(target_arch = "aarch64", not(test)), allow(dead_code))]
 #[inline]
 #[allow(clippy::too_many_arguments)]
 fn cdef_interior_row<const W: usize>(
