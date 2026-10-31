@@ -54,6 +54,8 @@ use oxideav_core::{
 
 use crate::codec_config::Av1CodecConfig;
 use crate::decoder::{SpecDecodeSession, SpecFrame};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::decoder::frame_driver::frame_threads::FrameThreadDecoder;
 use crate::encoder::{
     encode_key_frame_yuv_with_options, encode_still_yuv, quality_to_base_q_idx, ChromaFormat,
     StillOptions, StillSpeed, YuvFrame, DEFAULT_STILL_BASE_Q_IDX,
@@ -124,6 +126,10 @@ pub fn make_decoder(params: &CodecParameters) -> CoreResult<Box<dyn Decoder>> {
         queue: std::collections::VecDeque::new(),
         last_output: None,
         eof: false,
+        #[cfg(not(target_arch = "wasm32"))]
+        parallel: None,
+        #[cfg(not(target_arch = "wasm32"))]
+        pending_error: None,
     }))
 }
 
@@ -154,6 +160,10 @@ struct Av1Decoder {
     /// The [`Layout`] of the frame `receive_frame` last returned.
     last_output: Option<Layout>,
     eof: bool,
+    #[cfg(not(target_arch = "wasm32"))]
+    parallel: Option<FrameThreadDecoder>,
+    #[cfg(not(target_arch = "wasm32"))]
+    pending_error: Option<CoreError>,
 }
 
 /// The visible size and pixel layout of a decoded frame.
@@ -187,8 +197,26 @@ impl Av1Decoder {
     /// The [`Layout`] `output_*` report: the frame last returned, or before
     /// the first one the next queued frame.
     fn reported_layout(&self) -> Option<Layout> {
-        self.last_output
-            .or_else(|| self.queue.front().map(|(_, layout)| *layout))
+        let layout = self.last_output
+            .or_else(|| self.queue.front().map(|(_, layout)| *layout));
+        #[cfg(not(target_arch = "wasm32"))]
+        if layout.is_none() {
+            if let Some((w, h, depth, mono, sub_x, sub_y)) = self.parallel.as_ref().and_then(FrameThreadDecoder::next_frame_layout) {
+                use PixelFormat::*;
+                let family = if mono {
+                    [Gray8, Gray10Le, Gray12Le]
+                } else if sub_y && h.div_ceil(2) != h {
+                    [Yuv420P, Yuv420P10Le, Yuv420P12Le]
+                } else if sub_x && w.div_ceil(2) != w {
+                    [Yuv422P, Yuv422P10Le, Yuv422P12Le]
+                } else {
+                    [Yuv444P, Yuv444P10Le, Yuv444P12Le]
+                };
+                let format = match depth { 8 => Some(family[0]), 10 => Some(family[1]), 12 => Some(family[2]), _ => None };
+                return Some(((w, h), format));
+            }
+        }
+        layout
     }
 }
 
@@ -212,10 +240,39 @@ impl Decoder for Av1Decoder {
     }
 
     fn set_execution_context(&mut self, ctx: &ExecutionContext) {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if ctx.threads > 1 {
+                if let Some(parallel) = self.parallel.as_mut() {
+                    parallel.set_execution_context(ctx);
+                } else {
+                    self.parallel = Some(FrameThreadDecoder::new(&self.session, ctx));
+                }
+            } else if let Some(parallel) = self.parallel.take() {
+                match parallel.finish_into_session() {
+                    Ok((session, frames)) => {
+                        self.session = session;
+                        self.queue.extend(frames.into_iter().map(|(frame, pts)| {
+                            (spec_frame_to_video_frame(&frame, pts), frame_layout(&frame))
+                        }));
+                    }
+                    Err(error) => self.pending_error = Some(CoreError::invalid(format!("oxideav-av1: {error}"))),
+                }
+            }
+        }
         self.session.set_execution_context(ctx);
     }
 
     fn send_packet(&mut self, packet: &Packet) -> CoreResult<()> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if let Some(error) = self.pending_error.take() { return Err(error); }
+            if let Some(parallel) = self.parallel.as_mut() {
+                self.eof = false;
+                return parallel.send_packet(&packet.data, packet.pts)
+                    .map_err(|error| CoreError::invalid(format!("oxideav-av1: {error}")));
+            }
+        }
         let mut push = |frames: Vec<SpecFrame>| {
             for frame in &frames {
                 self.queue.push_back((
@@ -254,6 +311,23 @@ impl Decoder for Av1Decoder {
     }
 
     fn receive_frame(&mut self) -> CoreResult<CoreFrame> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if let Some(error) = self.pending_error.take() { return Err(error); }
+            if self.queue.is_empty() {
+                if let Some(parallel) = self.parallel.as_mut() {
+                    return match parallel.receive_frame()
+                        .map_err(|error| CoreError::invalid(format!("oxideav-av1: {error}")))? {
+                        Some((frame, pts)) => {
+                            self.last_output = Some(frame_layout(&frame));
+                            Ok(CoreFrame::Video(spec_frame_to_video_frame(&frame, pts)))
+                        }
+                        None if self.eof => Err(CoreError::Eof),
+                        None => Err(CoreError::NeedMore),
+                    };
+                }
+            }
+        }
         match self.queue.pop_front() {
             Some((vf, layout)) => {
                 self.last_output = Some(layout);
@@ -280,6 +354,13 @@ impl Decoder for Av1Decoder {
     }
 
     fn flush(&mut self) -> CoreResult<()> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if let Some(error) = self.pending_error.take() { return Err(error); }
+            if let Some(parallel) = self.parallel.as_mut() {
+                parallel.flush().map_err(|error| CoreError::invalid(format!("oxideav-av1: {error}")))?;
+            }
+        }
         self.eof = true;
         Ok(())
     }
@@ -293,6 +374,11 @@ impl Decoder for Av1Decoder {
         self.last_output = None;
         self.session.reset_references();
         self.eof = false;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.pending_error = None;
+            if let Some(parallel) = self.parallel.as_mut() { parallel.reset(); }
+        }
         Ok(())
     }
 }

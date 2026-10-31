@@ -34,6 +34,14 @@ All notable changes to `oxideav-av1` are recorded here.
   access or unused halo-row convolution.
 - Motion-field projection hoists reference distances, validity and exact
   projection multipliers out of the per-cell/per-destination loops.
+- Native registry decoding can overlap complete frames under the caller's
+  `ExecutionContext`. An ordered header coordinator builds a bounded lookahead;
+  jobs wait for completed, immutable versions of their named references,
+  primary-reference CDF/segmentation state and motion-field sources. Hidden
+  frames refresh references without display output, and show-existing outputs
+  retain their referenced version and the originating packet timestamp.
+  Frame workers share the budget with the existing row-parallel post-filters;
+  serial callers and WebAssembly retain the previous decode path.
 
 ### Added
 

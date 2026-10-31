@@ -58,6 +58,11 @@ use crate::Error;
 use crate::{PlaneRefSpec, RefFrameStoreEntry};
 use std::sync::Arc;
 
+#[cfg(not(target_arch = "wasm32"))]
+#[doc(hidden)]
+#[path = "frame_threads.rs"]
+pub mod frame_threads;
+
 /// One frame decoded by the spec-faithful driver. Planes are surfaced
 /// at their §5.9.8 cropped extents (`FrameWidth` × `FrameHeight` for
 /// luma, the §5.5.2 subsampled extent for chroma), row-major, 8-bit.
