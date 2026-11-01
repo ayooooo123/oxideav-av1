@@ -286,8 +286,18 @@ impl<'a> SymbolDecoder<'a> {
     /// never reused — we honour that by feeding a fresh local array
     /// each call, so any adaptation that does happen is discarded.
     pub fn read_bool(&mut self) -> Result<u32, Error> {
-        let mut cdf: [u16; 3] = [1 << 14, 1 << 15, 0];
-        self.read_symbol(&mut cdf)
+        let threshold = ((self.range >> 8) * ((1 << 14) >> EC_PROB_SHIFT))
+            >> (7 - EC_PROB_SHIFT);
+        let threshold = threshold + EC_MIN_PROB;
+        let symbol = u32::from(self.value < threshold);
+        if symbol == 0 {
+            self.range -= threshold;
+            self.value -= threshold;
+        } else {
+            self.range = threshold;
+        }
+        self.renormalize()?;
+        Ok(symbol)
     }
 
     /// `read_literal( n )` — §8.2.5.
@@ -485,18 +495,16 @@ pub(crate) fn update_cdf(cdf: &mut [u16], symbol: u32, n: u32) {
     let count = u32::from(cdf[n as usize]);
     let rate = 3 + u32::from(count > 15) + u32::from(count > 31) + core::cmp::min(floor_log2(n), 2);
 
-    let mut tmp: u32 = 0;
-    for i in 0..(n - 1) {
-        if i == symbol {
-            tmp = 1 << 15;
-        }
-        let c = u32::from(cdf[i as usize]);
-        let updated = if tmp < c {
-            c - ((c - tmp) >> rate)
-        } else {
-            c + ((tmp - c) >> rate)
-        };
-        cdf[i as usize] = updated as u16;
+    let adapting = &mut cdf[..n as usize - 1];
+    let split = (symbol as usize).min(adapting.len());
+    let (below, above) = adapting.split_at_mut(split);
+    for c in below {
+        let value = u32::from(*c);
+        *c = (value - (value >> rate)) as u16;
+    }
+    for c in above {
+        let value = u32::from(*c);
+        *c = (value + (((1 << 15) - value) >> rate)) as u16;
     }
     // cdf[N] += (cdf[N] < 32)
     if count < 32 {
@@ -515,6 +523,50 @@ pub(crate) fn update_cdf_for_encoder(cdf: &mut [u16], symbol: u32, n: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn boolean_fast_path_matches_symbol_state_and_padding() {
+        for seed in 0..=255u8 {
+            let bytes = [seed, seed.wrapping_mul(17), !seed, seed.rotate_left(3)];
+            for disable in [false, true] {
+                let mut fast = SymbolDecoder::init_symbol(&bytes, bytes.len(), disable).unwrap();
+                let mut scalar = SymbolDecoder::init_symbol(&bytes, bytes.len(), disable).unwrap();
+                for _ in 0..128 {
+                    let mut cdf = [1 << 14, 1 << 15, 0];
+                    assert_eq!(fast.read_bool(), scalar.read_symbol(&mut cdf));
+                    assert_eq!((fast.value, fast.range, fast.max_bits, fast.position()),
+                        (scalar.value, scalar.range, scalar.max_bits, scalar.position()));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn split_cdf_update_matches_spec_loop() {
+        for n in 1..=16u32 {
+            for symbol in 0..n {
+                for count in 0..=32u16 {
+                    let mut expected: Vec<u16> = (1..=n).map(|i| ((i * 32768) / n) as u16).collect();
+                    expected.push(count);
+                    let mut actual = expected.clone();
+                    let rate = 3 + u32::from(count > 15) + u32::from(count > 31) + floor_log2(n).min(2);
+                    let mut tmp = 0u32;
+                    for i in 0..n - 1 {
+                        if i == symbol { tmp = 32768; }
+                        let c = u32::from(expected[i as usize]);
+                        expected[i as usize] = if tmp < c {
+                            (c - ((c - tmp) >> rate)) as u16
+                        } else {
+                            (c + ((tmp - c) >> rate)) as u16
+                        };
+                    }
+                    expected[n as usize] = (count + 1).min(32);
+                    update_cdf(&mut actual, symbol, n);
+                    assert_eq!(actual, expected);
+                }
+            }
+        }
+    }
 
     /// §8.2.2 byte-exact initialisation over a full 15-bit window.
     ///

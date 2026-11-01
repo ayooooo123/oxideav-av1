@@ -67,6 +67,16 @@ impl<'a> BitReader<'a> {
     /// (`x = 0` and the body is skipped).
     pub(crate) fn f(&mut self, n: u32) -> Result<u64, Error> {
         debug_assert!(n <= 64);
+        if n == 0 {
+            return Ok(0);
+        }
+        let byte = self.pos >> 3;
+        if n <= 24 && self.bytes.len().saturating_sub(byte) >= 4 {
+            let word = u32::from_be_bytes(self.bytes[byte..byte + 4].try_into().unwrap());
+            let value = (word << (self.pos & 7)) >> (32 - n);
+            self.pos += n as usize;
+            return Ok(u64::from(value));
+        }
         let mut x: u64 = 0;
         for _ in 0..n {
             x = (x << 1) | u64::from(self.read_bit()?);
@@ -154,6 +164,29 @@ impl<'a> BitReader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn word_reads_match_bit_reads_at_every_alignment_and_tail() {
+        let bytes = [0xAC, 0x53, 0x01, 0xFE, 0x81, 0x42, 0x19, 0xE7, 0x33];
+        for len in 0..=bytes.len() {
+            for pos in 0..=len * 8 {
+                for n in 0..=64 {
+                    let mut fast = BitReader::new(&bytes[..len]);
+                    fast.pos = pos;
+                    let mut scalar = fast;
+                    let mut expected = Ok(0u64);
+                    for _ in 0..n {
+                        match scalar.read_bit() {
+                            Ok(bit) => expected = expected.map(|v| (v << 1) | u64::from(bit)),
+                            Err(e) => { expected = Err(e); break; }
+                        }
+                    }
+                    assert_eq!(fast.f(n), expected, "len={len} pos={pos} n={n}");
+                    assert_eq!(fast.position(), scalar.position());
+                }
+            }
+        }
+    }
 
     #[test]
     fn f1_walks_bits_msb_first() {

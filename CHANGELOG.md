@@ -6,6 +6,10 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Changed
 
+- Read short bit fields through a bounded big-endian word load, specialize
+  equiprobable arithmetic bits, and split CDF adaptation at the decoded symbol.
+  Exhaustive bit-position/tail checks and arithmetic-state differential tests
+  preserve the existing error and padding semantics.
 - WebAssembly SIMD128 adds exact CDEF filters/directional projections, eight-tap
   interpolation, clipped prediction/compound averages, motion-field destination
   projection, symmetric Wiener restoration, and four-lane inverse DCT/ADST/
