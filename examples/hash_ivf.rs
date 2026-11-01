@@ -46,6 +46,11 @@ fn main() {
     let input = std::fs::read(file).unwrap();
     let params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
     let mut decoder = make_decoder(&params).unwrap();
+    if let Some(threads) = std::env::args().nth(2) {
+        let threads = threads.parse::<usize>().expect("positive decoder thread count");
+        assert!(threads > 0, "decoder thread count must be positive");
+        decoder.set_execution_context(&oxideav_core::ExecutionContext::with_threads(threads));
+    }
     for record in IvfReader::new(&input).unwrap().read_all().unwrap() {
         decoder
             .send_packet(&Packet::new(0, TimeBase::new(1, 30), record.payload))

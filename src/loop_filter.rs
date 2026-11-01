@@ -399,6 +399,10 @@ pub(crate) fn loop_filter_frame_with_workers<P: Pixel>(
     workers: usize,
 ) {
     #[cfg(not(target_arch = "wasm32"))]
+    let lease = crate::decoder::frame_driver::worker_budget::borrow(workers);
+    #[cfg(not(target_arch = "wasm32"))]
+    let workers = lease.workers();
+    #[cfg(not(target_arch = "wasm32"))]
     if workers > 1 && !planes.is_empty() && planes[0].rows >= 128 {
         let num_planes = usize::from(ctx.num_planes).min(planes.len());
         let planes = &mut planes[..num_planes];

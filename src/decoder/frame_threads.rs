@@ -118,6 +118,7 @@ pub struct FrameThreadDecoder {
     running: Vec<Running>,
     sender: mpsc::Sender<usize>,
     receiver: mpsc::Receiver<usize>,
+    budget: Arc<super::worker_budget::Budget>,
     next_id: usize,
     draining: bool,
     input_blocked: bool,
@@ -128,6 +129,7 @@ pub struct FrameThreadDecoder {
 impl FrameThreadDecoder {
     pub fn new(session: &SpecDecodeSession, exec: &oxideav_core::ExecutionContext) -> Self {
         let (sender, receiver) = mpsc::channel();
+        let budget = super::worker_budget::Budget::new(exec.effective_workers(usize::MAX), sender.clone());
         let mut seeded: Vec<(Arc<SpecRefSlot>, Version)> = Vec::new();
         let cc = session.seq.as_ref().map(|s| &s.color_config);
         let slots = core::array::from_fn(|i| {
@@ -153,6 +155,7 @@ impl FrameThreadDecoder {
             inputs: VecDeque::new(), pending: VecDeque::new(), ordered: VecDeque::new(),
             running: Vec::new(), sender, receiver, next_id: 0, draining: false,
             input_blocked: false,
+            budget,
             failure: None, peaks: FrameThreadStats::default(),
         };
         decoder.record_peaks();
@@ -229,6 +232,7 @@ impl FrameThreadDecoder {
         // must not overlap them with newly granted workers.
         self.join_all();
         self.exec = ctx.clone();
+        self.budget = super::worker_budget::Budget::new(ctx.effective_workers(usize::MAX), self.sender.clone());
     }
 
     pub fn finish_into_session(mut self) -> Result<(SpecDecodeSession, Vec<(Arc<SpecFrame>, Option<i64>)>), Error> {
@@ -320,6 +324,7 @@ impl FrameThreadDecoder {
                 }
             }
             if !ready { index += 1; continue; }
+            let Some(frame_lease) = self.budget.try_frame() else { break; };
             let job = self.pending.remove(index).expect("indexed queued job");
             let id = job.id;
             let version = job.version.clone();
@@ -327,13 +332,16 @@ impl FrameThreadDecoder {
             let seq = job.seq.clone();
             let bytes = job_bytes(&job);
             let sender = self.sender.clone();
-            let grant = self.exec.effective_workers(usize::MAX) / self.active_limit();
-            let exec = oxideav_core::ExecutionContext::with_threads(grant.max(1));
+            let exec = self.exec.clone();
+            let budget = self.budget.clone();
             let destination = version.clone();
             let run = move || {
-                let result = catch_unwind(AssertUnwindSafe(|| run_job(job, &exec)))
+                let result = catch_unwind(AssertUnwindSafe(|| {
+                    super::worker_budget::within(budget, || run_job(job, &exec))
+                }))
                     .unwrap_or(Err(Error::PartitionWalkOutOfRange));
                 let _ = destination.result.set(result.map(Arc::new));
+                drop(frame_lease);
                 let _ = sender.send(id);
             };
             #[cfg(target_arch = "wasm32")]

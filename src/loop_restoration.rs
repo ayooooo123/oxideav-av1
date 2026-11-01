@@ -315,6 +315,10 @@ pub(crate) fn loop_restoration_frame_with_workers<P: Pixel>(
     workers: usize,
 ) {
     #[cfg(not(target_arch = "wasm32"))]
+    let lease = crate::decoder::frame_driver::worker_budget::borrow(workers);
+    #[cfg(not(target_arch = "wasm32"))]
+    let workers = lease.workers();
+    #[cfg(not(target_arch = "wasm32"))]
     if workers > 1 && !lr_planes.is_empty() && lr_planes[0].rows >= 128 {
         let rows = lr_planes[0].rows.div_ceil(workers as u32).div_ceil(64) * 64;
         let bands = crate::loop_filter::split_row_bands(lr_planes, rows, ctx.subsampling_y);

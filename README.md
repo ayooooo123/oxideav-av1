@@ -53,6 +53,13 @@ The JSON records contain each picture's full-plane byte count and hash in
 display order. Matroska inputs can be remuxed to IVF with `ffmpeg -c copy`;
 no pixel conversion or re-encoding is needed.
 
+Native frame workers share one bounded worker grant with independent deblock,
+CDEF and restoration bands. Idle frame capacity is borrowed only for the duration
+of a filter pass, then returned with a channel notification so ready frames can
+start without polling. `hash_ivf input.ivf N` selects a native thread budget for
+per-picture comparisons; omitting `N` retains the single-threaded hash path.
+
+
 
 ## Status
 

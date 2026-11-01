@@ -253,6 +253,10 @@ pub(crate) fn cdef_frame_with_workers<P: Pixel>(
     workers: usize,
 ) {
     #[cfg(not(target_arch = "wasm32"))]
+    let lease = crate::decoder::frame_driver::worker_budget::borrow(workers);
+    #[cfg(not(target_arch = "wasm32"))]
+    let workers = lease.workers();
+    #[cfg(not(target_arch = "wasm32"))]
     if workers > 1 && !dst_planes.is_empty() && dst_planes[0].rows >= 128 {
         let rows = dst_planes[0].rows.div_ceil(workers as u32).div_ceil(64) * 64;
         let bands = crate::loop_filter::split_row_bands(dst_planes, rows, ctx.subsampling_y);

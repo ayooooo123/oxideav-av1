@@ -6,6 +6,9 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Changed
 
+- Lend idle frame-worker capacity to independent deblock/CDEF/restoration bands.
+  Ready frames and filter helpers share one atomic permit budget; permit returns
+  notify the coordinator through its existing completion channel, without sleeps.
 - Collapse bounded DC-only two-dimensional DCTs to their exact row/column
   rounding and clamp sequence, avoiding empty butterflies and transposes.
   Differential tests cover every transform size at 8/10/12-bit precision.

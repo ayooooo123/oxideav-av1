@@ -62,6 +62,9 @@ use std::sync::Arc;
 #[doc(hidden)]
 #[path = "frame_threads.rs"]
 pub mod frame_threads;
+#[cfg(not(target_arch = "wasm32"))]
+#[path = "worker_budget.rs"]
+pub(crate) mod worker_budget;
 
 /// One frame decoded by the spec-faithful driver. Planes are surfaced
 /// at their §5.9.8 cropped extents (`FrameWidth` × `FrameHeight` for
