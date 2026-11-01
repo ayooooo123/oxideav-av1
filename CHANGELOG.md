@@ -6,6 +6,8 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Changed
 
+- Reject non-transform and skipped interior deblock edges before querying their
+  neighboring transform, segmentation, delta and strength state.
 - Lend idle frame-worker capacity to independent deblock/CDEF/restoration bands.
   Ready frames and filter helpers share one atomic permit budget; permit returns
   notify the coordinator through its existing completion channel, without sleeps.

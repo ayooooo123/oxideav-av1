@@ -522,9 +522,16 @@ fn loop_filter_edge_at<P: Pixel>(
     if row >= ctx.mi_rows || col >= ctx.mi_cols {
         return;
     }
-    // av1-spec p.308 line 17065-17075.
-    let mi_size = (ctx.mi_size)(row, col);
     let tx_sz = (ctx.lf_tx_size)(plane as usize, row >> sub_y, col >> sub_x);
+    let is_tx_edge = if pass == 0 {
+        (x_p as u32) % crate::cdf::TX_WIDTH[tx_sz].max(1) as u32 == 0
+    } else {
+        (y_p as u32) % crate::cdf::TX_HEIGHT[tx_sz].max(1) as u32 == 0
+    };
+    if !is_tx_edge {
+        return;
+    }
+    let mi_size = (ctx.mi_size)(row, col);
     // §7.14.2 line 17069: `planeSize = get_plane_residual_size( MiSize,
     // plane )`. On chroma planes the subsampled block size drives the
     // `isBlockEdge` modulus — e.g. a BLOCK_32X8 luma leaf's 4:2:0
@@ -537,25 +544,16 @@ fn loop_filter_edge_at<P: Pixel>(
         crate::cdf::get_plane_residual_size(mi_size, plane, sub_x, sub_y).unwrap_or(mi_size);
     let skip = (ctx.skip)(row, col);
     let is_intra = (ctx.is_intra)(row, col);
-    let prev_tx_sz = (ctx.lf_tx_size)(plane as usize, prev_row >> sub_y, prev_col >> sub_x);
     // av1-spec p.308 line 17079-17084: isBlockEdge.
     let is_block_edge = if pass == 0 {
         (x_p as u32) % block_width(plane_size).max(1) == 0
     } else {
         (y_p as u32) % block_height(plane_size).max(1) == 0
     };
-    // av1-spec p.308 line 17088-17099: isTxEdge.
-    let is_tx_edge = if pass == 0 {
-        (x_p as u32) % crate::cdf::TX_WIDTH[tx_sz].max(1) as u32 == 0
-    } else {
-        (y_p as u32) % crate::cdf::TX_HEIGHT[tx_sz].max(1) as u32 == 0
-    };
-    // av1-spec p.309 line 17101-17107: applyFilter.
-    let apply_filter = if !is_tx_edge {
-        false
-    } else {
-        is_block_edge || !skip || is_intra
-    };
+    if !is_block_edge && skip && !is_intra {
+        return;
+    }
+    let prev_tx_sz = (ctx.lf_tx_size)(plane as usize, prev_row >> sub_y, prev_col >> sub_x);
     // §7.14.3 filter size derivation.
     let filter_size = filter_size(tx_sz, prev_tx_sz, pass, plane);
     // §7.14.4 adaptive filter strength on the current side.
@@ -565,7 +563,7 @@ fn loop_filter_edge_at<P: Pixel>(
         // current-side lvl == 0.
         strength = adaptive_filter_strength(ctx, prev_row, prev_col, plane, pass);
     }
-    if !apply_filter || strength.lvl == 0 {
+    if strength.lvl == 0 {
         return;
     }
     // av1-spec p.309 line 17118-17122: walk i = 0..MI_SIZE-1 along
