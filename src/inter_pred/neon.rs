@@ -149,11 +149,54 @@ pub(super) fn average<P: Pixel>(depth: u8, shift: u32, a: &[i32], b: &[i32], dst
     }
 }
 
+#[inline(always)]
+pub(super) fn project_destinations(mv: [i32; 2], multipliers: &[i32; 8]) -> [[i16; 2]; 8] {
+    let mut out = [[0; 2]; 8];
+    // SAFETY: each multiplier load covers four of the eight entries; each
+    // interleaved store covers four two-component outputs. Wrapping products,
+    // signed rounding and the 15-bit clamp match the scalar projection.
+    unsafe {
+        for first in [0, 4] {
+            let multiplier = vld1q_s32(multipliers.as_ptr().add(first));
+            let components = mv.map(|value| {
+                let product = vmulq_n_s32(multiplier, value);
+                let magnitude = vshrq_n_s32::<14>(vaddq_s32(vabsq_s32(product), vdupq_n_s32(8192)));
+                let signed = vbslq_s32(vcltq_s32(product, vdupq_n_s32(0)), vnegq_s32(magnitude), magnitude);
+                vmovn_s32(vminq_s32(vdupq_n_s32(16383), vmaxq_s32(vdupq_n_s32(-16383), signed)))
+            });
+            let pairs = vzip_s16(components[0], components[1]);
+            vst1q_s16(out.as_mut_ptr().add(first).cast(), vcombine_s16(pairs.0, pairs.1));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::inter_pred::{filter_8tap_h_scalar, filter_8tap_v_scalar, SUBPEL_FILTERS};
     fn next(s: &mut u32) -> u32 { *s ^= *s << 13; *s ^= *s >> 17; *s ^= *s << 5; *s }
+    #[test]
+    fn destination_projection_matches_scalar_wrapping_and_rounding() {
+        let mut state = 0x71a49a31;
+        for case in 0..4096 {
+            let mv = if case < 7 {
+                let value = [-32768, -4095, -1, 0, 1, 4095, 32767][case];
+                [value, -value]
+            } else { [next(&mut state) as i16 as i32, next(&mut state) as i16 as i32] };
+            let multipliers = core::array::from_fn(|_| next(&mut state) as i32);
+            let actual = project_destinations(mv, &multipliers);
+            for (dst, &multiplier) in multipliers.iter().enumerate() {
+                let expected = mv.map(|value| {
+                    let product = value.wrapping_mul(multiplier);
+                    let magnitude = product.wrapping_abs().wrapping_add(8192) >> 14;
+                    let signed = if product < 0 { magnitude.wrapping_neg() } else { magnitude };
+                    signed.clamp(-16383, 16383) as i16
+                });
+                assert_eq!(actual[dst], expected, "case={case} dst={dst}");
+            }
+        }
+    }
     #[test]
     fn filters_match_scalar_all_phases_depths_and_widths() {
         let mut state = 0x9e3ac5b1;

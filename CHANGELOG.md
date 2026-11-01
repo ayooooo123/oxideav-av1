@@ -6,6 +6,9 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Changed
 
+- Project motion-field destination references in four-lane NEON batches,
+  preserving scalar wrapping products, signed rounding and clipped MV pairs.
+  Differential tests include full-range products and rounding boundaries.
 - Decode independent intra tiles on bounded tile-sized walkers, stitching pixels,
   metadata and frame-addressed restoration units as each tile finishes. A
   rendezvous channel bounds completed-tile retention; inter/intrabc walks retain

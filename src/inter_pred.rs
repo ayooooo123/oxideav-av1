@@ -7981,16 +7981,18 @@ pub fn motion_field_estimation_core(
                 if !(vy && vx) {
                     continue;
                 }
+                #[cfg(target_arch = "aarch64")]
+                let projected = neon::project_destinations(mv, &destination_multiplier[source_ref]);
                 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
                 let projected = wasm::project_destinations(mv, &destination_multiplier[source_ref]);
                 for (dst, &multiplier) in destination_multiplier[source_ref]
                     .iter().enumerate().take(ALTREF_FRAME + 1).skip(LAST_FRAME)
                 {
-                    #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
+                    #[cfg(not(any(target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128"))))]
                     let out = project_motion_vector(mv, multiplier);
-                    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+                    #[cfg(any(target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128")))]
                     let out = projected[dst];
-                    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+                    #[cfg(any(target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128")))]
                     let _ = multiplier;
                     mfmvs.set(
                         dst,
