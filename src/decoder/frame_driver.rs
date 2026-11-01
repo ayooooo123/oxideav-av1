@@ -865,7 +865,78 @@ fn decode_frame_spec_tiles_native<P: FramePixel, R: FramePixel>(
     // frame-end state (unless `disable_frame_end_update_cdf`, which
     // keeps the frame-start state).
     let mut end_cdfs: Option<Box<TileCdfContext>> = None;
+    #[cfg(not(target_arch = "wasm32"))]
+    let tile_parallel = if workers > 1 && tiles.len() > 1 && fh.frame_is_intra && !fh.allow_intrabc {
+        let lease = worker_budget::borrow(workers.min(tiles.len()));
+        let count = lease.workers();
+        if count > 1 {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            let next = AtomicUsize::new(0);
+            let decode_one = |tile_num: usize| -> Result<(PartitionWalker<P, R>, Box<TileCdfContext>), Error> {
+                let row = tile_num / ti.tile_cols as usize;
+                let col = tile_num % ti.tile_cols as usize;
+                let (r0, r1) = (ti.mi_row_starts[row], ti.mi_row_starts[row + 1]);
+                let (c0, c1) = (ti.mi_col_starts[col], ti.mi_col_starts[col + 1]);
+                let geometry = TileGeometry {
+                    mi_row_start: 0, mi_row_end: r1 - r0,
+                    mi_col_start: 0, mi_col_end: c1 - c0,
+                };
+                let mut local = PartitionWalker::<P, R>::new(r1 - r0, c1 - c0, geometry)
+                    .ok_or(Error::PartitionWalkOutOfRange)?;
+                local.set_lr_origin(r0, c0);
+                local.begin_tile(geometry);
+                local.set_current_q_index(i32::from(qp.base_q_idx));
+                let tile = &tiles[tile_num];
+                let mut decoder = SymbolDecoder::init_symbol(&tile.bytes, tile.bytes.len(), fh.disable_cdf_update)?;
+                let mut cdfs = Box::new(frame_start_cdfs.as_ref().clone());
+                local.decode_tile_syntax_with_lr(&mut decoder, &mut cdfs, &params,
+                    if lr.uses_lr { Some(&lr_walk) } else { None }, None, &quant, dq.delta_q_present)?;
+                Ok((local, cdfs))
+            };
+            let mut failure = None;
+            std::thread::scope(|scope| {
+                let (sender, receiver) = std::sync::mpsc::sync_channel(0);
+                for _ in 0..count {
+                    let sender = sender.clone();
+                    let next = &next;
+                    let decode_one = &decode_one;
+                    scope.spawn(move || loop {
+                        let tile_num = next.fetch_add(1, Ordering::Relaxed);
+                        if tile_num >= tiles.len() { break; }
+                        if sender.send((tile_num, decode_one(tile_num))).is_err() { break; }
+                    });
+                }
+                drop(sender);
+                for (tile_num, result) in receiver {
+                    match result {
+                        Ok((local, cdfs)) => {
+                            let row = tile_num / ti.tile_cols as usize;
+                            let col = tile_num % ti.tile_cols as usize;
+                            let (r0, r1) = (ti.mi_row_starts[row], ti.mi_row_starts[row + 1]);
+                            let (c0, c1) = (ti.mi_col_starts[col], ti.mi_col_starts[col + 1]);
+                            walker.import_rect_from(&local, 0, 0, r0, c0, r1 - r0, c1 - c0, sub_x_u8, sub_y_u8);
+                            walker.import_curr_frame_rect_from(&local, r0, c0, sub_x_u8, sub_y_u8);
+                            if lr.uses_lr { walker.import_lr_units_from(&local, r0, r1, c0, c1, &lr_walk); }
+                            if !fh.disable_frame_end_update_cdf && tile_num as u32 == ti.context_update_tile_id {
+                                end_cdfs = Some(cdfs);
+                            }
+                        }
+                        Err(error) => {
+                            if failure.as_ref().map_or(true, |&(first, _)| tile_num < first) {
+                                failure = Some((tile_num, error));
+                            }
+                        }
+                    }
+                }
+            });
+            if let Some((_, error)) = failure { return Err(error); }
+            true
+        } else { false }
+    } else { false };
+    #[cfg(target_arch = "wasm32")]
+    let tile_parallel = false;
     for (tile_num, tile) in tiles.iter().enumerate() {
+        if tile_parallel { break; }
         let tile_row = (tile_num as u32) / ti.tile_cols;
         let tile_col = (tile_num as u32) % ti.tile_cols;
         walker.begin_tile(TileGeometry {

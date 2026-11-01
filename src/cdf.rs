@@ -14084,6 +14084,71 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
             }
         }
     }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn set_lr_origin(&mut self, row: u32, col: u32) {
+        self.lr_origin = (row, col);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn import_curr_frame_rect_from(
+        &mut self, src: &Self, row4: u32, col4: u32, sub_x: u8, sub_y: u8,
+    ) {
+        for plane in 0..3 {
+            let Some(source) = src.curr_frame[plane].as_ref() else { continue; };
+            let (sx, sy) = if plane == 0 { (0, 0) } else { (sub_x, sub_y) };
+            self.ensure_curr_frame_plane(plane, (self.mi_rows * MI_SIZE as u32) >> sy,
+                (self.mi_cols * MI_SIZE as u32) >> sx);
+            let destination = self.curr_frame[plane].as_mut().unwrap();
+            let y0 = ((row4 * MI_SIZE as u32) >> sy) as usize;
+            let x0 = ((col4 * MI_SIZE as u32) >> sx) as usize;
+            let width = (source.cols as usize).min(destination.cols as usize - x0);
+            let height = (source.rows as usize).min(destination.rows as usize - y0);
+            for y in 0..height {
+                let dst = (y0 + y) * destination.cols as usize + x0;
+                let src = y * source.cols as usize;
+                destination.samples[dst..dst + width].copy_from_slice(&source.samples[src..src + width]);
+            }
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn import_lr_units_from(
+        &mut self, src: &Self, row0: u32, row1: u32, col0: u32, col1: u32,
+        params: &LrParams,
+    ) {
+        for plane in 0..params.num_planes.min(3) {
+            if params.frame_restoration_type[plane] == RESTORE_NONE { continue; }
+            let Some(source) = src.lr_units[plane].as_ref() else { continue; };
+            let unit_size = params.loop_restoration_size[plane];
+            if unit_size == 0 { continue; }
+            if self.lr_units[plane].as_ref().map_or(true, |grid|
+                grid.unit_rows != source.unit_rows || grid.unit_cols != source.unit_cols)
+            {
+                self.lr_units[plane] = Some(LrUnitGrid {
+                    unit_rows: source.unit_rows, unit_cols: source.unit_cols,
+                    units: vec![LrUnit::NONE; source.unit_rows as usize * source.unit_cols as usize],
+                });
+            }
+            let sub_x = if plane == 0 { 0 } else { params.subsampling_x };
+            let sub_y = if plane == 0 { 0 } else { params.subsampling_y };
+            let row_step = (MI_SIZE as u32) >> sub_y;
+            let first_row = (row0 * row_step).div_ceil(unit_size);
+            let last_row = source.unit_rows.min((row1 * row_step).div_ceil(unit_size));
+            let col_step = (MI_SIZE as u32) >> sub_x;
+            let (numerator, denominator) = if params.use_superres {
+                (col_step * params.superres_denom, unit_size * SUPERRES_NUM)
+            } else { (col_step, unit_size) };
+            let first_col = (col0 * numerator).div_ceil(denominator);
+            let last_col = source.unit_cols.min((col1 * numerator).div_ceil(denominator));
+            let destination = self.lr_units[plane].as_mut().unwrap();
+            for row in first_row..last_row {
+                let start = (row * source.unit_cols + first_col) as usize;
+                let end = (row * source.unit_cols + last_col) as usize;
+                destination.units[start..end].copy_from_slice(&source.units[start..end]);
+            }
+        }
+    }
 }
 
 impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker<P, R> {
@@ -14244,6 +14309,9 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         }
         if self.blocks != other.blocks {
             out.push("blocks");
+        }
+        if self.lr_origin != other.lr_origin {
+            out.push("lr_origin");
         }
         if self.curr_frame != other.curr_frame {
             out.push("curr_frame");
@@ -16141,6 +16209,8 @@ pub struct PartitionWalker<P: crate::loop_filter::Pixel = i32, R: crate::loop_fi
     /// `DecodedBlockRecord` leaves emitted by [`Self::decode_partition`]
     /// in §5.11.4 syntax order.
     blocks: Vec<DecodedBlockRecord>,
+    /// Frame-relative restoration origin for a tile-sized intra walker.
+    lr_origin: (u32, u32),
     /// `CurrFrame[ plane ][ y ][ x ]` (av1-spec §7.12.3 step-3 / §7.11.x
     /// prediction kernels / §7.14 loop filter / §7.15 CDEF / §7.16
     /// upscaling / §7.17 loop restoration). Three per-plane sample
@@ -16912,6 +16982,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
             interintra_wedge_indices,
             motion_modes,
             blocks: Vec::new(),
+            lr_origin: (0, 0),
             // §7.12.3 step-3 `CurrFrame[plane]` buffers — allocated
             // lazily on the first per-plane merge call (see
             // [`Self::ensure_curr_frame_plane`]).
@@ -20277,6 +20348,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
                     units,
                 });
             }
+            let (r, c) = (r + self.lr_origin.0, c + self.lr_origin.1);
             let mi_size_shift_y = (MI_SIZE as u32) >> sub_y;
             let unit_row_start = (r * mi_size_shift_y).div_ceil(unit_size);
             let unit_row_end =

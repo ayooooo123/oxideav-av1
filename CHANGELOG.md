@@ -6,6 +6,10 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Changed
 
+- Decode independent intra tiles on bounded tile-sized walkers, stitching pixels,
+  metadata and frame-addressed restoration units as each tile finishes. A
+  rendezvous channel bounds completed-tile retention; inter/intrabc walks retain
+  their frame-relative dependency semantics.
 - Deblock horizontal luma/chroma edges in alternating disjoint row-window
   waves, retaining seven-row tap skirts and transform-size-bounded independence.
 - Reject non-transform and skipped interior deblock edges before querying their
