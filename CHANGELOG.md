@@ -6,6 +6,8 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Changed
 
+- Deblock horizontal luma/chroma edges in alternating disjoint row-window
+  waves, retaining seven-row tap skirts and transform-size-bounded independence.
 - Reject non-transform and skipped interior deblock edges before querying their
   neighboring transform, segmentation, delta and strength state.
 - Lend idle frame-worker capacity to independent deblock/CDEF/restoration bands.

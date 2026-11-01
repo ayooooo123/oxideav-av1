@@ -425,25 +425,42 @@ pub(crate) fn loop_filter_frame_with_workers<P: Pixel>(
                 });
             }
         });
-        // Horizontal edges retain their complete top-to-bottom dependency chain.
-        // Different planes are independent, so this pass needs no column packing.
-        let planes_per_worker = num_planes.div_ceil(workers);
-        std::thread::scope(|scope| {
-            for (b, chunk) in planes.chunks_mut(planes_per_worker).enumerate() {
-                scope.spawn(move || {
-                    for (i, plane_buf) in chunk.iter_mut().enumerate() {
-                        let p = b * planes_per_worker + i;
-                        if p > 0 && ctx.loop_filter_level[1 + p] == 0 { continue; }
-                        let (sub_x, sub_y) = subsampling_for_plane(p as u8, ctx.subsampling_x, ctx.subsampling_y);
-                        for row in (0..ctx.mi_rows).step_by(1 << sub_y) {
-                            for col in (0..ctx.mi_cols).step_by(1 << sub_x) {
-                                loop_filter_edge_at(ctx, plane_buf, p as u8, 1, row, col, 0);
+        // Within a pass, min(current, previous) transform size bounds each
+        // edge's read/write reach below its distance to neighboring edges.
+        // Even/odd bands may therefore run out of order; seven-row skirts
+        // keep each concurrently borrowed window disjoint and all taps live.
+        let band_mi = ctx.mi_rows.div_ceil((workers * 2) as u32).div_ceil(16) * 16;
+        for (p, plane_buf) in planes.iter_mut().enumerate() {
+            if p > 0 && ctx.loop_filter_level[1 + p] == 0 { continue; }
+            let (sub_x, sub_y) = subsampling_for_plane(p as u8, ctx.subsampling_x, ctx.subsampling_y);
+            let cols = plane_buf.cols;
+            let rows = plane_buf.rows;
+            for parity in 0..2 {
+                std::thread::scope(|scope| {
+                    let mut remaining = &mut *plane_buf.samples;
+                    let mut consumed = 0usize;
+                    for start in (parity * band_mi..ctx.mi_rows).step_by((2 * band_mi) as usize) {
+                        let end = (start + band_mi).min(ctx.mi_rows);
+                        let first_row = ((start * MI_SIZE as u32) >> sub_y).saturating_sub(7);
+                        let last_row = (((end * MI_SIZE as u32) >> sub_y) + 7).min(rows);
+                        let first = first_row as usize * cols as usize;
+                        let last = last_row as usize * cols as usize;
+                        let (_, tail) = std::mem::take(&mut remaining).split_at_mut(first - consumed);
+                        let (samples, tail) = tail.split_at_mut(last - first);
+                        remaining = tail;
+                        consumed = last;
+                        scope.spawn(move || {
+                            let mut window = PlaneBuffer { cols, rows: last_row - first_row, samples };
+                            for row in (start..end).step_by(1 << sub_y) {
+                                for col in (0..ctx.mi_cols).step_by(1 << sub_x) {
+                                    loop_filter_edge_at(ctx, &mut window, p as u8, 1, row, col, first_row as i32);
+                                }
                             }
-                        }
+                        });
                     }
                 });
             }
-        });
+        }
         return;
     }
     let _ = workers;
