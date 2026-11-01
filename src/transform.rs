@@ -71,6 +71,12 @@ use crate::cdf::{
 
 #[cfg(target_arch = "aarch64")]
 mod neon;
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+mod wasm;
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+use wasm as simd;
+#[cfg(target_arch = "aarch64")]
+use neon as simd;
 
 /// `Cos128_Lookup[65]` (§7.13.2.1 av1-spec p.296). Quarter-period
 /// table: `Cos128_Lookup[k] = round(4096 * cos(k * pi / 128))` for
@@ -866,9 +872,9 @@ pub fn inverse_transform_2d(
     bit_depth: u32,
     lossless: bool,
 ) -> Vec<i64> {
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128")))]
     if !lossless && tx_sz < TX_SIZES_ALL && dequant.len() == TX_WIDTH[tx_sz] * TX_HEIGHT[tx_sz] {
-        if let Some(residual) = neon::inverse_2d(dequant, tx_sz, tx_type, bit_depth) {
+        if let Some(residual) = simd::inverse_2d(dequant, tx_sz, tx_type, bit_depth) {
             return residual;
         }
     }

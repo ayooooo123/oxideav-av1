@@ -6,6 +6,13 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Changed
 
+- WebAssembly SIMD128 adds exact CDEF filters/directional projections, eight-tap
+  interpolation, clipped prediction/compound averages, motion-field destination
+  projection, symmetric Wiener restoration, and four-lane inverse DCT/ADST/
+  identity transforms. Split-product arithmetic preserves widened transform
+  rounding using i32 lanes. Other targets retain their existing dispatch.
+  Scalar differential suites cover 8/10/12-bit samples, full-i32 product extrema,
+  transform precision edges, odd-width tails, and full-range compound rounding.
 - Deblocking and CDEF plane views are monomorphized over clipped sample storage.
   Scalar arithmetic retains the specification's signed widths; CDEF NEON loads
   and stores native `u8`/`u16` rows without an `i32` conversion buffer. Differential

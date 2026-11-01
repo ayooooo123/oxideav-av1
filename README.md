@@ -7,6 +7,53 @@ built from the public AV1 Bitstream & Decoding Process Specification.
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework.
 
+## WebAssembly SIMD128
+
+`wasm32` builds with `+simd128` select explicit SIMD kernels for CDEF,
+motion-compensation convolution, clipped prediction/compound averaging,
+motion-field destination projection, Wiener restoration, and inverse transforms.
+Other architectures keep their existing dispatch. Transform rotations split
+signed inputs into a high quotient and a nonnegative 12-bit remainder; this
+preserves the scalar widened multiply/round exactly without expensive SIMD i64
+multiplication. Differential tests also cover full-i32 split-product extrema.
+
+Run the library tests with Node's WASI preview1 host (Node 22 or newer):
+
+```sh
+export RUSTFLAGS="-C target-feature=+simd128"
+export CARGO_TARGET_WASM32_WASIP1_RUNNER="node $PWD/run-wasi.mjs"
+cargo test --release --target wasm32-wasip1 --lib -- --test-threads=1
+```
+
+Use the same `oxideav-core` dependency patch as the embedding application when
+building the fork standalone. For PearTube this is:
+
+```sh
+cargo test --release --target wasm32-wasip1 --lib \
+  --config 'patch.crates-io.oxideav-core.git="https://github.com/ayooooo123/oxideav-core"' \
+  --config 'patch.crates-io.oxideav-core.rev="979d7e32865f1cbd028171637922423da595d15e"' \
+  -- --test-threads=1
+```
+
+`examples/hash_ivf.rs` and `hash-wasi.mjs` hash every decoded picture with SHA-256,
+including every byte of 10/12-bit planes, before display conversion. Build the
+example for `wasm32-wasip1`, once with `RUSTFLAGS="-C target-feature=-simd128"`
+and once with `RUSTFLAGS="-C target-feature=+simd128"`; save the scalar executable
+before the second build. Pass the same dependency patch to both builds:
+
+```sh
+cargo build --release --target wasm32-wasip1 --example hash_ivf
+node hash-wasi.mjs /tmp/scalar-hash.wasm input.ivf /tmp/scalar-pictures.json
+node hash-wasi.mjs target/wasm32-wasip1/release/examples/hash_ivf.wasm \
+  input.ivf /tmp/simd-pictures.json
+cmp /tmp/scalar-pictures.json /tmp/simd-pictures.json
+```
+
+The JSON records contain each picture's full-plane byte count and hash in
+display order. Matroska inputs can be remuxed to IVF with `ffmpeg -c copy`;
+no pixel conversion or re-encoding is needed.
+
+
 ## Status
 
 Clean-room rebuild in progress. The bitstream-syntax and header layers

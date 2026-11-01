@@ -1011,6 +1011,8 @@ mod tests {
     /// arm riding the same options. A budgeted 4-thread encode of a
     /// multi-tile still equals the direct 4-thread encode byte for
     /// byte, and the serial encode is the single-tile one.
+    // This test explicitly requests parallel encoder workers, unavailable in WASI.
+    #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn defaults_are_fast_and_auto_threaded_under_the_execution_budget() {
         let params = video_params(512, 256, PixelFormat::Yuv420P);

@@ -58,6 +58,12 @@ use crate::uncompressed_header_tail::CdefParams;
 
 #[cfg(target_arch = "aarch64")]
 mod neon;
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+mod wasm;
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+use wasm as simd;
+#[cfg(target_arch = "aarch64")]
+use neon as simd;
 
 // =====================================================================
 // §7.15 constant lookup tables — av1-spec p.320-324.
@@ -474,7 +480,7 @@ pub fn cdef_direction<P: Pixel>(
     r: u32,
     c: u32,
 ) -> (i32, i32) {
-    cdef_direction_impl(ctx, src_planes, r, c, cfg!(target_arch = "aarch64"))
+    cdef_direction_impl(ctx, src_planes, r, c, cfg!(any(target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128"))))
 }
 
 fn cdef_direction_impl<P: Pixel>(
@@ -497,9 +503,9 @@ fn cdef_direction_impl<P: Pixel>(
     // av1-spec p.321 lines 17756-17768: per-pixel projection-sum
     // accumulator across the 8×8 luma block.
     let in_bounds = x0 >= 0 && x0 + 8 <= plane0.cols as i32 && y0 >= 0 && y0 + 8 <= plane0.rows as i32;
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128")))]
     if in_bounds && simd {
-        partial = neon::partial(plane0.samples, y0 as usize * plane0.cols as usize + x0 as usize,
+        partial = simd::partial(plane0.samples, y0 as usize * plane0.cols as usize + x0 as usize,
             plane0.cols as usize, shift);
     }
     if in_bounds && !simd {
@@ -733,20 +739,20 @@ fn cdef_filter_block_at<P: Pixel>(
             }
         }
 
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(any(target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128")))]
         {
             let base = y0 * src_cols + x0;
             let target = &mut dst.samples[(y0 - dst_y0) * dst_cols + x0..];
             if w == 8 {
-                neon::filter::<8, P>(src.samples, base, src_cols, target, dst_cols, h,
+                simd::filter::<8, P>(src.samples, base, src_cols, target, dst_cols, h,
                     &pri_offs, &sec_offs, pri_str, sec_str, pri_adj, sec_adj);
             } else {
-                neon::filter::<4, P>(src.samples, base, src_cols, target, dst_cols, h,
+                simd::filter::<4, P>(src.samples, base, src_cols, target, dst_cols, h,
                     &pri_offs, &sec_offs, pri_str, sec_str, pri_adj, sec_adj);
             }
         }
 
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(not(any(target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128"))))]
         for i in 0..h {
             let py = y0 + i;
             let src_row_base = py * src_cols + x0;

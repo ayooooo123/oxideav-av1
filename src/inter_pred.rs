@@ -595,6 +595,8 @@ thread_local! {
 
 #[cfg(target_arch = "aarch64")]
 mod neon;
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+mod wasm;
 
 use crate::loop_filter::Pixel;
 
@@ -640,7 +642,9 @@ fn filter_8tap_h<R: Pixel>(
 ) {
     #[cfg(target_arch = "aarch64")]
     neon::horizontal(src, coeffs, inter_round0, dst, w);
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    wasm::horizontal(src, coeffs, inter_round0, dst, w);
+    #[cfg(not(any(target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128"))))]
     filter_8tap_h_scalar(src, coeffs, inter_round0, dst, w);
 }
 
@@ -698,7 +702,9 @@ fn filter_8tap_v(
 ) {
     #[cfg(target_arch = "aarch64")]
     neon::vertical(intermediate, w, r, coeffs, inter_round1, dst_row);
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    wasm::vertical(intermediate, w, r, coeffs, inter_round1, dst_row);
+    #[cfg(not(any(target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128"))))]
     filter_8tap_v_scalar(intermediate, w, r, coeffs, inter_round1, dst_row);
 }
 
@@ -1043,7 +1049,9 @@ pub fn clip1_single_ref<P: Pixel>(bit_depth: u8, pred: &[i32], out: &mut [P]) ->
     }
     #[cfg(target_arch = "aarch64")]
     neon::clip(bit_depth, pred, out);
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    wasm::clip(bit_depth, pred, out);
+    #[cfg(not(any(target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128"))))]
     {
         let max = (1i32 << bit_depth) - 1;
         for (dst, src) in out.iter_mut().zip(pred.iter().copied()) {
@@ -1554,7 +1562,9 @@ fn predict_inter_compound_blend<P: Pixel>(
             //                    1 + InterPostRound))
             #[cfg(target_arch = "aarch64")]
             neon::average(bit_depth, 1 + inter_post_round, &pred0[..w * h], &pred1[..w * h], pred_out);
-            #[cfg(not(target_arch = "aarch64"))]
+            #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+            wasm::average(bit_depth, 1 + inter_post_round, &pred0[..w * h], &pred1[..w * h], pred_out);
+            #[cfg(not(any(target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128"))))]
             {
             let max: i32 = (1i32 << bit_depth) - 1;
             let shift: u32 = 1 + inter_post_round;
@@ -7971,10 +7981,17 @@ pub fn motion_field_estimation_core(
                 if !(vy && vx) {
                     continue;
                 }
+                #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+                let projected = wasm::project_destinations(mv, &destination_multiplier[source_ref]);
                 for (dst, &multiplier) in destination_multiplier[source_ref]
                     .iter().enumerate().take(ALTREF_FRAME + 1).skip(LAST_FRAME)
                 {
+                    #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
                     let out = project_motion_vector(mv, multiplier);
+                    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+                    let out = projected[dst];
+                    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+                    let _ = multiplier;
                     mfmvs.set(
                         dst,
                         pos_y8 as u32,

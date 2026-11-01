@@ -594,6 +594,8 @@ mod tests {
 
     /// r460 — the threaded tile search is bit-identical to the
     /// sequential walk of the same layout.
+    // WASI preview1 cannot spawn threads; the native suite covers this path.
+    #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn threaded_tile_search_is_bit_identical() {
         let input = textured(320, 192, 8, ChromaFormat::Yuv420);

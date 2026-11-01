@@ -85,6 +85,8 @@
 use crate::cdf::MI_SIZE;
 use crate::loop_filter::{Pixel, PlaneBuffer};
 use crate::uncompressed_header_tail::{FrameRestorationType, LrParams};
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+mod wasm;
 
 // =====================================================================
 // §7.17 constant lookup tables — av1-spec p.107 / p.332.
@@ -817,19 +819,17 @@ pub(crate) fn box_filter<P: Pixel>(
     // routing per sample).
     let sw = aw + 2 * ru;
     let sh = ah + 2 * ru;
-    let mut src = vec![0i64; sh * sw];
+    let mut src = vec![0i32; sh * sw];
+    let p = plane as usize;
     for (sy, row) in src.chunks_mut(sw).enumerate() {
         let y = geom.y as i32 + sy as i32 - 1 - r;
-        for (sx, v) in row.iter_mut().enumerate() {
-            let x = geom.x as i32 + sx as i32 - 1 - r;
-            *v = i64::from(get_source_sample(
-                curr_planes,
-                cdef_planes,
-                plane,
-                x,
-                y,
-                geom,
-            ));
+        let x = geom.x as i32 - 1 - r;
+        if let (Some(curr), Some(cdef)) = (curr_planes.get(p), cdef_planes.get(p)) {
+            source_row(curr, cdef, x, y, geom, row);
+        } else {
+            for (sx, value) in row.iter_mut().enumerate() {
+                *value = get_source_sample(curr_planes, cdef_planes, plane, x + sx as i32, y, geom);
+            }
         }
     }
     // Horizontal running sums over `2r + 1` columns, then vertical
@@ -841,15 +841,15 @@ pub(crate) fn box_filter<P: Pixel>(
         let srow = &src[sy * sw..(sy + 1) * sw];
         let mut sb: i64 = 0;
         let mut sa: i64 = 0;
-        for &c in &srow[..win] {
+        for c in srow[..win].iter().copied().map(i64::from) {
             sb += c;
             sa += c * c;
         }
         row_b[sy * aw] = sb;
         row_a[sy * aw] = sa;
         for j in 1..aw {
-            let out = srow[j - 1];
-            let inc = srow[j - 1 + win];
+            let out = i64::from(srow[j - 1]);
+            let inc = i64::from(srow[j - 1 + win]);
             sb += inc - out;
             sa += inc * inc - out * out;
             row_b[sy * aw + j] = sb;
@@ -991,6 +991,28 @@ pub fn wiener_filter<P: Pixel>(
     wiener_filter_at(ctx, curr_planes, cdef_planes, lr, plane, geom, 0);
 }
 
+#[inline]
+fn wiener_horizontal_scalar(src: &[i32], filter: &[i32; 7], shift: u32, low: i32, high: i32, dst: &mut [i32]) {
+    for (c, out) in dst.iter_mut().enumerate() {
+        let sum = filter[0] * (src[c] + src[c + 6])
+            + filter[1] * (src[c + 1] + src[c + 5])
+            + filter[2] * (src[c + 2] + src[c + 4])
+            + filter[3] * src[c + 3];
+        *out = clip3(low, high, round2_i32(sum, shift));
+    }
+}
+
+#[inline]
+fn wiener_vertical_scalar<P: Pixel>(rows: [&[i32]; 7], filter: &[i32; 7], shift: u32, max: i32, dst: &mut [P]) {
+    for (c, out) in dst.iter_mut().enumerate() {
+        let sum = filter[0] * (rows[0][c] + rows[6][c])
+            + filter[1] * (rows[1][c] + rows[5][c])
+            + filter[2] * (rows[2][c] + rows[4][c])
+            + filter[3] * rows[3][c];
+        *out = P::from_i32(clip3(0, max, round2_i32(sum, shift)));
+    }
+}
+
 fn wiener_filter_at<P: Pixel>(
     ctx: &LoopRestorationFrameContext<'_>,
     curr_planes: &[PlaneBuffer<'_, P>],
@@ -1041,15 +1063,11 @@ fn wiener_filter_at<P: Pixel>(
     let mut intermediate = vec![0i32; (h + 6) * w];
     for r in 0..(h + 6) {
         let wrow = &window[r * sw..(r + 1) * sw];
-        for c in 0..w {
-            let s = hfilter[0] * (wrow[c] + wrow[c + 6])
-                + hfilter[1] * (wrow[c + 1] + wrow[c + 5])
-                + hfilter[2] * (wrow[c + 2] + wrow[c + 4])
-                + hfilter[3] * wrow[c + 3];
-            let v = round2_i32(s, inter_round0);
-            let clipped = clip3(-offset, limit - offset, v);
-            intermediate[r * w + c] = clipped;
-        }
+        let dst = &mut intermediate[r * w..(r + 1) * w];
+        #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+        wasm::horizontal(wrow, &hfilter, inter_round0, -offset, limit - offset, dst);
+        #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
+        wiener_horizontal_scalar(wrow, &hfilter, inter_round0, -offset, limit - offset, dst);
     }
     // av1-spec p.334 lines 18476-18484: vertical pass writes
     // `LrFrame[plane][y + r][x + c]`.
@@ -1068,20 +1086,11 @@ fn wiener_filter_at<P: Pixel>(
         }
         let start = y * lr.cols as usize + x0;
         let dst = &mut lr.samples[start..start + width];
-        let row0 = &intermediate[r * w..r * w + width];
-        let row1 = &intermediate[(r + 1) * w..(r + 1) * w + width];
-        let row2 = &intermediate[(r + 2) * w..(r + 2) * w + width];
-        let row3 = &intermediate[(r + 3) * w..(r + 3) * w + width];
-        let row4 = &intermediate[(r + 4) * w..(r + 4) * w + width];
-        let row5 = &intermediate[(r + 5) * w..(r + 5) * w + width];
-        let row6 = &intermediate[(r + 6) * w..(r + 6) * w + width];
-        for (c, out) in dst.iter_mut().enumerate() {
-            let s = vfilter[0] * (row0[c] + row6[c])
-                + vfilter[1] * (row1[c] + row5[c])
-                + vfilter[2] * (row2[c] + row4[c])
-                + vfilter[3] * row3[c];
-            *out = P::from_i32(clip3(0, max_sample, round2_i32(s, inter_round1)));
-        }
+        let rows = core::array::from_fn(|k| &intermediate[(r + k) * w..(r + k) * w + width]);
+        #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+        wasm::vertical(rows, &vfilter, inter_round1, max_sample, dst);
+        #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
+        wiener_vertical_scalar(rows, &vfilter, inter_round1, max_sample, dst);
     }
 }
 
