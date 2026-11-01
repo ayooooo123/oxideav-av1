@@ -86,7 +86,24 @@ pub(super) fn vertical(src: &[i32], w: usize, r: usize, coeff: &[i32; 8], shift:
     }
 }
 
-pub(super) fn clip(depth: u8, src: &[i32], dst: &mut [u16]) {
+#[inline(always)]
+unsafe fn store_samples<P: Pixel>(dst: *mut P, values: uint16x8_t) {
+    // SAFETY: callers prove eight writable samples. Pixel is sealed to
+    // u8/u16/i32; narrowing matches from_i32 and widening is exact.
+    unsafe {
+        if core::mem::size_of::<P>() == 1 {
+            vst1_u8(dst.cast(), vmovn_u16(values));
+        } else if core::mem::size_of::<P>() == 2 {
+            vst1q_u16(dst.cast(), values);
+        } else {
+            let dst = dst.cast::<i32>();
+            vst1q_s32(dst, vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(values))));
+            vst1q_s32(dst.add(4), vreinterpretq_s32_u32(vmovl_high_u16(values)));
+        }
+    }
+}
+
+pub(super) fn clip<P: Pixel>(depth: u8, src: &[i32], dst: &mut [P]) {
     assert!(dst.len() >= src.len());
     let end = src.len() / 8 * 8;
     let max = (1 << depth) - 1;
@@ -97,13 +114,13 @@ pub(super) fn clip(depth: u8, src: &[i32], dst: &mut [u16]) {
         for x in (0..end).step_by(8) {
             let lo = vqmovun_s32(vminq_s32(high, vld1q_s32(src.as_ptr().add(x))));
             let hi = vqmovun_s32(vminq_s32(high, vld1q_s32(src.as_ptr().add(x + 4))));
-            vst1q_u16(dst.as_mut_ptr().add(x), vcombine_u16(lo, hi));
+            store_samples(dst.as_mut_ptr().add(x), vcombine_u16(lo, hi));
         }
     }
-    for x in end..src.len() { dst[x] = src[x].clamp(0, max) as u16; }
+    for x in end..src.len() { dst[x] = P::from_i32(src[x].clamp(0, max)); }
 }
 
-pub(super) fn average(depth: u8, shift: u32, a: &[i32], b: &[i32], dst: &mut [u16]) {
+pub(super) fn average<P: Pixel>(depth: u8, shift: u32, a: &[i32], b: &[i32], dst: &mut [P]) {
     assert!(a.len() <= b.len() && a.len() <= dst.len());
     assert!((1..32).contains(&shift));
     let end = a.len() / 8 * 8;
@@ -124,11 +141,11 @@ pub(super) fn average(depth: u8, shift: u32, a: &[i32], b: &[i32], dst: &mut [u1
                     else { vrshlq_s32(vhaddq_s32(av, bv), shifts) };
                 *value = vqmovun_s32(vminq_s32(rounded, high));
             }
-            vst1q_u16(dst.as_mut_ptr().add(x), vcombine_u16(v[0], v[1]));
+            store_samples(dst.as_mut_ptr().add(x), vcombine_u16(v[0], v[1]));
         }
     }
     for x in end..a.len() {
-        dst[x] = (((i64::from(a[x]) + i64::from(b[x]) + (1i64 << (shift - 1))) >> shift) as i32).clamp(0, max) as u16;
+        dst[x] = P::from_i32((((i64::from(a[x]) + i64::from(b[x]) + (1i64 << (shift - 1))) >> shift) as i32).clamp(0, max));
     }
 }
 
@@ -186,11 +203,25 @@ mod tests {
                 let max = (1 << depth) - 1;
                 let mut dst = vec![0; n]; clip(depth, &a, &mut dst);
                 assert_eq!(dst, a.iter().map(|&v| v.clamp(0, max) as u16).collect::<Vec<_>>());
+                let mut wide = vec![0i32; n];
+                clip(depth, &a, &mut wide);
+                assert_eq!(wide, dst.iter().map(|&v| i32::from(v)).collect::<Vec<_>>());
+                let mut native8 = vec![0u8; n];
+                if depth == 8 {
+                    clip(depth, &a, &mut native8);
+                    assert_eq!(native8, dst.iter().map(|&v| v as u8).collect::<Vec<_>>());
+                }
                 for shift in 1..=8 {
                     average(depth, shift, &a, &b, &mut dst);
                     let expected: Vec<u16> = a.iter().zip(&b).map(|(&a, &b)|
                         (((i64::from(a) + i64::from(b) + (1 << (shift - 1))) >> shift) as i32).clamp(0, max) as u16).collect();
                     assert_eq!(dst, expected);
+                    average(depth, shift, &a, &b, &mut wide);
+                    assert_eq!(wide, expected.iter().map(|&v| i32::from(v)).collect::<Vec<_>>());
+                    if depth == 8 {
+                        average(depth, shift, &a, &b, &mut native8);
+                        assert_eq!(native8, expected.iter().map(|&v| v as u8).collect::<Vec<_>>());
+                    }
                 }
             }
         }

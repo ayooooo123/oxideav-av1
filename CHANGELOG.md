@@ -19,6 +19,8 @@ All notable changes to `oxideav-av1` are recorded here.
   once; frame workers capture that selection with their sequence snapshot.
   Inter reconstruction borrows destination planes directly, removing full-plane
   representation mirrors; core output takes owned byte planes without a clone.
+  Clipped prediction, compound and OBMC scratch also share the native sample
+  type, with reusable typed thread-local buffers and direct SIMD stores.
 - AArch64 inverse transforms batch four rows and columns using explicit NEON
   DCT, ADST, and identity passes. Widened products, stage precision clamps,
   rectangular scaling, and both rounding stages remain bit-exact; lossless

@@ -591,7 +591,6 @@ thread_local! {
     static INTERMEDIATE_SCRATCH: std::cell::RefCell<Vec<i32>> = const { std::cell::RefCell::new(Vec::new()) };
     static PRED_SCRATCH_0: std::cell::RefCell<Vec<i32>> = const { std::cell::RefCell::new(Vec::new()) };
     static PRED_SCRATCH_1: std::cell::RefCell<Vec<i32>> = const { std::cell::RefCell::new(Vec::new()) };
-    static PRED_U16_SCRATCH: std::cell::RefCell<Vec<u16>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -599,10 +598,6 @@ mod neon;
 
 use crate::loop_filter::Pixel;
 
-#[inline]
-fn store_prediction<P: Pixel>(dst: &mut [P], src: &[u16]) {
-    for (dst, &src) in dst.iter_mut().zip(src) { *dst = P::from_i32(i32::from(src)); }
-}
 
 #[allow(dead_code)]
 #[inline]
@@ -1039,7 +1034,7 @@ pub fn block_inter_prediction<R: Pixel>(
 ///
 /// `bit_depth` must be one of `{8, 10, 12}`; pred values are clipped
 /// in-place to `[0, (1 << bit_depth) - 1]`.
-pub fn clip1_single_ref(bit_depth: u8, pred: &[i32], out: &mut [u16]) -> Result<(), crate::Error> {
+pub fn clip1_single_ref<P: Pixel>(bit_depth: u8, pred: &[i32], out: &mut [P]) -> Result<(), crate::Error> {
     if !matches!(bit_depth, 8 | 10 | 12) {
         return Err(crate::Error::PartitionWalkOutOfRange);
     }
@@ -1052,7 +1047,7 @@ pub fn clip1_single_ref(bit_depth: u8, pred: &[i32], out: &mut [u16]) -> Result<
     {
         let max = (1i32 << bit_depth) - 1;
         for (dst, src) in out.iter_mut().zip(pred.iter().copied()) {
-            *dst = clip3_i32(0, max, src) as u16;
+            *dst = P::from_i32(clip3_i32(0, max, src));
         }
     }
     Ok(())
@@ -1126,7 +1121,7 @@ pub fn clip1_single_ref(bit_depth: u8, pred: &[i32], out: &mut [u16]) -> Result<
 // * "Mask" prep / "inter predicted samples are then derived" —
 //   `isCompound == 0 && IsInterIntra == 0` arm:
 //   `CurrFrame[plane][y+i][x+j] = Clip1( preds[0][i][j] )`. We write
-//   into a caller-supplied flat `pred_out: &mut [u16]` per-block
+//   into a caller-supplied flat native `pred_out` per-block
 //   buffer; integrating the per-`CurrFrame[plane]` merge is the
 //   walker's responsibility (it owns the per-plane buffer; see
 //   [`crate::PartitionWalker::curr_frame`]). The compound arm writes
@@ -1538,7 +1533,7 @@ fn predict_inter_per_ref<R: Pixel>(
 /// * `COMPOUND_WEDGE` / `COMPOUND_DIFFWTD` / `COMPOUND_INTRA` route to
 ///   [`mask_blend`] with the caller-supplied luma-grid mask.
 #[allow(clippy::too_many_arguments)]
-fn predict_inter_compound_blend(
+fn predict_inter_compound_blend<P: Pixel>(
     plane: u8,
     bit_depth: u8,
     inter_post_round: u32,
@@ -1549,7 +1544,7 @@ fn predict_inter_compound_blend(
     pred0: &[i32],
     pred1: &[i32],
     params: CompoundParams<'_>,
-    pred_out: &mut [u16],
+    pred_out: &mut [P],
 ) -> Result<(), crate::Error> {
     match params {
         CompoundParams::Average => {
@@ -1567,7 +1562,7 @@ fn predict_inter_compound_blend(
                 for j in 0..w {
                     let acc = pred0[i * w + j] as i64 + pred1[i * w + j] as i64;
                     let rounded = round2(acc, shift) as i32;
-                    pred_out[i * w + j] = clip3_i32(0, max, rounded) as u16;
+                    pred_out[i * w + j] = P::from_i32(clip3_i32(0, max, rounded));
                 }
             }
             }
@@ -2178,7 +2173,7 @@ fn predict_inter_one_ref<R: Pixel>(
 /// * Steps 5, 6 — `motion_vector_scaling` + `block_inter_prediction`
 ///   are run via [`predict_inter_per_ref`] for the neighbour MV
 ///   against `predW × predH`.
-/// * Step 7 — `clip1_single_ref` on the i32 prediction → u16 obmc_pred.
+/// * Step 7 — `clip1_single_ref` on the i32 prediction → native obmc_pred.
 /// * Step 8 — `overlap_neighbour_predict_blend` against the in-place
 ///   `pred_out` buffer at the buffer-relative coordinates
 ///   `(predX - x_block_plane, predY - y_block_plane)`.
@@ -2201,7 +2196,7 @@ fn predict_inter_one_ref<R: Pixel>(
 /// (`x_block_plane = (MiCol * MI_SIZE) >> subX`, similarly for y) to
 /// buffer-relative before the §7.11.3.10 blend.
 #[allow(clippy::too_many_arguments)]
-fn obmc_walk_axis<R: Pixel>(
+fn obmc_walk_axis<R: Pixel, P: Pixel>(
     pass: OverlapPass,
     plane: u8,
     block_x_plane: i32,
@@ -2222,7 +2217,7 @@ fn obmc_walk_axis<R: Pixel>(
     inter_round1: u32,
     bit_depth: u8,
     neighbours: &[ObmcNeighbour<'_, R>],
-    pred_out: &mut [u16],
+    pred_out: &mut [P],
 ) -> Result<(), crate::Error> {
     let mi_size: u32 = crate::cdf::MI_SIZE as u32;
     let sub_x = subsampling_x as u32;
@@ -2368,8 +2363,8 @@ fn obmc_walk_axis<R: Pixel>(
         )?;
 
         // §7.11.3.9 step 7 — Clip1 on the i32 prediction.
-        let mut obmc_pred_u16 = vec![0u16; fit_w * fit_h];
-        clip1_single_ref(bit_depth, &obmc_pred_i32, &mut obmc_pred_u16)?;
+        let mut obmc_pred_native = vec![P::default(); fit_w * fit_h];
+        clip1_single_ref(bit_depth, &obmc_pred_i32, &mut obmc_pred_native)?;
 
         // §7.11.3.9 step 8 — overlap blend against the per-block
         // buffer treated as a `(block_h, block_w)` plane window.
@@ -2381,7 +2376,7 @@ fn obmc_walk_axis<R: Pixel>(
             fit_w,
             fit_h,
             pass,
-            &obmc_pred_u16,
+            &obmc_pred_native,
             /* obmc_stride */ fit_w,
             mask_length,
         )?;
@@ -2390,7 +2385,7 @@ fn obmc_walk_axis<R: Pixel>(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn predict_inter<R: Pixel>(
+pub fn predict_inter<R: Pixel, P: Pixel>(
     plane: u8,
     x: i32,
     y: i32,
@@ -2411,7 +2406,7 @@ pub fn predict_inter<R: Pixel>(
     inter_intra: Option<InterIntraParams<'_>>,
     warp: Option<&WarpDriverParams>,
     obmc: Option<&ObmcParams<'_, '_, R>>,
-    pred_out: &mut [u16],
+    pred_out: &mut [P],
 ) -> Result<(), crate::Error> {
     // ---------- caller-bug guards ----------
     if plane > 2 {
@@ -3419,7 +3414,7 @@ pub fn intra_mode_variant_mask(
 /// `Ok(())` on success. [`crate::Error::PartitionWalkOutOfRange`] for
 /// caller-bug arguments.
 #[allow(clippy::too_many_arguments)]
-pub fn mask_blend(
+pub fn mask_blend<P: Pixel>(
     bit_depth: u8,
     inter_post_round: u32,
     sub_x: u8,
@@ -3430,7 +3425,7 @@ pub fn mask_blend(
     h: usize,
     mask: &[u8],
     mask_stride: usize,
-    out: &mut [u16],
+    out: &mut [P],
 ) -> Result<(), crate::Error> {
     if !matches!(bit_depth, 8 | 10 | 12) {
         return Err(crate::Error::PartitionWalkOutOfRange);
@@ -3488,7 +3483,7 @@ pub fn mask_blend(
             let p1 = preds1[y * w + x] as i64;
             let acc = (m as i64) * p0 + ((64 - m) as i64) * p1;
             let blended = round2(acc, shift) as i32;
-            out[y * w + x] = clip3_i32(0, max, blended) as u16;
+            out[y * w + x] = P::from_i32(clip3_i32(0, max, blended));
         }
     }
     Ok(())
@@ -3555,7 +3550,7 @@ pub fn mask_blend(
 /// caller-bug arguments (invalid `bit_depth`, `sub_* > 1`, zero extent,
 /// slice-length / stride undershoot).
 #[allow(clippy::too_many_arguments)]
-pub fn mask_blend_interintra(
+pub fn mask_blend_interintra<P: Pixel>(
     bit_depth: u8,
     inter_post_round: u32,
     sub_x: u8,
@@ -3565,7 +3560,7 @@ pub fn mask_blend_interintra(
     h: usize,
     mask: &[u8],
     mask_stride: usize,
-    dst: &mut [u16],
+    dst: &mut [P],
 ) -> Result<(), crate::Error> {
     if !matches!(bit_depth, 8 | 10 | 12) {
         return Err(crate::Error::PartitionWalkOutOfRange);
@@ -3624,9 +3619,9 @@ pub fn mask_blend_interintra(
             let raw_pred0 = preds0[y * w + x] as i64;
             // pred0 = Clip1( Round2( preds[0][y][x], InterPostRound ) )
             let clipped = clip3_i32(0, max, round2(raw_pred0, inter_post_round) as i32) as i64;
-            let pred1 = dst[y * w + x] as i64;
+            let pred1 = i64::from(dst[y * w + x].to_i32());
             let blended = round2(m * pred1 + (64 - m) * clipped, 6) as i32;
-            dst[y * w + x] = clip3_i32(0, max, blended) as u16;
+            dst[y * w + x] = P::from_i32(clip3_i32(0, max, blended));
         }
     }
     Ok(())
@@ -3786,7 +3781,7 @@ pub fn distance_weights(
 /// per-pixel blend. Caller-bug-checked against the same argument set
 /// as [`mask_blend`].
 #[allow(clippy::too_many_arguments)]
-pub fn compound_distance_blend(
+pub fn compound_distance_blend<P: Pixel>(
     bit_depth: u8,
     inter_post_round: u32,
     weights: DistanceWeights,
@@ -3794,7 +3789,7 @@ pub fn compound_distance_blend(
     preds1: &[i32],
     w: usize,
     h: usize,
-    out: &mut [u16],
+    out: &mut [P],
 ) -> Result<(), crate::Error> {
     if !matches!(bit_depth, 8 | 10 | 12) {
         return Err(crate::Error::PartitionWalkOutOfRange);
@@ -3813,7 +3808,7 @@ pub fn compound_distance_blend(
             let acc = (weights.fwd_weight as i64) * (preds0[y * w + x] as i64)
                 + (weights.bck_weight as i64) * (preds1[y * w + x] as i64);
             let rounded = round2(acc, shift) as i32;
-            out[y * w + x] = clip3_i32(0, max, rounded) as u16;
+            out[y * w + x] = P::from_i32(clip3_i32(0, max, rounded));
         }
     }
     Ok(())
@@ -4866,9 +4861,8 @@ pub enum OverlapPass {
 ///
 /// * `current_plane` — the current frame's plane samples, row-major;
 ///   `current_plane[(pred_y + i) * curr_stride + (pred_x + j)]` is
-///   read and written in place for the blended region. `u16` matches
-///   the §7.11.3.4 / §7.11.3.5 output domain (any of 8/10/12-bit
-///   content fits in `u16`).
+///   read and written in place for the blended region, using the stream's
+///   native post-`Clip1` representation.
 /// * `curr_stride` — row stride of `current_plane` in samples.
 /// * `pred_x` / `pred_y` — top-left sample of the overlap region in
 ///   the `current_plane` grid (§7.11.3.9 step-3/4 `predX` / `predY`).
@@ -4896,15 +4890,15 @@ pub enum OverlapPass {
 /// `(pred_y + pred_h) * curr_stride`, or `mask` shorter than the
 /// pass-axis length (`pred_h` for `Above`, `pred_w` for `Left`).
 #[allow(clippy::too_many_arguments)]
-pub fn overlap_blending(
-    current_plane: &mut [u16],
+pub fn overlap_blending<P: Pixel>(
+    current_plane: &mut [P],
     curr_stride: usize,
     pred_x: usize,
     pred_y: usize,
     pred_w: usize,
     pred_h: usize,
     pass: OverlapPass,
-    obmc_pred: &[u16],
+    obmc_pred: &[P],
     obmc_stride: usize,
     mask: &[u8],
 ) -> Result<(), crate::Error> {
@@ -4957,14 +4951,14 @@ pub fn overlap_blending(
                 for j in 0..pred_w {
                     let curr_idx = curr_row_base + pred_x + j;
                     let obmc_idx = obmc_row_base + j;
-                    let curr_sample = current_plane[curr_idx] as u32;
-                    let obmc_sample = obmc_pred[obmc_idx] as u32;
+                    let curr_sample = current_plane[curr_idx].to_i32() as u32;
+                    let obmc_sample = obmc_pred[obmc_idx].to_i32() as u32;
                     // m ∈ [0, 64] so `64 - m` is non-negative; product
                     // fits in u32 for any bit depth ≤ 14 (64 * (1<<14)
                     // = 1<<20).
                     let blended = m * curr_sample + (64 - m) * obmc_sample;
                     // Round2(blended, 6) = (blended + (1 << 5)) >> 6.
-                    current_plane[curr_idx] = ((blended + (1u32 << 5)) >> 6) as u16;
+                    current_plane[curr_idx] = P::from_i32(((blended + (1u32 << 5)) >> 6) as i32);
                 }
             }
         }
@@ -4976,10 +4970,10 @@ pub fn overlap_blending(
                     let m: u32 = mj as u32;
                     let curr_idx = curr_row_base + pred_x + j;
                     let obmc_idx = obmc_row_base + j;
-                    let curr_sample = current_plane[curr_idx] as u32;
-                    let obmc_sample = obmc_pred[obmc_idx] as u32;
+                    let curr_sample = current_plane[curr_idx].to_i32() as u32;
+                    let obmc_sample = obmc_pred[obmc_idx].to_i32() as u32;
                     let blended = m * curr_sample + (64 - m) * obmc_sample;
-                    current_plane[curr_idx] = ((blended + (1u32 << 5)) >> 6) as u16;
+                    current_plane[curr_idx] = P::from_i32(((blended + (1u32 << 5)) >> 6) as i32);
                 }
             }
         }
@@ -5032,15 +5026,15 @@ pub fn overlap_blending(
 /// [`crate::Error::PartitionWalkOutOfRange`] for the same caller-bug
 /// conditions as [`overlap_blending`].
 #[allow(clippy::too_many_arguments)]
-pub fn overlap_neighbour_predict_blend(
-    current_plane: &mut [u16],
+pub fn overlap_neighbour_predict_blend<P: Pixel>(
+    current_plane: &mut [P],
     curr_stride: usize,
     pred_x: usize,
     pred_y: usize,
     pred_w: usize,
     pred_h: usize,
     pass: OverlapPass,
-    obmc_pred: &[u16],
+    obmc_pred: &[P],
     obmc_stride: usize,
     mask_length: usize,
 ) -> Result<(), crate::Error> {
@@ -5221,13 +5215,7 @@ pub fn reconstruct_inter_block<R: Pixel, P: Pixel>(
 
     // ---------- §7.11.3.1 steps 1-13 — prediction into scratch -----
     let n_samples = w * h;
-    let mut pred_out = PRED_U16_SCRATCH.with(|cell| {
-        let mut b = cell.borrow_mut();
-        if b.len() < n_samples {
-            b.resize(n_samples, 0);
-        }
-        std::mem::take(&mut *b)
-    });
+    let mut pred_out = P::with_prediction_scratch(|b| { if b.len() < n_samples { b.resize(n_samples, P::default()); } std::mem::take(b) });
     let res = predict_inter(
         plane,
         x,
@@ -5252,22 +5240,22 @@ pub fn reconstruct_inter_block<R: Pixel, P: Pixel>(
         &mut pred_out[..n_samples],
     );
     if let Err(e) = res {
-        PRED_U16_SCRATCH.with(|cell| *cell.borrow_mut() = pred_out);
+        P::with_prediction_scratch(|b| *b = pred_out);
         return Err(e);
     }
 
     if x < 0 || y < 0 {
-        PRED_U16_SCRATCH.with(|cell| *cell.borrow_mut() = pred_out);
+        P::with_prediction_scratch(|b| *b = pred_out);
         return Err(crate::Error::PartitionWalkOutOfRange);
     }
     let (px, py) = (x as usize, y as usize);
     if curr_stride == 0 || px >= curr_stride {
-        PRED_U16_SCRATCH.with(|cell| *cell.borrow_mut() = pred_out);
+        P::with_prediction_scratch(|b| *b = pred_out);
         return Err(crate::Error::PartitionWalkOutOfRange);
     }
     let plane_rows = curr_plane.len() / curr_stride;
     if py >= plane_rows {
-        PRED_U16_SCRATCH.with(|cell| *cell.borrow_mut() = pred_out);
+        P::with_prediction_scratch(|b| *b = pred_out);
         return Err(crate::Error::PartitionWalkOutOfRange);
     }
     let fit_w = w.min(curr_stride - px);
@@ -5275,10 +5263,10 @@ pub fn reconstruct_inter_block<R: Pixel, P: Pixel>(
     for i in 0..fit_h {
         let dst = (py + i) * curr_stride + px;
         let src = i * w;
-        store_prediction(&mut curr_plane[dst..dst + fit_w], &pred_out[src..src + fit_w]);
+        (&mut curr_plane[dst..dst + fit_w]).copy_from_slice(&pred_out[src..src + fit_w]);
     }
 
-    PRED_U16_SCRATCH.with(|cell| *cell.borrow_mut() = pred_out);
+    P::with_prediction_scratch(|b| *b = pred_out);
     Ok(())
 }
 
@@ -5367,7 +5355,7 @@ pub fn reconstruct_inter_block_warp<R: Pixel, P: Pixel>(
     }];
 
     // ---------- §7.11.3.1 steps 1-13 — WARP prediction into scratch ---
-    let mut pred_out = vec![0u16; w * h];
+    let mut pred_out = vec![P::default(); w * h];
     predict_inter(
         plane,
         x,
@@ -5416,7 +5404,7 @@ pub fn reconstruct_inter_block_warp<R: Pixel, P: Pixel>(
     for i in 0..fit_h {
         let dst = (py + i) * curr_stride + px;
         let src = i * w;
-        store_prediction(&mut curr_plane[dst..dst + fit_w], &pred_out[src..src + fit_w]);
+        (&mut curr_plane[dst..dst + fit_w]).copy_from_slice(&pred_out[src..src + fit_w]);
     }
 
     Ok(())
@@ -5509,7 +5497,7 @@ pub fn reconstruct_inter_block_obmc<R: Pixel, P: Pixel>(
     }];
 
     // ---------- §7.11.3.1 steps 1-13 + §7.11.3.9-10 OBMC post-step ---
-    let mut pred_out = vec![0u16; w * h];
+    let mut pred_out = vec![P::default(); w * h];
     predict_inter(
         plane,
         x,
@@ -5558,7 +5546,7 @@ pub fn reconstruct_inter_block_obmc<R: Pixel, P: Pixel>(
     for i in 0..fit_h {
         let dst = (py + i) * curr_stride + px;
         let src = i * w;
-        store_prediction(&mut curr_plane[dst..dst + fit_w], &pred_out[src..src + fit_w]);
+        (&mut curr_plane[dst..dst + fit_w]).copy_from_slice(&pred_out[src..src + fit_w]);
     }
 
     Ok(())
@@ -5883,13 +5871,7 @@ pub fn reconstruct_inter_block_compound<R: Pixel, P: Pixel>(
 
     // ---------- §7.11.3.1 steps 1-14 — compound prediction ----------
     let n_samples = w * h;
-    let mut pred_out = PRED_U16_SCRATCH.with(|cell| {
-        let mut b = cell.borrow_mut();
-        if b.len() < n_samples {
-            b.resize(n_samples, 0);
-        }
-        std::mem::take(&mut *b)
-    });
+    let mut pred_out = P::with_prediction_scratch(|b| { if b.len() < n_samples { b.resize(n_samples, P::default()); } std::mem::take(b) });
     let res = predict_inter(
         plane,
         x,
@@ -5914,22 +5896,22 @@ pub fn reconstruct_inter_block_compound<R: Pixel, P: Pixel>(
         &mut pred_out[..n_samples],
     );
     if let Err(e) = res {
-        PRED_U16_SCRATCH.with(|cell| *cell.borrow_mut() = pred_out);
+        P::with_prediction_scratch(|b| *b = pred_out);
         return Err(e);
     }
 
     if x < 0 || y < 0 {
-        PRED_U16_SCRATCH.with(|cell| *cell.borrow_mut() = pred_out);
+        P::with_prediction_scratch(|b| *b = pred_out);
         return Err(crate::Error::PartitionWalkOutOfRange);
     }
     let (px, py) = (x as usize, y as usize);
     if curr_stride == 0 || px >= curr_stride {
-        PRED_U16_SCRATCH.with(|cell| *cell.borrow_mut() = pred_out);
+        P::with_prediction_scratch(|b| *b = pred_out);
         return Err(crate::Error::PartitionWalkOutOfRange);
     }
     let plane_rows = curr_plane.len() / curr_stride;
     if py >= plane_rows {
-        PRED_U16_SCRATCH.with(|cell| *cell.borrow_mut() = pred_out);
+        P::with_prediction_scratch(|b| *b = pred_out);
         return Err(crate::Error::PartitionWalkOutOfRange);
     }
     let fit_w = w.min(curr_stride - px);
@@ -5937,10 +5919,10 @@ pub fn reconstruct_inter_block_compound<R: Pixel, P: Pixel>(
     for i in 0..fit_h {
         let dst = (py + i) * curr_stride + px;
         let src = i * w;
-        store_prediction(&mut curr_plane[dst..dst + fit_w], &pred_out[src..src + fit_w]);
+        (&mut curr_plane[dst..dst + fit_w]).copy_from_slice(&pred_out[src..src + fit_w]);
     }
 
-    PRED_U16_SCRATCH.with(|cell| *cell.borrow_mut() = pred_out);
+    P::with_prediction_scratch(|b| *b = pred_out);
     Ok(())
 }
 
@@ -6139,19 +6121,11 @@ pub fn reconstruct_inter_block_interintra<R: Pixel, P: Pixel>(
     // `curr_plane` into the scratch buffer `predict_inter` consumes (it
     // overwrites the scratch with the blended sample in place).
     let n_samples = w * h;
-    let mut pred_out = PRED_U16_SCRATCH.with(|cell| {
-        let mut b = cell.borrow_mut();
-        if b.len() < n_samples {
-            b.resize(n_samples, 0);
-        }
-        std::mem::take(&mut *b)
-    });
+    let mut pred_out = P::with_prediction_scratch(|b| { if b.len() < n_samples { b.resize(n_samples, P::default()); } std::mem::take(b) });
     for i in 0..fit_h {
         let src = (py + i) * curr_stride + px;
         let dst = i * w;
-        for (dst, &src) in pred_out[dst..dst + fit_w].iter_mut().zip(&curr_plane[src..src + fit_w]) {
-            *dst = src.to_i32() as u16;
-        }
+        pred_out[dst..dst + fit_w].copy_from_slice(&curr_plane[src..src + fit_w]);
     }
 
     // ---------- §7.11.3.11 wedge-mask regeneration (wedge arm) -------
@@ -6224,17 +6198,17 @@ pub fn reconstruct_inter_block_interintra<R: Pixel, P: Pixel>(
         &mut pred_out[..n_samples],
     );
     if let Err(e) = res {
-        PRED_U16_SCRATCH.with(|cell| *cell.borrow_mut() = pred_out);
+        P::with_prediction_scratch(|b| *b = pred_out);
         return Err(e);
     }
 
     for i in 0..fit_h {
         let dst = (py + i) * curr_stride + px;
         let src = i * w;
-        store_prediction(&mut curr_plane[dst..dst + fit_w], &pred_out[src..src + fit_w]);
+        (&mut curr_plane[dst..dst + fit_w]).copy_from_slice(&pred_out[src..src + fit_w]);
     }
 
-    PRED_U16_SCRATCH.with(|cell| *cell.borrow_mut() = pred_out);
+    P::with_prediction_scratch(|b| *b = pred_out);
     Ok(())
 }
 

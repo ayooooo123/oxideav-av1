@@ -110,6 +110,12 @@ pub const SEG_LVL_ALT_LF_Y_V: usize = 1;
 // §7.14.1 / §7.14.2 — public top-level surface.
 // =====================================================================
 
+std::thread_local! {
+    static PREDICTION_U8: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    static PREDICTION_U16: std::cell::RefCell<Vec<u16>> = const { std::cell::RefCell::new(Vec::new()) };
+    static PREDICTION_I32: std::cell::RefCell<Vec<i32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 mod pixel_sealed {
     pub trait Sealed {}
     impl Sealed for u8 {}
@@ -124,6 +130,8 @@ mod pixel_sealed {
 pub trait Pixel: pixel_sealed::Sealed + Copy + Default + Send + Sync + std::fmt::Debug + PartialEq + 'static {
     fn to_i32(self) -> i32;
     fn from_i32(value: i32) -> Self;
+    /// Reuse clipped-prediction scratch for this compile-time sample type.
+    fn with_prediction_scratch<T>(f: impl FnOnce(&mut Vec<Self>) -> T) -> T;
     fn into_bytes(samples: Vec<Self>, bit_depth: u8) -> Vec<u8> {
         if bit_depth == 8 {
             samples.into_iter().map(|v| v.to_i32().clamp(0, 255) as u8).collect()
@@ -140,6 +148,10 @@ impl Pixel for u8 {
     fn from_i32(value: i32) -> Self { value as u8 }
     #[inline]
     fn into_bytes(samples: Vec<Self>, _bit_depth: u8) -> Vec<u8> { samples }
+    #[inline]
+    fn with_prediction_scratch<T>(f: impl FnOnce(&mut Vec<Self>) -> T) -> T {
+        PREDICTION_U8.with_borrow_mut(f)
+    }
 }
 
 impl Pixel for u16 {
@@ -147,6 +159,10 @@ impl Pixel for u16 {
     fn to_i32(self) -> i32 { self as i32 }
     #[inline(always)]
     fn from_i32(value: i32) -> Self { value as u16 }
+    #[inline]
+    fn with_prediction_scratch<T>(f: impl FnOnce(&mut Vec<Self>) -> T) -> T {
+        PREDICTION_U16.with_borrow_mut(f)
+    }
 }
 
 // Signed storage remains available to encoder search and differential oracles.
@@ -155,6 +171,10 @@ impl Pixel for i32 {
     fn to_i32(self) -> i32 { self }
     #[inline(always)]
     fn from_i32(value: i32) -> Self { value }
+    #[inline]
+    fn with_prediction_scratch<T>(f: impl FnOnce(&mut Vec<Self>) -> T) -> T {
+        PREDICTION_I32.with_borrow_mut(f)
+    }
 }
 
 /// Mutable view of a single plane's `CurrFrame[plane]` sample buffer.
