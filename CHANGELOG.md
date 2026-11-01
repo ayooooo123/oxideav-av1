@@ -6,6 +6,9 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Changed
 
+- Collapse bounded DC-only two-dimensional DCTs to their exact row/column
+  rounding and clamp sequence, avoiding empty butterflies and transposes.
+  Differential tests cover every transform size at 8/10/12-bit precision.
 - Read short bit fields through a bounded big-endian word load, specialize
   equiprobable arithmetic bits, and split CDF adaptation at the decoded symbol.
   Exhaustive bit-position/tail checks and arithmetic-state differential tests

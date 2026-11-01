@@ -872,6 +872,25 @@ pub fn inverse_transform_2d(
     bit_depth: u32,
     lossless: bool,
 ) -> Vec<i64> {
+    if !lossless && tx_type == DCT_DCT && tx_sz < TX_SIZES_ALL
+        && matches!(bit_depth, 8 | 10 | 12)
+        && dequant.len() == TX_WIDTH[tx_sz] * TX_HEIGHT[tx_sz]
+        && dequant[0] >= -(1i64 << (bit_depth + 7))
+        && dequant[0] < (1i64 << (bit_depth + 7))
+        && dequant[1..].iter().all(|&v| v == 0)
+    {
+        let mut dc = dequant[0];
+        let log2_w = TX_WIDTH_LOG2[tx_sz] as u32;
+        let log2_h = (TX_HEIGHT[tx_sz] as u32).trailing_zeros();
+        if log2_w.abs_diff(log2_h) == 1 {
+            dc = round2(dc * 2896, 12);
+        }
+        dc = round2(round2(dc * 2896, 12), TRANSFORM_ROW_SHIFT[tx_sz]);
+        let precision = (bit_depth + 6).max(16);
+        dc = dc.clamp(-(1 << (precision - 1)), (1 << (precision - 1)) - 1);
+        dc = round2(round2(dc * 2896, 12), 4);
+        return vec![dc; dequant.len()];
+    }
     #[cfg(any(target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128")))]
     if !lossless && tx_sz < TX_SIZES_ALL && dequant.len() == TX_WIDTH[tx_sz] * TX_HEIGHT[tx_sz] {
         if let Some(residual) = simd::inverse_2d(dequant, tx_sz, tx_type, bit_depth) {
@@ -1051,6 +1070,26 @@ fn apply_col_kernel(t: &mut [i64], tx_type: usize, log2_h: u32, col_clamp_range:
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dc_only_dct_matches_full_scalar_every_size_and_depth() {
+        for size in 0..TX_SIZES_ALL {
+            for depth in [8, 10, 12] {
+                let limit = 1i64 << (depth + 7);
+                let mut input = vec![0; TX_WIDTH[size] * TX_HEIGHT[size]];
+                for dc in [-limit, -limit + 1, -4097, -4096, -4095, -129, -128,
+                    -127, -65, -64, -63, -33, -32, -31, -17, -16, -15, -1,
+                    0, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128,
+                    129, 4095, 4096, 4097, limit - 1]
+                {
+                    input[0] = dc;
+                    assert_eq!(inverse_transform_2d(&input, size, DCT_DCT, depth, false),
+                        inverse_transform_2d_scalar(&input, size, DCT_DCT, depth, false),
+                        "size={size} depth={depth} dc={dc}");
+                }
+            }
+        }
+    }
+
     use super::*;
     use crate::cdf::{TX_16X16, TX_32X32, TX_4X4, TX_4X8, TX_64X64, TX_8X8};
 
