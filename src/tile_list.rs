@@ -653,8 +653,7 @@ pub fn decode_tile_list(
     tl: &TileListObu,
 ) -> Result<SpecFrame, Error> {
     match seq.color_config.bit_depth {
-        8 => decode_tile_list_native::<u8>(seq, fh, anchors, tl),
-        10 | 12 => decode_tile_list_native::<u16>(seq, fh, anchors, tl),
+        8 | 10 | 12 => decode_tile_list_native::<u16>(seq, fh, anchors, tl),
         _ => Err(Error::TileListInvalid),
     }
 }

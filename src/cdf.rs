@@ -29714,6 +29714,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
     /// encoder-mirror drivers where §5.11.47 codes no symbol) can keep
     /// using [`Self::coefficients`], whose behaviour is unchanged.
     #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
     pub fn coefficients_gate_open(
         &mut self,
         decoder: &mut crate::symbol_decoder::SymbolDecoder<'_>,
@@ -29725,6 +29726,26 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         dc_sign_ctx: usize,
         scan: &[u16],
         quant: &mut [i32],
+    ) -> Result<CoefficientsReadout, crate::Error> {
+        self.coefficients_gate_open_inner(
+            decoder, cdfs, plane, is_inter, tx_size, tx_class, dc_sign_ctx, scan, quant, true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    fn coefficients_gate_open_inner(
+        &mut self,
+        decoder: &mut crate::symbol_decoder::SymbolDecoder<'_>,
+        cdfs: &mut TileCdfContext,
+        plane: u8,
+        is_inter: u8,
+        tx_size: usize,
+        tx_class: usize,
+        dc_sign_ctx: usize,
+        scan: &[u16],
+        quant: &mut [i32],
+        zero_quant: bool,
     ) -> Result<CoefficientsReadout, crate::Error> {
         // ---------------- caller-bug guards ----------------
         if tx_size >= TX_SIZES_ALL {
@@ -29765,8 +29786,8 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         }
         // §5.11.39 lines 8-9 zero-fill (idempotent when the caller came
         // through [`Self::coefficients`], which already zeroed).
-        for cell in quant.iter_mut().take(seg_eob) {
-            *cell = 0;
+        if zero_quant {
+            quant[..seg_eob].fill(0);
         }
 
         // ---------------- §5.11.39 EOB read ----------------
@@ -31049,7 +31070,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
             avail_u_chroma,
             enable_intra_edge_filter: self.enable_intra_edge_filter,
         };
-        let _residual = self.residual(
+        self.residual_with_readout(
             decoder,
             cdfs,
             mi_row_b,
@@ -31064,6 +31085,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
             tx_size as usize,
             use_128x128_superblock,
             &neutral_ctx,
+            None,
         )?;
         // §5.11.5 line `is_compound = RefFrame[ 1 ] > INTRA_FRAME` —
         // already derived above. The §5.11.5 walker concludes the
@@ -31544,7 +31566,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
             avail_u_chroma: false,
             enable_intra_edge_filter: self.enable_intra_edge_filter,
         };
-        let _residual = self.residual(
+        self.residual_with_readout(
             decoder,
             cdfs,
             mi_row,
@@ -31553,12 +31575,13 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
             has_chroma,
             subsampling_x,
             subsampling_y,
-            /* is_inter = */ true,
+            true,
             info.lossless,
             info.skip != 0,
             tx_size as usize,
             use_128x128_superblock,
             &neutral_ctx,
+            None,
         )?;
 
         Ok(DecodedBlock {
@@ -31805,7 +31828,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
             avail_u_chroma,
             enable_intra_edge_filter: self.enable_intra_edge_filter,
         };
-        let _residual = self.residual(
+        self.residual_with_readout(
             decoder,
             cdfs,
             mi_row,
@@ -31814,12 +31837,13 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
             has_chroma,
             subsampling_x,
             subsampling_y,
-            /* is_inter = */ false,
+            false,
             info.lossless,
             info.skip != 0,
             tx_size as usize,
             use_128x128_superblock,
             &res_ctx,
+            None,
         )?;
 
         Ok(DecodedBlock {
@@ -32487,35 +32511,25 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         use_128x128_superblock: bool,
         ctx: &ResidualContext,
     ) -> Result<ResidualReadout, crate::Error> {
-        // ---------- caller-bug guards ----------
-        if mi_size >= BLOCK_SIZES {
+        if mi_size >= BLOCK_SIZES
+            || mi_row >= self.mi_rows
+            || mi_col >= self.mi_cols
+            || subsampling_x > 1
+            || subsampling_y > 1
+            || tx_size >= TX_SIZES_ALL
+        {
             return Err(crate::Error::PartitionWalkOutOfRange);
         }
-        if mi_row >= self.mi_rows || mi_col >= self.mi_cols {
-            return Err(crate::Error::PartitionWalkOutOfRange);
-        }
-        if subsampling_x > 1 || subsampling_y > 1 {
-            return Err(crate::Error::PartitionWalkOutOfRange);
-        }
-        if tx_size >= TX_SIZES_ALL {
-            return Err(crate::Error::PartitionWalkOutOfRange);
-        }
-
-        // §5.11.34 lines 3-4: `widthChunks` / `heightChunks`.
         let block_w = block_width(mi_size);
         let block_h = block_height(mi_size);
         let width_chunks = core::cmp::max(1, block_w >> 6);
         let height_chunks = core::cmp::max(1, block_h >> 6);
-        // §5.11.34 line 5: `miSizeChunk`.
         let mi_size_chunk = if width_chunks > 1 || height_chunks > 1 {
             BLOCK_64X64
         } else {
             mi_size
         };
-
-        // §5.11.34 line 22-ish: `1 + HasChroma * 2`.
         let num_planes = 1u8 + if has_chroma { 2 } else { 0 };
-
         let mut readout = ResidualReadout {
             width_chunks: width_chunks as u8,
             height_chunks: height_chunks as u8,
@@ -32526,6 +32540,64 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
             residuals: Vec::new(),
             skip,
         };
+        self.residual_with_readout(
+            decoder,
+            cdfs,
+            mi_row,
+            mi_col,
+            mi_size,
+            has_chroma,
+            subsampling_x,
+            subsampling_y,
+            is_inter,
+            lossless,
+            skip,
+            tx_size,
+            use_128x128_superblock,
+            ctx,
+            Some(&mut readout),
+        )?;
+        Ok(readout)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn residual_with_readout(
+        &mut self,
+        decoder: &mut crate::symbol_decoder::SymbolDecoder<'_>,
+        cdfs: &mut TileCdfContext,
+        mi_row: u32,
+        mi_col: u32,
+        mi_size: usize,
+        has_chroma: bool,
+        subsampling_x: u8,
+        subsampling_y: u8,
+        is_inter: bool,
+        lossless: bool,
+        skip: bool,
+        tx_size: usize,
+        use_128x128_superblock: bool,
+        ctx: &ResidualContext,
+        mut readout: Option<&mut ResidualReadout>,
+    ) -> Result<(), crate::Error> {
+        if mi_size >= BLOCK_SIZES
+            || mi_row >= self.mi_rows
+            || mi_col >= self.mi_cols
+            || subsampling_x > 1
+            || subsampling_y > 1
+            || tx_size >= TX_SIZES_ALL
+        {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        let block_w = block_width(mi_size);
+        let block_h = block_height(mi_size);
+        let width_chunks = core::cmp::max(1, block_w >> 6);
+        let height_chunks = core::cmp::max(1, block_h >> 6);
+        let mi_size_chunk = if width_chunks > 1 || height_chunks > 1 {
+            BLOCK_64X64
+        } else {
+            mi_size
+        };
+        let num_planes = 1u8 + if has_chroma { 2 } else { 0 };
 
         // §5.11.34 outer chunk loop. For `MiSize < BLOCK_128X128` the
         // body executes once with `chunkY = chunkX = 0`. For
@@ -32605,7 +32677,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
                             mi_size,
                             use_128x128_superblock,
                             ctx,
-                            &mut readout,
+                            readout.as_deref_mut(),
                         )?;
                     } else {
                         // §5.11.34 line 26-27: `baseXBlock` /
@@ -32642,7 +32714,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
                                     mi_size,
                                     use_128x128_superblock,
                                     ctx,
-                                    &mut readout,
+                                    readout.as_deref_mut(),
                                 )?;
                                 if step_x == 0 {
                                     break;
@@ -32659,7 +32731,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
             }
         }
 
-        Ok(readout)
+        Ok(())
     }
 
     /// `transform_tree( startX, startY, w, h )` per §5.11.36 (av1-spec
@@ -32700,7 +32772,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         mi_size: usize,
         use_128x128_superblock: bool,
         ctx: &ResidualContext,
-        readout: &mut ResidualReadout,
+        mut readout: Option<&mut ResidualReadout>,
     ) -> Result<(), crate::Error> {
         // §5.11.36 lines 1-3: `maxX = MiCols * MI_SIZE` / `maxY = MiRows
         // * MI_SIZE` early-return.
@@ -32775,7 +32847,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
                 mi_size,
                 use_128x128_superblock,
                 ctx,
-                readout,
+                readout.as_deref_mut(),
             )?;
             self.residual_transform_tree(
                 decoder,
@@ -32814,7 +32886,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
                 mi_size,
                 use_128x128_superblock,
                 ctx,
-                readout,
+                readout.as_deref_mut(),
             )?;
             self.residual_transform_tree(
                 decoder,
@@ -32853,7 +32925,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
                 mi_size,
                 use_128x128_superblock,
                 ctx,
-                readout,
+                readout.as_deref_mut(),
             )?;
             self.residual_transform_tree(
                 decoder,
@@ -32872,7 +32944,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
                 mi_size,
                 use_128x128_superblock,
                 ctx,
-                readout,
+                readout.as_deref_mut(),
             )?;
             self.residual_transform_tree(
                 decoder,
@@ -32891,7 +32963,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
                 mi_size,
                 use_128x128_superblock,
                 ctx,
-                readout,
+                readout.as_deref_mut(),
             )?;
             self.residual_transform_tree(
                 decoder,
@@ -32975,7 +33047,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         mi_size: usize,
         use_128x128_superblock: bool,
         ctx: &ResidualContext,
-        readout: &mut ResidualReadout,
+        mut readout: Option<&mut ResidualReadout>,
     ) -> Result<(), crate::Error> {
         // §5.11.35 lines 1-2: `startX = baseX + 4 * x`, `startY =
         // baseY + 4 * y`.
@@ -33161,16 +33233,18 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         // identity (neither flip flag fires for DCT_DCT, so a
         // skip-path TU with no residual maps cleanly to a no-op step-3
         // merge anyway).
-        readout.tasks.push(ResidualTuTask {
-            plane,
-            start_x,
-            start_y,
-            tx_size: tx_sz as u8,
-            chunk_x,
-            chunk_y,
-            from_transform_tree,
-            plane_tx_type: DCT_DCT as u8,
-        });
+        if let Some(ro) = readout.as_deref_mut() {
+            ro.tasks.push(ResidualTuTask {
+                plane,
+                start_x,
+                start_y,
+                tx_size: tx_sz as u8,
+                chunk_x,
+                chunk_y,
+                from_transform_tree,
+                plane_tx_type: DCT_DCT as u8,
+            });
+        }
 
         // §5.11.35 line 32: `if ( !skip ) eob = coeffs( plane, startX,
         // startY, txSz )` — invoke the §5.11.39 reader for the
@@ -33228,13 +33302,15 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
                 // §5.11.39 tail — culLevel = 0 / dcCategory = 0 stamps
                 // fire on the gate-closed arm too.
                 self.stamp_txb_level_context(plane, tx_sz, x4, y4, 0, 0);
-                readout.coeffs.push(CoefficientsReadout {
-                    all_zero: true,
-                    eob: 0,
-                    cul_level: 0,
-                    dc_category: 0,
-                });
-                readout.residuals.push(None);
+                if let Some(ro) = readout.as_deref_mut() {
+                    ro.coeffs.push(CoefficientsReadout {
+                        all_zero: true,
+                        eob: 0,
+                        cul_level: 0,
+                        dc_category: 0,
+                    });
+                    ro.residuals.push(None);
+                }
             } else {
                 // §5.11.47 `transform_type` S() — luma-only on the
                 // `all_zero == 0` arm. The chroma plane uses
@@ -33307,87 +33383,187 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
                 // for the `flipUD` / `flipLR` destination remap. The task
                 // was pushed above with the DCT_DCT placeholder; on this
                 // arm we replace it with the actual `PlaneTxType`.
-                if let Some(last) = readout.tasks.last_mut() {
-                    last.plane_tx_type = plane_tx_type as u8;
+                if let Some(ro) = readout.as_deref_mut() {
+                    if let Some(last) = ro.tasks.last_mut() {
+                        last.plane_tx_type = plane_tx_type as u8;
+                    }
                 }
-
-                // §8.3.2 tx_class derivation — fold the §3 `*_DCT` /
-                // `*_ADST` / `*_FLIPADST` constants into TX_CLASS_2D /
-                // TX_CLASS_HORIZ / TX_CLASS_VERT.
                 let tx_class = match plane_tx_type {
                     V_DCT | V_ADST | V_FLIPADST => TX_CLASS_VERT,
                     H_DCT | H_ADST | H_FLIPADST => TX_CLASS_HORIZ,
                     _ => TX_CLASS_2D,
                 };
-
-                // §7.5 / §5.11.41 `get_scan( txSz )` — routes per
-                // `(txSz, PlaneTxType)` to the per-size Default / Mrow /
-                // Mcol scan table the §5.11.39 reader walks.
                 let scan = crate::scan::get_scan(tx_sz, plane_tx_type);
-                let mut quant = vec![0i32; tx_w * tx_h];
-                let coeffs = self.coefficients_gate_open(
-                    decoder,
-                    cdfs,
-                    plane,
-                    is_inter as u8,
-                    tx_sz,
-                    tx_class,
-                    dc_sign_ctx,
-                    scan,
-                    &mut quant,
-                )?;
-                // §5.11.39 tail — stamp the TU's `culLevel` / `dcCategory`
-                // into the §6.10.2 context arrays.
-                self.stamp_txb_level_context(
-                    plane,
-                    tx_sz,
-                    x4,
-                    y4,
-                    coeffs.cul_level,
-                    coeffs.dc_category,
-                );
-                readout.coeffs.push(coeffs);
-                // §5.11.35 line 34: `if ( eob > 0 ) reconstruct(...)` —
-                // §7.12.3 dequantization (step 1) + §7.13 inverse
-                // transform + §7.12.3 step-3 frame-buffer merge.
-                if coeffs.eob > 0 {
-                    let dequant = dequantize_step1(
-                        &quant,
-                        tx_sz,
-                        plane,
-                        ctx.segment_id,
-                        plane_tx_type,
-                        ctx.seg_qm_level[plane as usize],
-                        &ctx.quant,
+                if let Some(ro) = readout {
+                    let mut quant = vec![0i32; tx_w * tx_h];
+                    let coeffs = self.coefficients_gate_open(
+                        decoder, cdfs, plane, is_inter as u8, tx_sz, tx_class, dc_sign_ctx, scan,
+                        &mut quant,
+                    )?;
+                    self.stamp_txb_level_context(
+                        plane, tx_sz, x4, y4, coeffs.cul_level, coeffs.dc_category,
                     );
-                    let residual = crate::transform::inverse_transform_2d(
-                        &dequant,
-                        tx_sz,
-                        plane_tx_type,
-                        ctx.quant.bit_depth as u32,
-                        lossless,
-                    );
-                    // §7.12.3 step-3 (av1-spec p.295) — merge the per-TU
-                    // `Residual[i][j]` into `CurrFrame[plane][y + yy][x +
-                    // xx]` with the `flipLR` / `flipUD` destination remap
-                    // for the FLIPADST family and a `Clip1` envelope
-                    // against `(1 << BitDepth) - 1`. The buffer is
-                    // allocated lazily on the first per-plane merge call
-                    // (see [`Self::ensure_curr_frame_plane`]).
-                    self.curr_frame_step3_merge(
-                        plane,
-                        start_x,
-                        start_y,
-                        tx_sz,
-                        plane_tx_type,
-                        &residual,
-                        ctx.quant.bit_depth,
-                        sub_x,
-                        sub_y,
-                    );
-                    readout.residuals.push(Some(residual));
+                    ro.coeffs.push(coeffs);
+                    if coeffs.eob > 0 {
+                        let dequant = dequantize_step1(
+                            &quant,
+                            tx_sz,
+                            plane,
+                            ctx.segment_id,
+                            plane_tx_type,
+                            ctx.seg_qm_level[plane as usize],
+                            &ctx.quant,
+                        );
+                        let residual = crate::transform::inverse_transform_2d(
+                            &dequant,
+                            tx_sz,
+                            plane_tx_type,
+                            ctx.quant.bit_depth as u32,
+                            lossless,
+                        );
+                        self.curr_frame_step3_merge(
+                            plane, start_x, start_y, tx_sz, plane_tx_type, &residual,
+                            ctx.quant.bit_depth, sub_x, sub_y,
+                        );
+                        ro.residuals.push(Some(residual));
+                    } else {
+                        ro.residuals.push(None);
+                    }
                 } else {
-                    readout.residuals.push(None);
+                    struct TuScratch {
+                        quant: [i32; 4096],
+                        dequant: [i64; 4096],
+                        dc_buf: [i64; 4096],
+                    }
+                    std::thread_local! {
+                        static AV1_TU_SCRATCH: core::cell::Cell<Option<Box<TuScratch>>> = const { core::cell::Cell::new(None) };
+                    }
+                    let mut scratch = AV1_TU_SCRATCH.with(|c| c.take()).unwrap_or_else(|| {
+                        Box::new(TuScratch {
+                            quant: [0; 4096],
+                            dequant: [0; 4096],
+                            dc_buf: [0; 4096],
+                        })
+                    });
+                    let n_tu = tx_w * tx_h;
+                    let res = self.coefficients_gate_open_inner(
+                        decoder,
+                        cdfs,
+                        plane,
+                        is_inter as u8,
+                        tx_sz,
+                        tx_class,
+                        dc_sign_ctx,
+                        scan,
+                        &mut scratch.quant[..n_tu],
+                        false,
+                    );
+                    let coeffs = match res {
+                        Ok(c) => c,
+                        Err(e) => {
+                            scratch.quant[..n_tu.min(1024)].fill(0);
+                            AV1_TU_SCRATCH.with(|cell| cell.set(Some(scratch)));
+                            return Err(e);
+                        }
+                    };
+                    self.stamp_txb_level_context(
+                        plane, tx_sz, x4, y4, coeffs.cul_level, coeffs.dc_category,
+                    );
+                    if coeffs.eob > 0 {
+                        let eob_n = coeffs.eob as usize;
+                        let tw = core::cmp::min(32, tx_w);
+                        let dq_shift: u32 = match dequant_denom(tx_sz) {
+                            1 => 0,
+                            2 => 1,
+                            _ => 2,
+                        };
+                        let clip_min: i64 = -(1i64 << (7 + ctx.quant.bit_depth as u32));
+                        let clip_max: i64 = (1i64 << (7 + ctx.quant.bit_depth as u32)) - 1;
+                        let dc_q_val = get_dc_quant(&ctx.quant, plane, ctx.segment_id) as i64;
+                        let ac_q_val = get_ac_quant(&ctx.quant, plane, ctx.segment_id) as i64;
+                        let seg_qm_level = ctx.seg_qm_level[plane as usize];
+                        let qm_active =
+                            ctx.quant.using_qmatrix && plane_tx_type < IDTX && seg_qm_level < 15;
+                        for &pos_u16 in &scan[..eob_n] {
+                            let p = pos_u16 as usize;
+                            let ql = scratch.quant[p];
+                            if ql != 0 {
+                                scratch.quant[p] = 0;
+                                let i = p / tw;
+                                let j = p % tw;
+                                let q = if p == 0 { dc_q_val } else { ac_q_val };
+                                let q2 = if qm_active {
+                                    let qm = crate::qmatrix::qmatrix_value(
+                                        seg_qm_level, plane, tx_sz, i, j,
+                                    ) as i64;
+                                    (q * qm + 16) >> 5
+                                } else {
+                                    q
+                                };
+                                let dq = (ql as i64) * q2;
+                                let mag = ((dq.unsigned_abs() & 0xFF_FFFF) >> dq_shift) as i64;
+                                let dq2 = if dq < 0 { -mag } else { mag };
+                                scratch.dequant[i * tx_w + j] = dq2.clamp(clip_min, clip_max);
+                            }
+                        }
+                        let bd = ctx.quant.bit_depth as u32;
+                        if eob_n == 1
+                            && !lossless
+                            && plane_tx_type == DCT_DCT
+                            && matches!(bd, 8 | 10 | 12)
+                        {
+                            let mut dc = scratch.dequant[0];
+                            scratch.dequant[0] = 0;
+                            let log2_w = TX_WIDTH_LOG2[tx_sz] as u32;
+                            let log2_h = (tx_h as u32).trailing_zeros();
+                            if log2_w.abs_diff(log2_h) == 1 {
+                                dc = (dc * 2896 + 2048) >> 12;
+                            }
+                            let rs = crate::transform::TRANSFORM_ROW_SHIFT[tx_sz];
+                            let d1 = (dc * 2896 + 2048) >> 12;
+                            dc = if rs == 0 { d1 } else { (d1 + (1 << (rs - 1))) >> rs };
+                            let prec = (bd + 6).max(16);
+                            dc = dc.clamp(-(1 << (prec - 1)), (1 << (prec - 1)) - 1);
+                            let d2 = (dc * 2896 + 2048) >> 12;
+                            dc = (d2 + 8) >> 4;
+                            scratch.dc_buf[..n_tu].fill(dc);
+                            self.curr_frame_step3_merge(
+                                plane,
+                                start_x,
+                                start_y,
+                                tx_sz,
+                                plane_tx_type,
+                                &scratch.dc_buf[..n_tu],
+                                ctx.quant.bit_depth,
+                                sub_x,
+                                sub_y,
+                            );
+                        } else {
+                            let residual = crate::transform::inverse_transform_2d(
+                                &scratch.dequant[..n_tu],
+                                tx_sz,
+                                plane_tx_type,
+                                bd,
+                                lossless,
+                            );
+                            for &pos_u16 in &scan[..eob_n] {
+                                let p = pos_u16 as usize;
+                                scratch.dequant[(p / tw) * tx_w + (p % tw)] = 0;
+                            }
+                            self.curr_frame_step3_merge(
+                                plane,
+                                start_x,
+                                start_y,
+                                tx_sz,
+                                plane_tx_type,
+                                &residual,
+                                ctx.quant.bit_depth,
+                                sub_x,
+                                sub_y,
+                            );
+                        }
+                    }
+                    AV1_TU_SCRATCH.with(|cell| cell.set(Some(scratch)));
                 }
             }
         } else if plane == 0 {

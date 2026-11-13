@@ -17,23 +17,35 @@ unsafe fn samples<P: Pixel>(p: *const P) -> v128 {
     }
 }
 
-pub(super) fn horizontal<R: Pixel>(
-    src: &[R],
-    coeff: &[i32; 8],
-    shift: u32,
-    dst: &mut [i32],
-    w: usize,
-) {
+pub(super) fn horizontal<R: Pixel>(src: &[R], coeff: &[i32; 8], shift: u32, dst: &mut [i32], w: usize) {
     assert!(src.len() >= w + 7 && dst.len() >= w);
     assert!((1..32).contains(&shift));
+    let wide_end = if core::mem::size_of::<R>() <= 2 { w / 16 * 16 } else { 0 };
     let end = w / 8 * 8;
-    // SAFETY: the checked source includes every tap of each eight-sample group;
-    // the destination covers both four-lane stores. AV1 products fit i32.
+    let end4 = w / 4 * 4;
+    // SAFETY: every load covers only its checked output group and seven taps.
     unsafe {
-        for x in (0..end).step_by(8) {
+        for x in (0..wide_end).step_by(16) {
+            let mut sums = [i32x4_splat(1 << (shift - 1)); 4];
+            for (k, &c) in coeff.iter().enumerate() {
+                if c == 0 { continue; }
+                let a = samples(src.as_ptr().add(x + k));
+                let b = samples(src.as_ptr().add(x + k + 8));
+                let c = i16x8_splat(c as i16);
+                sums[0] = i32x4_add(sums[0], i32x4_extmul_low_i16x8(a, c));
+                sums[1] = i32x4_add(sums[1], i32x4_extmul_high_i16x8(a, c));
+                sums[2] = i32x4_add(sums[2], i32x4_extmul_low_i16x8(b, c));
+                sums[3] = i32x4_add(sums[3], i32x4_extmul_high_i16x8(b, c));
+            }
+            for (lane, sum) in sums.into_iter().enumerate() {
+                v128_store(dst.as_mut_ptr().add(x + lane * 4).cast(), i32x4_shr(sum, shift));
+            }
+        }
+        for x in (wide_end..end).step_by(8) {
             let mut lo = i32x4_splat(1 << (shift - 1));
             let mut hi = lo;
             for (k, &c) in coeff.iter().enumerate() {
+                if c == 0 { continue; }
                 let v = samples(src.as_ptr().add(x + k));
                 let c = i16x8_splat(c as i16);
                 lo = i32x4_add(lo, i32x4_extmul_low_i16x8(v, c));
@@ -42,8 +54,24 @@ pub(super) fn horizontal<R: Pixel>(
             v128_store(dst.as_mut_ptr().add(x).cast(), i32x4_shr(lo, shift));
             v128_store(dst.as_mut_ptr().add(x + 4).cast(), i32x4_shr(hi, shift));
         }
+        for x in (end..end4).step_by(4) {
+            let mut sum = i32x4_splat(1 << (shift - 1));
+            for (k, &c) in coeff.iter().enumerate() {
+                if c == 0 { continue; }
+                let p = src.as_ptr().add(x + k);
+                let v = if core::mem::size_of::<R>() == 1 {
+                    i16x8_extend_low_u8x16(v128_load32_zero(p.cast()))
+                } else if core::mem::size_of::<R>() == 2 {
+                    v128_load64_zero(p.cast())
+                } else {
+                    i16x8_narrow_i32x4(v128_load(p.cast()), i32x4_splat(0))
+                };
+                sum = i32x4_add(sum, i32x4_extmul_low_i16x8(v, i16x8_splat(c as i16)));
+            }
+            v128_store(dst.as_mut_ptr().add(x).cast(), i32x4_shr(sum, shift));
+        }
     }
-    for x in end..w {
+    for x in end4..w {
         let sum: i32 = (0..8).map(|k| coeff[k] * src[x + k].to_i32()).sum();
         dst[x] = (sum + (1 << (shift - 1))) >> shift;
     }
@@ -66,6 +94,7 @@ pub(super) fn vertical(
         for x in (0..end).step_by(4) {
             let mut sum = i32x4_splat(1 << (shift - 1));
             for (k, &c) in coeff.iter().enumerate() {
+                if c == 0 { continue; }
                 sum = i32x4_add(
                     sum,
                     i32x4_mul(
@@ -347,4 +376,37 @@ mod tests {
             }
         }
     }
+}
+
+pub(super) fn copy_round<R: Pixel>(src: &[R], dst: &mut [i32], shift: u32) {
+    assert!(src.len() >= dst.len() && (1..32).contains(&shift));
+    let end = dst.len() / 4 * 4;
+    // SAFETY: only four checked samples are loaded, including at narrow tails.
+    unsafe {
+        for x in (0..end).step_by(4) {
+            let p = src.as_ptr().add(x);
+            let v = if core::mem::size_of::<R>() == 1 {
+                i32x4_extend_low_u16x8(i16x8_extend_low_u8x16(v128_load32_zero(p.cast())))
+            } else if core::mem::size_of::<R>() == 2 {
+                i32x4_extend_low_u16x8(v128_load64_zero(p.cast()))
+            } else { v128_load(p.cast()) };
+            let v = i32x4_shr(i32x4_add(i32x4_shl(v, 7), i32x4_splat(1 << (shift - 1))), shift);
+            v128_store(dst.as_mut_ptr().add(x).cast(), v);
+        }
+    }
+    for x in end..dst.len() { dst[x] = (128 * src[x].to_i32() + (1 << (shift - 1))) >> shift; }
+}
+
+pub(super) fn finish(row: &mut [i32], shift: u32) {
+    assert!((1..32).contains(&shift));
+    let end = row.len() / 4 * 4;
+    // SAFETY: each in-place load/store covers four complete intermediates.
+    unsafe {
+        for x in (0..end).step_by(4) {
+            let p = row.as_mut_ptr().add(x);
+            let v = i32x4_shr(i32x4_add(i32x4_shl(v128_load(p.cast()), 7), i32x4_splat(1 << (shift - 1))), shift);
+            v128_store(p.cast(), v);
+        }
+    }
+    for v in &mut row[end..] { *v = (128 * *v + (1 << (shift - 1))) >> shift; }
 }

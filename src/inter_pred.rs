@@ -599,6 +599,27 @@ mod neon;
 mod wasm;
 
 use crate::loop_filter::Pixel;
+#[inline(always)]
+fn copy_prediction_round<R: Pixel>(src: &[R], dst: &mut [i32], shift: u32) {
+    #[cfg(target_arch = "aarch64")]
+    { neon::copy_round(src, dst, shift); }
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    { wasm::copy_round(src, dst, shift); }
+    #[cfg(not(any(target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128"))))]
+    for (out, &sample) in dst.iter_mut().zip(src) {
+        *out = (128 * sample.to_i32() + (1 << (shift - 1))) >> shift;
+    }
+}
+
+#[inline(always)]
+fn finish_prediction_round(row: &mut [i32], shift: u32) {
+    #[cfg(target_arch = "aarch64")]
+    { neon::finish(row, shift); }
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    { wasm::finish(row, shift); }
+    #[cfg(not(any(target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128"))))]
+    for value in row { *value = (128 * *value + (1 << (shift - 1))) >> shift; }
+}
 
 
 #[allow(dead_code)]
@@ -772,6 +793,7 @@ fn filter_8tap_v(
 /// ref_height * ref_stride`, `w == 0`, `h == 0`, `w > 256`, `h > 256`,
 /// `step_x <= 0`, `step_y <= 0`, `interp_filter_x >= 6`,
 /// `interp_filter_y >= 6`, `pred.len() < h * w`.
+
 #[allow(clippy::too_many_arguments)]
 pub fn block_inter_prediction<R: Pixel>(
     plane: u8,
@@ -867,11 +889,7 @@ pub fn block_inter_prediction<R: Pixel>(
         let y_int = start_y >> SCALE_SUBPEL_BITS;
         let round0 = 1i32 << (inter_round0 - 1);
         let round1 = 1i32 << (inter_round1 - 1);
-        let finish = |row: &mut [i32]| {
-            for value in row {
-                *value = (128 * *value + round1) >> inter_round1;
-            }
-        };
+        let finish = |row: &mut [i32]| finish_prediction_round(row, inter_round1);
         if phase_x == 0 {
             let inside_x = x_int >= 0 && x_int as usize + w <= plane_w;
             for r in 0..h {
@@ -880,10 +898,8 @@ pub fn block_inter_prediction<R: Pixel>(
                 let dst = &mut pred[r * w..(r + 1) * w];
                 if inside_x {
                     let start = base + x_int as usize;
-                    for (out, &sample) in dst.iter_mut().zip(&ref_plane[start..start + w]) {
-                        let horizontal = (128 * sample.to_i32() + round0) >> inter_round0;
-                        *out = (128 * horizontal + round1) >> inter_round1;
-                    }
+                    copy_prediction_round(&ref_plane[start..start + w], dst, inter_round0);
+                    finish(dst);
                 } else {
                     for (c, out) in dst.iter_mut().enumerate() {
                         let x = clip3_i32(0, last_x, x_int + c as i32) as usize;
@@ -928,13 +944,7 @@ pub fn block_inter_prediction<R: Pixel>(
     };
 
     let needed = intermediate_height * w;
-    INTERMEDIATE_SCRATCH.with(|cell| {
-        let mut buf = cell.borrow_mut();
-        if buf.len() < needed {
-            buf.resize(needed, 0);
-        }
-        let intermediate = &mut buf[..needed];
-
+    let mut run_with_intermediate = |intermediate: &mut [i32]| {
         if is_unscaled {
             let coeffs_h = &SUBPEL_FILTERS[h_filter][phase_x];
             let coeffs_v = &SUBPEL_FILTERS[v_filter][phase_y];
@@ -952,9 +962,7 @@ pub fn block_inter_prediction<R: Pixel>(
                     let dst_row = &mut intermediate[r * w..(r + 1) * w];
                     if start_x_int >= 0 && start_x_int as usize + w <= plane_w {
                         let start = row_base + start_x_int as usize;
-                        for (dst, &src) in dst_row.iter_mut().zip(&ref_plane[start..start + w]) {
-                            *dst = (128 * src.to_i32() + round_offset) >> inter_round0;
-                        }
+                        copy_prediction_round(&ref_plane[start..start + w], dst_row, inter_round0);
                     } else {
                         for (c, dst) in dst_row.iter_mut().enumerate() {
                             let rx = clip3_i32(0, last_x, start_x_int + c as i32) as usize;
@@ -1026,7 +1034,19 @@ pub fn block_inter_prediction<R: Pixel>(
                 }
             }
         }
-    });
+    };
+    if needed <= 64 * 71 {
+        let mut stack_buf = [0i32; 64 * 71];
+        run_with_intermediate(&mut stack_buf[..needed]);
+    } else {
+        INTERMEDIATE_SCRATCH.with(|cell| {
+            let mut buf = cell.borrow_mut();
+            if buf.len() < needed {
+                buf.resize(needed, 0);
+            }
+            run_with_intermediate(&mut buf[..needed]);
+        });
+    }
 
 
     Ok(())
@@ -2547,96 +2567,10 @@ pub fn predict_inter<R: Pixel, P: Pixel>(
     // arm, step 12 = `block_warp` per 8×8 sub-section. The compound
     // arm (step 14) repeats the same body for `refList = 1`.
     let n_samples = w * h;
-    let mut pred0 = PRED_SCRATCH_0.with(|cell| {
-        let mut b = cell.borrow_mut();
-        if b.len() < n_samples {
-            let missing = n_samples - b.len();
-            b.try_reserve_exact(missing)
-                .map_err(|_| crate::Error::PartitionWalkOutOfRange)?;
-            b.resize(n_samples, 0);
-        }
-        Ok::<_, crate::Error>(std::mem::take(&mut *b))
-    })?;
-
-    let res0 = predict_inter_one_ref_into(
-        &refs[0],
-        /* ref_list */ 0,
-        plane,
-        x,
-        y,
-        w,
-        h,
-        motion_mode,
-        subsampling_x,
-        subsampling_y,
-        frame_width,
-        frame_height,
-        interp_filter_x,
-        interp_filter_y,
-        rv.inter_round0,
-        rv.inter_round1,
-        warp,
-        effective_local_valid,
-        &mut pred0[..n_samples],
-    );
-    if let Err(e) = res0 {
-        PRED_SCRATCH_0.with(|cell| *cell.borrow_mut() = pred0);
-        return Err(e);
-    }
-
-    // ---------- §7.11.3.1 step 14 + final blend ----------
-    if is_inter_intra {
-        let ii = inter_intra.expect("inter_intra checked above");
-        let blend_res = match ii.wedge {
-            None => {
-                let mut mask = vec![0u8; w * h];
-                intra_mode_variant_mask(ii.interintra_mode, w, h, &mut mask)
-                    .and_then(|()| {
-                        mask_blend_interintra(
-                            bit_depth,
-                            rv.inter_post_round,
-                            /* sub_x */ 0,
-                            /* sub_y */ 0,
-                            &pred0[..n_samples],
-                            w,
-                            h,
-                            &mask,
-                            /* mask_stride */ 0,
-                            pred_out,
-                        )
-                    })
-            }
-            Some(wi) => {
-                mask_blend_interintra(
-                    bit_depth,
-                    rv.inter_post_round,
-                    subsampling_x,
-                    subsampling_y,
-                    &pred0[..n_samples],
-                    w,
-                    h,
-                    wi.mask,
-                    wi.mask_stride,
-                    pred_out,
-                )
-            }
-        };
-        PRED_SCRATCH_0.with(|cell| *cell.borrow_mut() = pred0);
-        blend_res?;
-    } else if is_compound {
-        let mut pred1 = PRED_SCRATCH_1.with(|cell| {
-            let mut b = cell.borrow_mut();
-            if b.len() < n_samples {
-                let missing = n_samples - b.len();
-                b.try_reserve_exact(missing)
-                    .map_err(|_| crate::Error::PartitionWalkOutOfRange)?;
-                b.resize(n_samples, 0);
-            }
-            Ok::<_, crate::Error>(std::mem::take(&mut *b))
-        })?;
-        let res1 = predict_inter_one_ref_into(
-            &refs[1],
-            /* ref_list */ 1,
+    let run_pred_blend = |pred0: &mut [i32]| -> Result<(), crate::Error> {
+        predict_inter_one_ref_into(
+            &refs[0],
+            /* ref_list */ 0,
             plane,
             x,
             y,
@@ -2653,36 +2587,116 @@ pub fn predict_inter<R: Pixel, P: Pixel>(
             rv.inter_round1,
             warp,
             effective_local_valid,
-            &mut pred1[..n_samples],
-        );
-        if let Err(e) = res1 {
-            PRED_SCRATCH_0.with(|cell| *cell.borrow_mut() = pred0);
-            PRED_SCRATCH_1.with(|cell| *cell.borrow_mut() = pred1);
-            return Err(e);
-        }
-        let cp = compound.expect("compound checked above");
-        let blend_res = predict_inter_compound_blend(
-            plane,
-            bit_depth,
-            rv.inter_post_round,
-            subsampling_x,
-            subsampling_y,
-            w,
-            h,
-            &pred0[..n_samples],
-            &pred1[..n_samples],
-            cp,
-            pred_out,
-        );
-        PRED_SCRATCH_0.with(|cell| *cell.borrow_mut() = pred0);
-        PRED_SCRATCH_1.with(|cell| *cell.borrow_mut() = pred1);
-        blend_res?;
-    } else {
-        let clip_res = clip1_single_ref(bit_depth, &pred0[..n_samples], pred_out);
-        PRED_SCRATCH_0.with(|cell| *cell.borrow_mut() = pred0);
-        clip_res?;
-    }
+            pred0,
+        )?;
 
+        if is_inter_intra {
+            let ii = inter_intra.expect("inter_intra checked above");
+            match ii.wedge {
+                None => {
+                    let mut mask = vec![0u8; w * h];
+                    intra_mode_variant_mask(ii.interintra_mode, w, h, &mut mask)?;
+                    mask_blend_interintra(
+                        bit_depth,
+                        rv.inter_post_round,
+                        /* sub_x */ 0,
+                        /* sub_y */ 0,
+                        pred0,
+                        w,
+                        h,
+                        &mask,
+                        /* mask_stride */ 0,
+                        pred_out,
+                    )?;
+                }
+                Some(wi) => {
+                    mask_blend_interintra(
+                        bit_depth,
+                        rv.inter_post_round,
+                        subsampling_x,
+                        subsampling_y,
+                        pred0,
+                        w,
+                        h,
+                        wi.mask,
+                        wi.mask_stride,
+                        pred_out,
+                    )?;
+                }
+            }
+        } else if is_compound {
+            let run_compound = |pred1: &mut [i32]| -> Result<(), crate::Error> {
+                predict_inter_one_ref_into(
+                    &refs[1],
+                    /* ref_list */ 1,
+                    plane,
+                    x,
+                    y,
+                    w,
+                    h,
+                    motion_mode,
+                    subsampling_x,
+                    subsampling_y,
+                    frame_width,
+                    frame_height,
+                    interp_filter_x,
+                    interp_filter_y,
+                    rv.inter_round0,
+                    rv.inter_round1,
+                    warp,
+                    effective_local_valid,
+                    pred1,
+                )?;
+                let cp = compound.expect("compound checked above");
+                predict_inter_compound_blend(
+                    plane,
+                    bit_depth,
+                    rv.inter_post_round,
+                    subsampling_x,
+                    subsampling_y,
+                    w,
+                    h,
+                    pred0,
+                    pred1,
+                    cp,
+                    pred_out,
+                )
+            };
+            if n_samples <= 64 * 64 {
+                let mut stack_pred1 = [0i32; 64 * 64];
+                run_compound(&mut stack_pred1[..n_samples])?;
+            } else {
+                let mut pred1 = PRED_SCRATCH_1.with(|cell| {
+                    let mut b = cell.borrow_mut();
+                    if b.len() < n_samples {
+                        b.resize(n_samples, 0);
+                    }
+                    std::mem::take(&mut *b)
+                });
+                let r = run_compound(&mut pred1[..n_samples]);
+                PRED_SCRATCH_1.with(|cell| *cell.borrow_mut() = pred1);
+                r?;
+            }
+        } else {
+            clip1_single_ref(bit_depth, pred0, pred_out)?;
+        }
+        Ok(())
+    };
+    if n_samples <= 64 * 64 {
+        let mut stack_pred0 = [0i32; 64 * 64];
+        run_pred_blend(&mut stack_pred0[..n_samples])?;
+    } else {
+        let mut pred0 = PRED_SCRATCH_0.with(|cell| {
+            let mut b = cell.borrow_mut();
+            if b.len() < n_samples {
+                b.resize(n_samples, 0);
+            }
+            std::mem::take(&mut *b)
+        });
+        let r = run_pred_blend(&mut pred0[..n_samples]);
+        PRED_SCRATCH_0.with(|cell| *cell.borrow_mut() = pred0);
+        r?;
+    }
     // ---------- §7.11.3.1 post-step — OBMC overlap blend ---------
     //
     // av1-spec p.258 line 14414: "If motion_mode is equal to OBMC,

@@ -23,7 +23,8 @@ use crate::Error;
 /// `FloorLog2(x)` per §4.7: floor of log base 2 of `x`. For `x == 0`
 /// we return 0 (the §4.7 helper is undefined at zero; ns() is only
 /// invoked with `n >= 1`, so this convention is never reached).
-fn floor_log2(x: u32) -> u32 {
+#[inline(always)]
+pub(crate) fn floor_log2(x: u32) -> u32 {
     if x == 0 {
         0
     } else {
@@ -34,9 +35,9 @@ fn floor_log2(x: u32) -> u32 {
 /// MSB-first bit reader.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct BitReader<'a> {
-    bytes: &'a [u8],
+    pub(crate) bytes: &'a [u8],
     /// Total bit position from the start of `bytes`, in bits.
-    pos: usize,
+    pub(crate) pos: usize,
 }
 
 impl<'a> BitReader<'a> {
@@ -65,6 +66,7 @@ impl<'a> BitReader<'a> {
     ///
     /// `n` may be 0..=64. Returns 0 when `n == 0` per the §8.1 loop
     /// (`x = 0` and the body is skipped).
+    #[inline(always)]
     pub(crate) fn f(&mut self, n: u32) -> Result<u64, Error> {
         debug_assert!(n <= 64);
         if n == 0 {
@@ -76,6 +78,18 @@ impl<'a> BitReader<'a> {
             let value = (word << (self.pos & 7)) >> (32 - n);
             self.pos += n as usize;
             return Ok(u64::from(value));
+        }
+        if n <= 24 && self.bytes.len().saturating_mul(8).saturating_sub(self.pos) >= n as usize {
+            let mut remaining = n;
+            let mut value = 0u64;
+            while remaining != 0 {
+                let bits = remaining.min(8 - (self.pos & 7) as u32);
+                let shift = 8 - (self.pos & 7) as u32 - bits;
+                value = (value << bits) | u64::from((self.bytes[self.pos >> 3] >> shift) & (255 >> (8 - bits)));
+                self.pos += bits as usize;
+                remaining -= bits;
+            }
+            return Ok(value);
         }
         let mut x: u64 = 0;
         for _ in 0..n {

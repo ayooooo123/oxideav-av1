@@ -16,6 +16,7 @@ unsafe fn convolution(
     unsafe {
         let mut sum = i32x4_splat(1 << (shift - 1));
         for k in 0..3 {
+            if filter[k] == 0 { continue; }
             let pair = i32x4_add(v128_load(rows[k].cast()), v128_load(rows[6 - k].cast()));
             sum = i32x4_add(sum, i32x4_mul(pair, i32x4_splat(filter[k])));
         }

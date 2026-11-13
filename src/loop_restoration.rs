@@ -87,6 +87,8 @@ use crate::loop_filter::{Pixel, PlaneBuffer};
 use crate::uncompressed_header_tail::{FrameRestorationType, LrParams};
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
 mod wasm;
+#[cfg(target_arch = "aarch64")]
+mod neon;
 
 // =====================================================================
 // §7.17 constant lookup tables — av1-spec p.107 / p.332.
@@ -1070,7 +1072,9 @@ fn wiener_filter_at<P: Pixel>(
         let dst = &mut intermediate[r * w..(r + 1) * w];
         #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
         wasm::horizontal(wrow, &hfilter, inter_round0, -offset, limit - offset, dst);
-        #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
+        #[cfg(target_arch = "aarch64")]
+        neon::horizontal(wrow, &hfilter, inter_round0, -offset, limit - offset, dst);
+        #[cfg(not(any(target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128"))))]
         wiener_horizontal_scalar(wrow, &hfilter, inter_round0, -offset, limit - offset, dst);
     }
     // av1-spec p.334 lines 18476-18484: vertical pass writes
@@ -1093,7 +1097,9 @@ fn wiener_filter_at<P: Pixel>(
         let rows = core::array::from_fn(|k| &intermediate[(r + k) * w..(r + k) * w + width]);
         #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
         wasm::vertical(rows, &vfilter, inter_round1, max_sample, dst);
-        #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
+        #[cfg(target_arch = "aarch64")]
+        neon::vertical(rows, &vfilter, inter_round1, max_sample, dst);
+        #[cfg(not(any(target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128"))))]
         wiener_vertical_scalar(rows, &vfilter, inter_round1, max_sample, dst);
     }
 }

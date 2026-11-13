@@ -43,6 +43,7 @@ const EC_MIN_PROB: u32 = 4;
 /// returns 0 for `x == 0` defensively (never reached in practice — the
 /// renormalisation step only invokes it on a `SymbolRange` that is at
 /// least `1 << 8`, and the §8.3 rate calculation on `N >= 1`).
+#[inline(always)]
 fn floor_log2(x: u32) -> u32 {
     if x == 0 {
         0
@@ -167,46 +168,62 @@ impl<'a> SymbolDecoder<'a> {
     /// `disable_cdf_update` was set at `init_symbol`.
     ///
     /// Returns the decoded `symbol` in `0..N`.
+    #[inline(always)]
     pub fn read_symbol(&mut self, cdf: &mut [u16]) -> Result<u32, Error> {
-        // N = number of possible symbol values = cdf.len() - 1.
-        let n = cdf.len() as u32 - 1;
+        let len = cdf.len();
+        if len == 3 && cdf[1] == (1 << 15) {
+            let r = self.range >> 8;
+            let f0 = (1u32 << 15) - u32::from(cdf[0]);
+            let cur0 = ((r * (f0 >> EC_PROB_SHIFT)) >> (7 - EC_PROB_SHIFT)) + EC_MIN_PROB;
+            let symbol = if self.value >= cur0 {
+                self.range -= cur0;
+                self.value -= cur0;
+                0u32
+            } else {
+                self.range = cur0;
+                1u32
+            };
+            self.renormalize()?;
+            if !self.disable_cdf_update {
+                let cnt = u32::from(cdf[2]);
+                let rate = 4 + u32::from(cnt > 15) + u32::from(cnt > 31);
+                let c0 = u32::from(cdf[0]);
+                cdf[0] = if symbol == 0 {
+                    c0 + (((1 << 15) - c0) >> rate)
+                } else {
+                    c0 - (c0 >> rate)
+                } as u16;
+                if cnt < 32 {
+                    cdf[2] = (cnt + 1) as u16;
+                }
+            }
+            return Ok(symbol);
+        }
+
+        let n = len as u32 - 1;
         debug_assert!(n >= 1, "§8.2.6: N must be greater than 1");
 
-        // §8.2.6 symbol-search loop.
-        //   cur = SymbolRange
-        //   symbol = -1
-        //   do { symbol++; prev = cur;
-        //        f = (1<<15) - cdf[symbol]
-        //        cur = ((SymbolRange >> 8) * (f >> EC_PROB_SHIFT)) >> (7 - EC_PROB_SHIFT)
-        //        cur += EC_MIN_PROB * (N - symbol - 1)
-        //   } while ( SymbolValue < cur )
+        let r = self.range >> 8;
         let mut cur = self.range;
         let mut prev;
-        // symbol starts at -1 and is pre-incremented at the loop top, so
-        // the first iteration evaluates symbol = 0.
-        let mut symbol: i64 = -1;
+        let mut s = 0usize;
+        let mut min_term = EC_MIN_PROB * (n - 1);
         loop {
-            symbol += 1;
             prev = cur;
-            let s = symbol as usize;
             let f = (1u32 << 15) - u32::from(cdf[s]);
-            cur = ((self.range >> 8) * (f >> EC_PROB_SHIFT)) >> (7 - EC_PROB_SHIFT);
-            cur += EC_MIN_PROB * (n - symbol as u32 - 1);
+            cur = ((r * (f >> EC_PROB_SHIFT)) >> (7 - EC_PROB_SHIFT)) + min_term;
             if self.value >= cur {
                 break;
             }
+            s += 1;
+            min_term = min_term.wrapping_sub(EC_MIN_PROB);
         }
-        let symbol = symbol as u32;
+        let symbol = s as u32;
 
-        // SymbolRange = prev - cur
         self.range = prev - cur;
-        // SymbolValue = SymbolValue - cur
         self.value -= cur;
-
-        // Renormalisation (§8.2.6 ordered steps 1..7).
         self.renormalize()?;
 
-        // §8.3 CDF update.
         if !self.disable_cdf_update {
             update_cdf(cdf, symbol, n);
         }
@@ -224,14 +241,42 @@ impl<'a> SymbolDecoder<'a> {
     /// arithmetic bug that drives the state out of range surfaces as
     /// [`Error::SymbolStateInvariantBroken`] instead of leaving the
     /// decoder in an undefined state.
+    #[inline(always)]
     fn renormalize(&mut self) -> Result<(), Error> {
-        // 1. bits = 15 - FloorLog2(SymbolRange)
-        let bits = 15 - floor_log2(self.range);
+        if self.range >= (1 << 15) {
+            return if self.range < (1 << 16) && self.value < self.range {
+                Ok(())
+            } else {
+                Err(Error::SymbolStateInvariantBroken)
+            };
+        }
+        if self.range == 0 {
+            return Err(Error::SymbolStateInvariantBroken);
+        }
+        // 1. bits = 15 - FloorLog2(SymbolRange) (1..=15 since 0 < range < 32768)
+        let bits = self.range.leading_zeros() - 16;
         // 2. SymbolRange = SymbolRange << bits
         self.range <<= bits;
+        // Fast interior path: enough bits in partition and >= 4 bytes in buffer.
+        let bits_i64 = i64::from(bits);
+        let byte = self.reader.pos >> 3;
+        if self.max_bits >= bits_i64 && byte + 4 <= self.reader.bytes.len() {
+            let word = u32::from_be_bytes(
+                self.reader.bytes[byte..byte + 4].try_into().unwrap(),
+            );
+            let new_data = (word << (self.reader.pos & 7)) >> (32 - bits);
+            self.reader.pos += bits as usize;
+            self.value = new_data ^ (((self.value + 1) << bits) - 1);
+            self.max_bits -= bits_i64;
+            return if self.value < self.range {
+                Ok(())
+            } else {
+                Err(Error::SymbolStateInvariantBroken)
+            };
+        }
         // 3. numBits = Min(bits, Max(0, SymbolMaxBits))
         let avail = self.max_bits.max(0);
-        let num_bits = core::cmp::min(i64::from(bits), avail) as u32;
+        let num_bits = core::cmp::min(bits_i64, avail) as u32;
         // 4. newData = f(numBits)
         let new_data = self.reader.f(num_bits)? as u32;
         // 5. paddedData = newData << (bits - numBits)
@@ -239,7 +284,7 @@ impl<'a> SymbolDecoder<'a> {
         // 6. SymbolValue = paddedData ^ (((SymbolValue + 1) << bits) - 1)
         self.value = padded_data ^ (((self.value + 1) << bits) - 1);
         // 7. SymbolMaxBits = SymbolMaxBits - bits
-        self.max_bits -= i64::from(bits);
+        self.max_bits -= bits_i64;
 
         self.check_post_renorm_invariants()
     }
@@ -265,6 +310,7 @@ impl<'a> SymbolDecoder<'a> {
     /// arithmetic precision error, etc.); we surface it as
     /// [`Error::SymbolStateInvariantBroken`] rather than allowing the
     /// decoder to continue from an undefined state.
+    #[inline(always)]
     fn check_post_renorm_invariants(&self) -> Result<(), Error> {
         const SYMBOL_RANGE_MIN: u32 = 1 << 15; // 32768
         const SYMBOL_RANGE_MAX: u32 = (1 << 16) - 1; // 65535
@@ -285,6 +331,7 @@ impl<'a> SymbolDecoder<'a> {
     /// the CDF update can be omitted because the modified values are
     /// never reused — we honour that by feeding a fresh local array
     /// each call, so any adaptation that does happen is discarded.
+    #[inline(always)]
     pub fn read_bool(&mut self) -> Result<u32, Error> {
         let threshold = ((self.range >> 8) * ((1 << 14) >> EC_PROB_SHIFT))
             >> (7 - EC_PROB_SHIFT);
@@ -310,6 +357,7 @@ impl<'a> SymbolDecoder<'a> {
     /// i.e. an `n`-bit unsigned value, MSB first, with each bit decoded
     /// via the §8.2.3 boolean process. This is the `L(n)` descriptor of
     /// §4.10.8.
+    #[inline(always)]
     pub fn read_literal(&mut self, n: u32) -> Result<u32, Error> {
         let mut x: u32 = 0;
         for _ in 0..n {
@@ -491,24 +539,89 @@ impl<'a> SymbolDecoder<'a> {
 ///   }
 ///   cdf[N] += (cdf[N] < 32)
 /// ```
+#[inline(always)]
 pub(crate) fn update_cdf(cdf: &mut [u16], symbol: u32, n: u32) {
-    let count = u32::from(cdf[n as usize]);
+    let n_usize = n as usize;
+    let count = u32::from(cdf[n_usize]);
     let rate = 3 + u32::from(count > 15) + u32::from(count > 31) + core::cmp::min(floor_log2(n), 2);
-
-    let adapting = &mut cdf[..n as usize - 1];
-    let split = (symbol as usize).min(adapting.len());
-    let (below, above) = adapting.split_at_mut(split);
-    for c in below {
-        let value = u32::from(*c);
-        *c = (value - (value >> rate)) as u16;
-    }
-    for c in above {
-        let value = u32::from(*c);
-        *c = (value + (((1 << 15) - value) >> rate)) as u16;
-    }
-    // cdf[N] += (cdf[N] < 32)
     if count < 32 {
-        cdf[n as usize] = (count + 1) as u16;
+        cdf[n_usize] = (count + 1) as u16;
+    }
+    let len = n_usize - 1;
+
+    #[cfg(target_arch = "aarch64")]
+    if (8..=16).contains(&len) {
+        use core::arch::aarch64::*;
+        unsafe {
+            let sym_v = vdupq_n_u16(symbol.min(16) as u16);
+            let shift_v = vdupq_n_s16(-(rate as i16));
+            let top_v = vdupq_n_u16(32768);
+            const IDX16: [u16; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+            let idx0 = vld1q_u16(IDX16.as_ptr());
+            let c0 = vld1q_u16(cdf.as_ptr());
+            let m0 = vcltq_u16(idx0, sym_v);
+            let out0 = vbslq_u16(
+                m0,
+                vsubq_u16(c0, vshlq_u16(c0, shift_v)),
+                vaddq_u16(c0, vshlq_u16(vsubq_u16(top_v, c0), shift_v)),
+            );
+            if len > 8 {
+                let off = len - 8;
+                let idx1 = vld1q_u16(IDX16.as_ptr().add(off));
+                let c1 = vld1q_u16(cdf.as_ptr().add(off));
+                let m1 = vcltq_u16(idx1, sym_v);
+                let out1 = vbslq_u16(
+                    m1,
+                    vsubq_u16(c1, vshlq_u16(c1, shift_v)),
+                    vaddq_u16(c1, vshlq_u16(vsubq_u16(top_v, c1), shift_v)),
+                );
+                vst1q_u16(cdf.as_mut_ptr().add(off), out1);
+            }
+            vst1q_u16(cdf.as_mut_ptr(), out0);
+        }
+        return;
+    }
+
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    if (8..=16).contains(&len) {
+        use core::arch::wasm32::*;
+        unsafe {
+            let sym_v = u16x8_splat(symbol.min(16) as u16);
+            let top_v = u16x8_splat(32768);
+            const IDX16: [u16; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+            let idx0 = v128_load(IDX16.as_ptr().cast());
+            let c0 = v128_load(cdf.as_ptr().cast());
+            let m0 = u16x8_lt(idx0, sym_v);
+            let out0 = v128_bitselect(
+                u16x8_sub(c0, u16x8_shr(c0, rate)),
+                u16x8_add(c0, u16x8_shr(u16x8_sub(top_v, c0), rate)),
+                m0,
+            );
+            if len > 8 {
+                let off = len - 8;
+                let idx1 = v128_load(IDX16.as_ptr().add(off).cast());
+                let c1 = v128_load(cdf.as_ptr().add(off).cast());
+                let m1 = u16x8_lt(idx1, sym_v);
+                let out1 = v128_bitselect(
+                    u16x8_sub(c1, u16x8_shr(c1, rate)),
+                    u16x8_add(c1, u16x8_shr(u16x8_sub(top_v, c1), rate)),
+                    m1,
+                );
+                v128_store(cdf.as_mut_ptr().add(off).cast(), out1);
+            }
+            v128_store(cdf.as_mut_ptr().cast(), out0);
+        }
+        return;
+    }
+
+    let sym = symbol as usize;
+    for (i, c) in cdf[..len].iter_mut().enumerate() {
+        let v = u32::from(*c);
+        *c = if i < sym {
+            (v - (v >> rate)) as u16
+        } else {
+            (v + (((1 << 15) - v) >> rate)) as u16
+        };
     }
 }
 

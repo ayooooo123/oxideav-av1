@@ -76,6 +76,13 @@ use crate::{
     uncompressed_header_tail::{INTRA_FRAME, MAX_LOOP_FILTER, TOTAL_REFS_PER_FRAME},
 };
 
+#[cfg(target_arch = "aarch64")]
+#[path = "loop_filter/neon.rs"]
+mod simd;
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+#[path = "loop_filter/wasm.rs"]
+mod simd;
+
 // =====================================================================
 // §3 mode-type ordinals consumed by §7.14.4 — av1-spec p.13-14.
 // =====================================================================
@@ -586,6 +593,13 @@ fn loop_filter_edge_at<P: Pixel>(
     // av1-spec p.309 line 17118-17122: walk i = 0..MI_SIZE-1 along
     // the edge (the boundary spans `MI_SIZE` samples for the 4×4
     // grid).
+    #[cfg(any(target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128")))]
+    if pass == 1 && simd::edge(
+        plane_buf, x_p, y_p - origin_y, plane, strength.limit,
+        strength.blimit, strength.thresh, filter_size, ctx.bit_depth,
+    ) {
+        return;
+    }
     for i in 0..(MI_SIZE as i32) {
         let sx = x_p + dy * i;
         let sy = y_p - origin_y + dx * i;

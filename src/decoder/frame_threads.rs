@@ -16,7 +16,7 @@ use std::thread::JoinHandle;
 pub const MAX_LOOKAHEAD_FRAMES: usize = 16;
 /// Compressed parsed-work budget; one oversized frame is admitted on its own.
 pub const MAX_LOOKAHEAD_BYTES: usize = 32 * 1024 * 1024;
-const MAX_ACTIVE_FRAMES: usize = 4;
+pub const MAX_ACTIVE_FRAMES: usize = 8;
 type Layout = (u32, u32, u8, bool, bool, bool);
 type Version = Arc<ReferenceVersion>;
 type Slots = [Option<Version>; NUM_REF_FRAMES as usize];

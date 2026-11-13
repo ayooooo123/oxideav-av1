@@ -192,6 +192,7 @@ pub struct SequenceHeader {
 ///     was 3..=7 (reserved).
 ///   * [`Error::ReducedStillRequiresStill`] — §6.4.1 conformance:
 ///     `reduced_still_picture_header == 1` with `still_picture == 0`.
+#[cold]
 pub fn parse_sequence_header(payload: &[u8]) -> Result<SequenceHeader, Error> {
     let mut br = BitReader::new(payload);
 

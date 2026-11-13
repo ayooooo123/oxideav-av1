@@ -5,22 +5,24 @@ use crate::loop_filter::Pixel;
 pub(super) fn horizontal<R: Pixel>(src: &[R], coeff: &[i32; 8], shift: u32, dst: &mut [i32], w: usize) {
     assert!(src.len() >= w + 7 && dst.len() >= w);
     assert!((1..32).contains(&shift));
+    let wide_end = if core::mem::size_of::<R>() <= 2 { w / 16 * 16 } else { 0 };
     let end = w / 8 * 8;
-    let wide_end = if core::mem::size_of::<R>() == 1 { w / 16 * 16 } else { 0 };
-    // SAFETY: Pixel is sealed to u8/u16/i32. The complete source tap
-    // rectangle and destination were checked above. Native u8 consumes
-    // sixteen samples per input register; u16 consumes eight. Samples fit
-    // signed 16 bits and convolution products/sums retain exact i32 widths.
+    let end4 = w / 4 * 4;
+    // SAFETY: each load covers only its output group and seven checked taps.
     unsafe {
         let offset = vdupq_n_s32(1 << (shift - 1));
         let shifts = vdupq_n_s32(-(shift as i32));
         for x in (0..wide_end).step_by(16) {
-            let p = src.as_ptr().add(x).cast::<u8>();
             let (mut a0, mut a1, mut b0, mut b1) = (offset, offset, offset, offset);
             for (k, &c) in coeff.iter().enumerate() {
-                let bytes = vld1q_u8(p.add(k));
-                let a = vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(bytes)));
-                let b = vreinterpretq_s16_u16(vmovl_high_u8(bytes));
+                if c == 0 { continue; }
+                let p = src.as_ptr().add(x + k);
+                let (a, b) = if core::mem::size_of::<R>() == 1 {
+                    let bytes = vld1q_u8(p.cast());
+                    (vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(bytes))), vreinterpretq_s16_u16(vmovl_high_u8(bytes)))
+                } else {
+                    (vreinterpretq_s16_u16(vld1q_u16(p.cast())), vreinterpretq_s16_u16(vld1q_u16(p.add(8).cast())))
+                };
                 a0 = vmlal_n_s16(a0, vget_low_s16(a), c as i16);
                 a1 = vmlal_high_n_s16(a1, a, c as i16);
                 b0 = vmlal_n_s16(b0, vget_low_s16(b), c as i16);
@@ -32,18 +34,16 @@ pub(super) fn horizontal<R: Pixel>(src: &[R], coeff: &[i32; 8], shift: u32, dst:
             vst1q_s32(dst.as_mut_ptr().add(x + 12), vshlq_s32(b1, shifts));
         }
         for x in (wide_end..end).step_by(8) {
-            let p = src.as_ptr().add(x);
-            let mut lo = offset;
-            let mut hi = offset;
+            let (mut lo, mut hi) = (offset, offset);
             for (k, &c) in coeff.iter().enumerate() {
-                let p = p.add(k);
+                if c == 0 { continue; }
+                let p = src.as_ptr().add(x + k);
                 let s = if core::mem::size_of::<R>() == 1 {
                     vreinterpretq_s16_u16(vmovl_u8(vld1_u8(p.cast())))
                 } else if core::mem::size_of::<R>() == 2 {
                     vreinterpretq_s16_u16(vld1q_u16(p.cast()))
                 } else {
-                    let p = p.cast::<i32>();
-                    vcombine_s16(vmovn_s32(vld1q_s32(p)), vmovn_s32(vld1q_s32(p.add(4))))
+                    vcombine_s16(vmovn_s32(vld1q_s32(p.cast())), vmovn_s32(vld1q_s32(p.add(4).cast())))
                 };
                 lo = vmlal_n_s16(lo, vget_low_s16(s), c as i16);
                 hi = vmlal_high_n_s16(hi, s, c as i16);
@@ -51,33 +51,50 @@ pub(super) fn horizontal<R: Pixel>(src: &[R], coeff: &[i32; 8], shift: u32, dst:
             vst1q_s32(dst.as_mut_ptr().add(x), vshlq_s32(lo, shifts));
             vst1q_s32(dst.as_mut_ptr().add(x + 4), vshlq_s32(hi, shifts));
         }
+        for x in (end..end4).step_by(4) {
+            let mut sum = offset;
+            for (k, &c) in coeff.iter().enumerate() {
+                if c == 0 { continue; }
+                sum = vmlal_n_s16(sum, samples4(src.as_ptr().add(x + k)), c as i16);
+            }
+            vst1q_s32(dst.as_mut_ptr().add(x), vshlq_s32(sum, shifts));
+        }
     }
-    for x in end..w {
+    for x in end4..w {
         let sum: i32 = (0..8).map(|k| coeff[k] * src[x + k].to_i32()).sum();
         dst[x] = (sum + (1 << (shift - 1))) >> shift;
+    }
+}
+
+#[inline(always)]
+unsafe fn samples4<P: Pixel>(p: *const P) -> int16x4_t {
+    // SAFETY: callers prove four readable samples; AV1 samples fit signed i16.
+    unsafe {
+        if core::mem::size_of::<P>() == 1 {
+            vreinterpret_s16_u16(vget_low_u16(vmovl_u8(vcreate_u8(core::ptr::read_unaligned(p.cast::<u32>()) as u64))))
+        } else if core::mem::size_of::<P>() == 2 {
+            vreinterpret_s16_u16(vld1_u16(p.cast()))
+        } else {
+            vmovn_s32(vld1q_s32(p.cast()))
+        }
     }
 }
 
 pub(super) fn vertical(src: &[i32], w: usize, r: usize, coeff: &[i32; 8], shift: u32, dst: &mut [i32]) {
     assert!(src.len() >= (r + 8) * w && dst.len() >= w);
     assert!((1..32).contains(&shift));
-    let end = w / 8 * 8;
-    // SAFETY: all eight source rows and the output row were checked above.
-    // Horizontal intermediate bounds and the specification's coefficient
-    // range keep products/sums in i32, including compound rounding paths.
+    let end = w / 4 * 4;
+    // SAFETY: every vector stays within the eight checked rows and output row.
     unsafe {
         let offset = vdupq_n_s32(1 << (shift - 1));
         let shifts = vdupq_n_s32(-(shift as i32));
-        for x in (0..end).step_by(8) {
-            let mut lo = offset;
-            let mut hi = offset;
+        for x in (0..end).step_by(4) {
+            let mut sum = offset;
             for (k, &c) in coeff.iter().enumerate() {
-                let p = src.as_ptr().add((r + k) * w + x);
-                lo = vmlaq_n_s32(lo, vld1q_s32(p), c);
-                hi = vmlaq_n_s32(hi, vld1q_s32(p.add(4)), c);
+                if c == 0 { continue; }
+                sum = vmlaq_n_s32(sum, vld1q_s32(src.as_ptr().add((r + k) * w + x)), c);
             }
-            vst1q_s32(dst.as_mut_ptr().add(x), vshlq_s32(lo, shifts));
-            vst1q_s32(dst.as_mut_ptr().add(x + 4), vshlq_s32(hi, shifts));
+            vst1q_s32(dst.as_mut_ptr().add(x), vshlq_s32(sum, shifts));
         }
     }
     for x in end..w {
@@ -269,4 +286,34 @@ mod tests {
             }
         }
     }
+}
+
+pub(super) fn copy_round<R: Pixel>(src: &[R], dst: &mut [i32], shift: u32) {
+    assert!(src.len() >= dst.len() && (1..32).contains(&shift));
+    let end = dst.len() / 4 * 4;
+    // SAFETY: complete four-sample groups are checked before widening.
+    unsafe {
+        let offset = vdupq_n_s32(1 << (shift - 1));
+        let shifts = vdupq_n_s32(-(shift as i32));
+        for x in (0..end).step_by(4) {
+            let v = vshlq_n_s32::<7>(vmovl_s16(samples4(src.as_ptr().add(x))));
+            vst1q_s32(dst.as_mut_ptr().add(x), vshlq_s32(vaddq_s32(v, offset), shifts));
+        }
+    }
+    for x in end..dst.len() { dst[x] = (128 * src[x].to_i32() + (1 << (shift - 1))) >> shift; }
+}
+
+pub(super) fn finish(row: &mut [i32], shift: u32) {
+    assert!((1..32).contains(&shift));
+    let end = row.len() / 4 * 4;
+    // SAFETY: each in-place load/store covers four complete intermediates.
+    unsafe {
+        let offset = vdupq_n_s32(1 << (shift - 1));
+        let shifts = vdupq_n_s32(-(shift as i32));
+        for x in (0..end).step_by(4) {
+            let p = row.as_mut_ptr().add(x);
+            vst1q_s32(p, vshlq_s32(vaddq_s32(vshlq_n_s32::<7>(vld1q_s32(p)), offset), shifts));
+        }
+    }
+    for v in &mut row[end..] { *v = (128 * *v + (1 << (shift - 1))) >> shift; }
 }

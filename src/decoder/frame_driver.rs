@@ -93,7 +93,10 @@ enum NativePlanes {
 
 impl NativePlanes {
     fn len(&self) -> usize {
-        match self { Self::U8(p) => p.len(), Self::U16(p) => p.len() }
+        match self {
+            Self::U8(p) => p.len(),
+            Self::U16(p) => p.len(),
+        }
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -116,12 +119,16 @@ impl NativePlanes {
 }
 
 trait FramePixel: Pixel {
+    fn empty_snapshot() -> NativePlanes;
+    fn into_snapshot(planes: Vec<Vec<Self>>) -> NativePlanes;
     fn snapshot(planes: &[Vec<Self>]) -> NativePlanes;
     fn reference(planes: &NativePlanes, index: usize) -> Option<&[Self]>;
 }
 
 impl FramePixel for u8 {
     fn snapshot(planes: &[Vec<Self>]) -> NativePlanes { NativePlanes::U8(planes.to_vec()) }
+    fn empty_snapshot() -> NativePlanes { NativePlanes::U8(Vec::new()) }
+    fn into_snapshot(planes: Vec<Vec<Self>>) -> NativePlanes { NativePlanes::U8(planes) }
     fn reference(planes: &NativePlanes, index: usize) -> Option<&[Self]> {
         match planes { NativePlanes::U8(p) => p.get(index).map(Vec::as_slice), _ => None }
     }
@@ -129,8 +136,13 @@ impl FramePixel for u8 {
 
 impl FramePixel for u16 {
     fn snapshot(planes: &[Vec<Self>]) -> NativePlanes { NativePlanes::U16(planes.to_vec()) }
+    fn empty_snapshot() -> NativePlanes { NativePlanes::U16(Vec::new()) }
+    fn into_snapshot(planes: Vec<Vec<Self>>) -> NativePlanes { NativePlanes::U16(planes) }
     fn reference(planes: &NativePlanes, index: usize) -> Option<&[Self]> {
-        match planes { NativePlanes::U16(p) => p.get(index).map(Vec::as_slice), _ => None }
+        match planes {
+            NativePlanes::U16(p) => p.get(index).map(Vec::as_slice),
+            _ => None,
+        }
     }
 }
 
@@ -139,6 +151,8 @@ impl FramePixel for i32 {
     fn snapshot(planes: &[Vec<Self>]) -> NativePlanes {
         NativePlanes::U16(planes.iter().map(|p| p.iter().map(|&v| v as u16).collect()).collect())
     }
+    fn empty_snapshot() -> NativePlanes { NativePlanes::U16(Vec::new()) }
+    fn into_snapshot(planes: Vec<Vec<Self>>) -> NativePlanes { Self::snapshot(&planes) }
     fn reference(_planes: &NativePlanes, _index: usize) -> Option<&[Self]> { None }
 }
 
@@ -209,8 +223,11 @@ type FrameDecode = fn(
 ) -> Result<DecodedFrameInternal, Error>;
 
 fn frame_decoder(bit_depth: u8) -> FrameDecode {
-    if bit_depth == 8 { decode_frame_spec_tiles_checked::<u8, u8> }
-    else { decode_frame_spec_tiles_checked::<u16, u16> }
+    if bit_depth == 8 {
+        decode_frame_spec_tiles_checked::<u8, u8>
+    } else {
+        decode_frame_spec_tiles_checked::<u16, u16>
+    }
 }
 
 /// Cross-frame decoder session state: the §5.9.2 `RefInfo` arrays the
@@ -1239,8 +1256,27 @@ fn decode_frame_spec_tiles_native<P: FramePixel, R: FramePixel>(
     // §7.18.3 film grain applies to the OUTPUT copy only; the §7.20
     // reference store keeps the grain-free frame (the samples later
     // frames motion-compensate against).
-    let ref_planes = P::snapshot(&plane_bufs);
-    let ref_plane_dims: Vec<(u32, u32)> = plane_dims.clone();
+    let will_refresh_ref = fh.refresh_frame_flags != 0;
+    let will_apply_grain = fh
+        .film_grain_params
+        .as_ref()
+        .is_some_and(|fg| fg.apply_grain);
+    #[cfg(not(test))]
+    let move_into_ref = will_refresh_ref && !fh.show_frame && !will_apply_grain;
+    #[cfg(test)]
+    let move_into_ref = false;
+    let ref_planes = if !will_refresh_ref {
+        P::empty_snapshot()
+    } else if move_into_ref {
+        P::into_snapshot(std::mem::take(&mut plane_bufs))
+    } else {
+        P::snapshot(&plane_bufs)
+    };
+    let ref_plane_dims: Vec<(u32, u32)> = if will_refresh_ref {
+        plane_dims.clone()
+    } else {
+        Vec::new()
+    };
 
     // ---- §7.18.3 film grain. ----
     // §5.9.30 `update_grain == 0` predicted path: `load_grain_params(
@@ -1339,7 +1375,11 @@ fn decode_frame_spec_tiles_native<P: FramePixel, R: FramePixel>(
     // `SegmentIds[][]` grid; unwritten `-1` cells clamp to `0` (the
     // spec map is always written: `segment_id = 0` when segmentation
     // is disabled).
-    let segment_ids: Vec<i32> = walker.segment_ids().iter().map(|&v| v.max(0)).collect();
+    let segment_ids: Vec<i32> = if will_refresh_ref {
+        walker.segment_ids().iter().map(|&v| v.max(0)).collect()
+    } else {
+        Vec::new()
+    };
 
     Ok(DecodedFrameInternal {
         frame: SpecFrame {

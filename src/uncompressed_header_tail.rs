@@ -206,12 +206,14 @@ impl InterpolationFilter {
 ///
 /// ## Errors
 ///   * [`Error::UnexpectedEnd`] — payload exhausted mid-read.
+#[cold]
 pub fn parse_interpolation_filter(payload: &[u8]) -> Result<(InterpolationFilter, usize), Error> {
     let mut br = BitReader::new(payload);
     let filt = read_interpolation_filter(&mut br)?;
     Ok((filt, br.position()))
 }
 
+#[cold]
 pub(crate) fn read_interpolation_filter(
     br: &mut BitReader<'_>,
 ) -> Result<InterpolationFilter, Error> {
@@ -317,6 +319,7 @@ impl LoopFilterParams {
 ///
 /// ## Errors
 ///   * [`Error::UnexpectedEnd`]
+#[cold]
 pub fn parse_loop_filter_params(
     payload: &[u8],
     num_planes: u8,
@@ -328,6 +331,7 @@ pub fn parse_loop_filter_params(
     Ok((lf, br.position()))
 }
 
+#[cold]
 pub(crate) fn read_loop_filter_params(
     br: &mut BitReader<'_>,
     num_planes: u8,
@@ -442,6 +446,7 @@ pub struct QuantizationParams {
 ///
 /// ## Errors
 ///   * [`Error::UnexpectedEnd`]
+#[cold]
 pub fn parse_quantization_params(
     payload: &[u8],
     num_planes: u8,
@@ -452,6 +457,7 @@ pub fn parse_quantization_params(
     Ok((q, br.position()))
 }
 
+#[cold]
 pub(crate) fn read_quantization_params(
     br: &mut BitReader<'_>,
     num_planes: u8,
@@ -606,6 +612,7 @@ impl SegmentationParams {
 ///
 /// ## Errors
 ///   * [`Error::UnexpectedEnd`]
+#[cold]
 pub fn parse_segmentation_params(
     payload: &[u8],
     primary_ref_frame: u8,
@@ -626,6 +633,7 @@ pub type LoadedSegFeatures<'a> = (
     &'a [[i16; SEG_LVL_MAX]; MAX_SEGMENTS],
 );
 
+#[cold]
 pub(crate) fn read_segmentation_params(
     br: &mut BitReader<'_>,
     primary_ref_frame: u8,
@@ -747,6 +755,7 @@ pub struct DeltaQParams {
 ///
 /// ## Errors
 ///   * [`Error::UnexpectedEnd`]
+#[cold]
 pub fn parse_delta_q_params(
     payload: &[u8],
     base_q_idx: u8,
@@ -756,6 +765,7 @@ pub fn parse_delta_q_params(
     Ok((d, br.position()))
 }
 
+#[cold]
 pub(crate) fn read_delta_q_params(
     br: &mut BitReader<'_>,
     base_q_idx: u8,
@@ -810,6 +820,7 @@ pub struct DeltaLfParams {
 ///
 /// ## Errors
 ///   * [`Error::UnexpectedEnd`]
+#[cold]
 pub fn parse_delta_lf_params(
     payload: &[u8],
     delta_q_present: bool,
@@ -820,6 +831,7 @@ pub fn parse_delta_lf_params(
     Ok((d, br.position()))
 }
 
+#[cold]
 pub(crate) fn read_delta_lf_params(
     br: &mut BitReader<'_>,
     delta_q_present: bool,
@@ -926,6 +938,7 @@ impl CdefParams {
 ///
 /// ## Errors
 ///   * [`Error::UnexpectedEnd`]
+#[cold]
 pub fn parse_cdef_params(
     payload: &[u8],
     num_planes: u8,
@@ -944,6 +957,7 @@ pub fn parse_cdef_params(
     Ok((cdef, br.position()))
 }
 
+#[cold]
 pub(crate) fn read_cdef_params(
     br: &mut BitReader<'_>,
     num_planes: u8,
@@ -1140,6 +1154,7 @@ impl LrParams {
 /// ## Errors
 ///   * [`Error::UnexpectedEnd`]
 #[allow(clippy::too_many_arguments)]
+#[cold]
 pub fn parse_lr_params(
     payload: &[u8],
     num_planes: u8,
@@ -1165,6 +1180,7 @@ pub fn parse_lr_params(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cold]
 pub(crate) fn read_lr_params(
     br: &mut BitReader<'_>,
     num_planes: u8,
@@ -1298,12 +1314,14 @@ impl TxMode {
 ///
 /// ## Errors
 ///   * [`Error::UnexpectedEnd`]
+#[cold]
 pub fn parse_tx_mode(payload: &[u8], coded_lossless: bool) -> Result<(TxMode, usize), Error> {
     let mut br = BitReader::new(payload);
     let tx_mode = read_tx_mode(&mut br, coded_lossless)?;
     Ok((tx_mode, br.position()))
 }
 
+#[cold]
 pub(crate) fn read_tx_mode(br: &mut BitReader<'_>, coded_lossless: bool) -> Result<TxMode, Error> {
     // §5.9.21:
     //   if ( CodedLossless == 1 ) {
@@ -1607,6 +1625,7 @@ fn read_global_param(
 ///
 /// ## Errors
 ///   * [`Error::UnexpectedEnd`]
+#[cold]
 pub fn parse_global_motion_params(
     payload: &[u8],
     frame_is_intra: bool,
@@ -1623,6 +1642,7 @@ pub fn parse_global_motion_params(
     Ok((gm, br.position()))
 }
 
+#[cold]
 pub(crate) fn read_global_motion_params(
     br: &mut BitReader<'_>,
     frame_is_intra: bool,
@@ -1898,6 +1918,7 @@ pub struct FilmGrainContext {
 ///
 /// ## Errors
 ///   * [`Error::UnexpectedEnd`]
+#[cold]
 pub fn parse_film_grain_params(
     payload: &[u8],
     ctx: FilmGrainContext,
@@ -1907,6 +1928,7 @@ pub fn parse_film_grain_params(
     Ok((fg, br.position()))
 }
 
+#[cold]
 pub(crate) fn read_film_grain_params(
     br: &mut BitReader<'_>,
     ctx: FilmGrainContext,

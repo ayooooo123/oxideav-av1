@@ -708,6 +708,7 @@ pub struct FrameHeader {
 /// zeroed). For an inter frame that uses `set_frame_refs()` or
 /// `frame_size_with_refs()` against real reference dimensions, use
 /// [`parse_frame_header_with_refs`] and pass the session's [`RefInfo`].
+#[cold]
 pub fn parse_frame_header(payload: &[u8], seq: &SequenceHeader) -> Result<FrameHeader, Error> {
     let mut br = BitReader::new(payload);
     parse_with(&mut br, seq, &RefInfo::default())
@@ -723,6 +724,7 @@ pub fn parse_frame_header(payload: &[u8], seq: &SequenceHeader) -> Result<FrameH
 /// `RefValid[]` / `RefOrderHint[]` / `RefFrameId[]` plus per-slot
 /// `RefUpscaledWidth[]` / `RefFrameHeight[]` / `RefRenderWidth[]` /
 /// `RefRenderHeight[]` arrays).
+#[cold]
 pub fn parse_frame_header_with_refs(
     payload: &[u8],
     seq: &SequenceHeader,
@@ -732,6 +734,7 @@ pub fn parse_frame_header_with_refs(
     parse_with(&mut br, seq, ref_info)
 }
 
+#[cold]
 fn parse_with(
     br: &mut BitReader<'_>,
     seq: &SequenceHeader,

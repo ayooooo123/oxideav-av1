@@ -120,10 +120,10 @@ fn lookahead_and_worker_retention_are_bounded() {
         decoder.flush().unwrap();
         while decoder.receive_frame().unwrap().is_some() {}
         let stats = decoder.stats();
-        assert!(stats.peak_active_frames <= threads.min(4));
+        assert!(stats.peak_active_frames <= threads.min(8));
         assert!(stats.peak_queued_frames <= MAX_LOOKAHEAD_FRAMES);
         assert!(stats.peak_queued_bytes <= MAX_LOOKAHEAD_BYTES);
-        assert!(stats.peak_retained_frames <= 8 * (MAX_LOOKAHEAD_FRAMES + 4) + MAX_LOOKAHEAD_FRAMES + 4);
+        assert!(stats.peak_retained_frames <= 8 * (MAX_LOOKAHEAD_FRAMES + 8) + MAX_LOOKAHEAD_FRAMES + 8);
     }
 }
 

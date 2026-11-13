@@ -819,7 +819,7 @@ fn cdef_filter_block_at<P: Pixel>(
     }
 }
 
-#[cfg_attr(all(target_arch = "aarch64", not(test)), allow(dead_code))]
+#[cfg(any(test, not(any(target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128")))))]
 #[inline]
 #[allow(clippy::too_many_arguments)]
 fn cdef_interior_row<const W: usize, P: Pixel>(
