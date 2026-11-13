@@ -83,12 +83,8 @@
 //!   reference loop here mirrors the spec's per-sample formulation.
 
 use crate::cdf::MI_SIZE;
-use crate::loop_filter::{Pixel, PlaneBuffer};
+use crate::loop_filter::{PlaneBuffer, Sample};
 use crate::uncompressed_header_tail::{FrameRestorationType, LrParams};
-#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
-mod wasm;
-#[cfg(target_arch = "aarch64")]
-mod neon;
 
 // =====================================================================
 // §7.17 constant lookup tables — av1-spec p.107 / p.332.
@@ -218,23 +214,23 @@ pub struct LoopRestorationFrameContext<'a> {
     pub lr_params: &'a LrParams,
     /// `LrType[plane][unitRow][unitCol]` per §5.11.58 — `RESTORE_NONE`
     /// / `RESTORE_WIENER` / `RESTORE_SGRPROJ`.
-    pub lr_type: &'a (dyn Fn(u8, u32, u32) -> FrameRestorationType + Sync),
+    pub lr_type: &'a dyn Fn(u8, u32, u32) -> FrameRestorationType,
     /// `LrWiener[plane][unitRow][unitCol][pass][i]` per §5.11.58 —
     /// `pass ∈ {0, 1}` selects vertical / horizontal coefficient sets;
     /// `i ∈ {0, 1, 2}` selects one of the three transmitted Wiener
     /// coefficients. Only consulted when the per-unit `LrType` is
     /// `RESTORE_WIENER`.
-    pub lr_wiener: &'a (dyn Fn(u8, u32, u32, u8, usize) -> i32 + Sync),
+    pub lr_wiener: &'a dyn Fn(u8, u32, u32, u8, usize) -> i32,
     /// `LrSgrSet[plane][unitRow][unitCol]` per §5.11.58 — index in
     /// `[0, 16)` into [`SGR_PARAMS`]. Only consulted when the per-unit
     /// `LrType` is `RESTORE_SGRPROJ`.
-    pub lr_sgr_set: &'a (dyn Fn(u8, u32, u32) -> u8 + Sync),
+    pub lr_sgr_set: &'a dyn Fn(u8, u32, u32) -> u8,
     /// `LrSgrXqd[plane][unitRow][unitCol][i]` per §5.11.58 —
     /// `i ∈ {0, 1}` selects one of the two transmitted self-guided
     /// projection weights (`w0` / `w1`); `w2` is derived as
     /// `(1 << SGRPROJ_PRJ_BITS) - w0 - w1`. Only consulted when the
     /// per-unit `LrType` is `RESTORE_SGRPROJ`.
-    pub lr_sgr_xqd: &'a (dyn Fn(u8, u32, u32, usize) -> i32 + Sync),
+    pub lr_sgr_xqd: &'a dyn Fn(u8, u32, u32, usize) -> i32,
 }
 
 impl std::fmt::Debug for LoopRestorationFrameContext<'_> {
@@ -269,7 +265,7 @@ impl std::fmt::Debug for LoopRestorationFrameContext<'_> {
 /// "copy `LrFrame = UpscaledCdefFrame`" prelude is materialised by
 /// copying `cdef_planes ↦ lr_planes` up-front; on `UsesLr == 0` the
 /// driver returns immediately after the copy.
-pub fn loop_restoration_frame<P: Pixel>(
+pub fn loop_restoration_frame<P: Sample>(
     ctx: &LoopRestorationFrameContext<'_>,
     curr_planes: &[PlaneBuffer<'_, P>],
     cdef_planes: &[PlaneBuffer<'_, P>],
@@ -307,63 +303,6 @@ pub fn loop_restoration_frame<P: Pixel>(
             loop_restore_rect(ctx, curr_planes, cdef_planes, lr_planes, plane, &geom);
         }
     }
-}
-
-pub(crate) fn loop_restoration_frame_with_workers<P: Pixel>(
-    ctx: &LoopRestorationFrameContext<'_>,
-    curr_planes: &[PlaneBuffer<'_, P>],
-    cdef_planes: &[PlaneBuffer<'_, P>],
-    lr_planes: &mut [PlaneBuffer<'_, P>],
-    workers: usize,
-) {
-    #[cfg(not(target_arch = "wasm32"))]
-    let lease = crate::decoder::frame_driver::worker_budget::borrow(workers);
-    #[cfg(not(target_arch = "wasm32"))]
-    let workers = lease.workers();
-    #[cfg(not(target_arch = "wasm32"))]
-    if workers > 1 && !lr_planes.is_empty() && lr_planes[0].rows >= 128 {
-        let rows = lr_planes[0].rows.div_ceil(workers as u32).div_ceil(64) * 64;
-        let bands = crate::loop_filter::split_row_bands(lr_planes, rows, ctx.subsampling_y);
-        let rectangles: Vec<_> = (0..ctx.num_planes).map(|plane| {
-            if ctx.lr_params.uses_lr && ctx.lr_params.frame_restoration_type[plane as usize] != FrameRestorationType::None {
-                stripe_unit_rects(ctx, plane)
-            } else {
-                Vec::new()
-            }
-        }).collect();
-        std::thread::scope(|scope| {
-            let rectangles = &rectangles;
-            for (b, mut band) in bands.into_iter().enumerate() {
-                scope.spawn(move || {
-                    for (p, dst) in band.iter_mut().enumerate().take(ctx.num_planes as usize) {
-                        let sub_y = if p == 0 { 0 } else { ctx.subsampling_y };
-                        let origin = (b as u32 * rows) >> sub_y;
-                        let src = &cdef_planes[p];
-                        let start = origin as usize * src.cols as usize;
-                        let len = dst.samples.len().min(src.samples.len().saturating_sub(start));
-                        dst.samples[..len].copy_from_slice(&src.samples[start..start + len]);
-                        if !ctx.lr_params.uses_lr || ctx.lr_params.frame_restoration_type[p] == FrameRestorationType::None {
-                            continue;
-                        }
-                        for &geom in &rectangles[p] {
-                            let mut geom = geom;
-                            let start = geom.y.max(origin);
-                            let end = (geom.y + geom.h).min(origin + dst.rows);
-                            if start >= end { continue; }
-                            // Aligned bands preserve the self-guided pass-0 row parity.
-                            debug_assert_eq!((start - geom.y) & 1, 0);
-                            geom.y = start;
-                            geom.h = end - start;
-                            loop_restore_rect_at(ctx, curr_planes, cdef_planes, dst, p as u8, &geom, origin);
-                        }
-                    }
-                });
-            }
-        });
-        return;
-    }
-    let _ = workers;
-    loop_restoration_frame(ctx, curr_planes, cdef_planes, lr_planes);
 }
 
 /// r464 — the (stripe, restoration-unit) rectangles of `plane`, each
@@ -438,7 +377,7 @@ pub fn stripe_unit_rects(ctx: &LoopRestorationFrameContext<'_>, plane: u8) -> Ve
 /// (see [`stripe_unit_rects`]): `rType = LrType[plane][unitRow]
 /// [unitCol]` dispatches to the Wiener / self-guided / no-op arm
 /// exactly like [`loop_restore_block`].
-pub fn loop_restore_rect<P: Pixel>(
+pub fn loop_restore_rect<P: Sample>(
     ctx: &LoopRestorationFrameContext<'_>,
     curr_planes: &[PlaneBuffer<'_, P>],
     cdef_planes: &[PlaneBuffer<'_, P>],
@@ -446,29 +385,16 @@ pub fn loop_restore_rect<P: Pixel>(
     plane: u8,
     geom: &LrBlockGeometry,
 ) {
-    let Some(lr) = lr_planes.get_mut(plane as usize) else { return };
-    loop_restore_rect_at(ctx, curr_planes, cdef_planes, lr, plane, geom, 0);
-}
-
-fn loop_restore_rect_at<P: Pixel>(
-    ctx: &LoopRestorationFrameContext<'_>,
-    curr_planes: &[PlaneBuffer<'_, P>],
-    cdef_planes: &[PlaneBuffer<'_, P>],
-    lr: &mut PlaneBuffer<'_, P>,
-    plane: u8,
-    geom: &LrBlockGeometry,
-    origin_y: u32,
-) {
     if geom.w == 0 || geom.h == 0 {
         return;
     }
     let r_type = (ctx.lr_type)(plane, geom.unit_row, geom.unit_col);
     match r_type {
         FrameRestorationType::Wiener => {
-            wiener_filter_at(ctx, curr_planes, cdef_planes, lr, plane, geom, origin_y);
+            wiener_filter(ctx, curr_planes, cdef_planes, lr_planes, plane, geom);
         }
         FrameRestorationType::SgrProj => {
-            self_guided_filter_at(ctx, curr_planes, cdef_planes, lr, plane, geom, origin_y);
+            self_guided_filter(ctx, curr_planes, cdef_planes, lr_planes, plane, geom);
         }
         FrameRestorationType::None | FrameRestorationType::Switchable => {}
     }
@@ -478,7 +404,11 @@ fn loop_restore_rect_at<P: Pixel>(
 /// the §7.17 driver's `LrFrame = UpscaledCdefFrame` prelude. Both
 /// buffers carry the same `(rows, cols)` shape; on a mismatch the copy
 /// honours the smaller extent on each axis.
-fn copy_plane<P: Pixel>(src_planes: &[PlaneBuffer<'_, P>], dst_planes: &mut [PlaneBuffer<'_, P>], plane: u8) {
+fn copy_plane<P: Sample>(
+    src_planes: &[PlaneBuffer<'_, P>],
+    dst_planes: &mut [PlaneBuffer<'_, P>],
+    plane: u8,
+) {
     let p = plane as usize;
     let Some(src) = src_planes.get(p) else { return };
     let Some(dst) = dst_planes.get_mut(p) else {
@@ -595,7 +525,7 @@ pub fn derive_block_geometry(
 /// Computes the block's `(unitRow, unitCol, x, y, w, h, ...)`
 /// geometry, fetches `rType = LrType[plane][unitRow][unitCol]`, and
 /// dispatches to the Wiener / self-guided / no-op arm.
-pub fn loop_restore_block<P: Pixel>(
+pub fn loop_restore_block<P: Sample>(
     ctx: &LoopRestorationFrameContext<'_>,
     curr_planes: &[PlaneBuffer<'_, P>],
     cdef_planes: &[PlaneBuffer<'_, P>],
@@ -650,7 +580,7 @@ pub fn loop_restore_block<P: Pixel>(
 ///
 /// `w2` is derived as `(1 << SGRPROJ_PRJ_BITS) - w0 - w1` per av1-spec
 /// p.330 line 18255.
-pub fn self_guided_filter<P: Pixel>(
+pub fn self_guided_filter<P: Sample>(
     ctx: &LoopRestorationFrameContext<'_>,
     curr_planes: &[PlaneBuffer<'_, P>],
     cdef_planes: &[PlaneBuffer<'_, P>],
@@ -658,18 +588,27 @@ pub fn self_guided_filter<P: Pixel>(
     plane: u8,
     geom: &LrBlockGeometry,
 ) {
-    let Some(lr) = lr_planes.get_mut(plane as usize) else { return };
-    self_guided_filter_at(ctx, curr_planes, cdef_planes, lr, plane, geom, 0);
+    let Some(lr) = lr_planes.get_mut(plane as usize) else {
+        return;
+    };
+    let src = PlaneSource {
+        curr: curr_planes,
+        cdef: cdef_planes,
+        plane,
+    };
+    self_guided_filter_src(ctx, &src, lr, 0, plane, geom);
 }
 
-fn self_guided_filter_at<P: Pixel>(
+/// [`self_guided_filter`] from an [`LrSource`] into one plane buffer
+/// that may be a row window of the plane (`out_row0` = the plane row
+/// at `lr.samples[ 0 ]`).
+pub(crate) fn self_guided_filter_src<S: LrSource, P: Sample>(
     ctx: &LoopRestorationFrameContext<'_>,
-    curr_planes: &[PlaneBuffer<'_, P>],
-    cdef_planes: &[PlaneBuffer<'_, P>],
+    src: &S,
     lr: &mut PlaneBuffer<'_, P>,
+    out_row0: i32,
     plane: u8,
     geom: &LrBlockGeometry,
-    origin_y: u32,
 ) {
     if geom.w == 0 || geom.h == 0 {
         return;
@@ -687,48 +626,20 @@ fn self_guided_filter_at<P: Pixel>(
     let w1 = (ctx.lr_sgr_xqd)(plane, geom.unit_row, geom.unit_col, 1);
     // av1-spec p.330 lines 18233-18241: box_filter twice, with the
     // per-pass `(r, eps)` from Sgr_Params[set].
-    let flt0 = box_filter(
-        curr_planes,
-        cdef_planes,
-        plane,
-        geom,
-        ctx.bit_depth,
-        r0,
-        eps0,
-        0,
-    );
-    let flt1 = box_filter(
-        curr_planes,
-        cdef_planes,
-        plane,
-        geom,
-        ctx.bit_depth,
-        r1,
-        eps1,
-        1,
-    );
+    let flt0 = box_filter_src(src, geom, ctx.bit_depth, r0, eps0, 0);
+    let flt1 = box_filter_src(src, geom, ctx.bit_depth, r1, eps1, 1);
     // av1-spec p.330 lines 18258-18272: per-sample projection.
     let h = geom.h as usize;
     let w = geom.w as usize;
     let lr_rows = lr.rows as i32;
     let lr_cols = lr.cols as i32;
     let lr_cols_usize = lr.cols as usize;
-    let Some(cdef) = cdef_planes.get(plane as usize) else {
-        return;
-    };
-    let cdef_rows = cdef.rows as i32;
-    let cdef_cols = cdef.cols as i32;
-    let cdef_cols_usize = cdef.cols as usize;
     for i in 0..h {
         for j in 0..w {
             let py = geom.y as i32 + i as i32;
             let px = geom.x as i32 + j as i32;
             // av1-spec p.330 line 18260: u = CDEF[y + i][x + j] << RST_BITS.
-            let u = if py >= 0 && py < cdef_rows && px >= 0 && px < cdef_cols {
-                cdef.samples[(py as usize) * cdef_cols_usize + px as usize].to_i32() << SGRPROJ_RST_BITS
-            } else {
-                0
-            };
+            let u = src.cdef_at(px, py) << SGRPROJ_RST_BITS;
             let out = sgr_project(
                 u,
                 flt0[i * w + j],
@@ -739,11 +650,11 @@ fn self_guided_filter_at<P: Pixel>(
                 r1,
                 ctx.bit_depth,
             );
-            let dst_y = py - origin_y as i32;
-            if dst_y < 0 || dst_y >= lr_rows || px < 0 || px >= lr_cols {
+            let wy = py - out_row0;
+            if wy < 0 || wy >= lr_rows || px < 0 || px >= lr_cols {
                 continue;
             }
-            lr.samples[(dst_y as usize) * lr_cols_usize + px as usize] = P::from_i32(out);
+            lr.samples[(wy as usize) * lr_cols_usize + px as usize] = P::narrow(out);
         }
     }
 }
@@ -787,10 +698,41 @@ pub fn sgr_project(
 /// spec's sample for sample) instead of re-fetching the window per
 /// output position.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn box_filter<P: Pixel>(
+pub(crate) fn box_filter<P: Sample>(
     curr_planes: &[PlaneBuffer<'_, P>],
     cdef_planes: &[PlaneBuffer<'_, P>],
     plane: u8,
+    geom: &LrBlockGeometry,
+    bit_depth: u8,
+    r: i32,
+    eps: i32,
+    pass: u8,
+) -> Vec<i32> {
+    let src = PlaneSource {
+        curr: curr_planes,
+        cdef: cdef_planes,
+        plane,
+    };
+    box_filter_src(&src, geom, bit_depth, r, eps, pass)
+}
+
+/// §7.17.3 `a2` for `z` in `0..255`: `1` at `z == 0`, else `( ( z <<
+/// SGRPROJ_SGR_BITS ) + ( z / 2 ) ) / ( z + 1 )` — the per-sample
+/// division of the box filter, evaluated once per `z`.
+const SGR_A2_BY_Z: [u16; 255] = {
+    let mut table = [0u16; 255];
+    table[0] = 1;
+    let mut z = 1usize;
+    while z < 255 {
+        table[z] = (((z << SGRPROJ_SGR_BITS) + (z / 2)) / (z + 1)) as u16;
+        z += 1;
+    }
+    table
+};
+
+/// [`box_filter`] from an [`LrSource`].
+pub(crate) fn box_filter_src<S: LrSource>(
+    src_view: &S,
     geom: &LrBlockGeometry,
     bit_depth: u8,
     r: i32,
@@ -825,17 +767,13 @@ pub(crate) fn box_filter<P: Pixel>(
     // routing per sample).
     let sw = aw + 2 * ru;
     let sh = ah + 2 * ru;
-    let mut src = vec![0i32; sh * sw];
-    let p = plane as usize;
+    let mut src = vec![0i64; sh * sw];
+    let mut row_buf = vec![0i32; sw];
     for (sy, row) in src.chunks_mut(sw).enumerate() {
         let y = geom.y as i32 + sy as i32 - 1 - r;
-        let x = geom.x as i32 - 1 - r;
-        if let (Some(curr), Some(cdef)) = (curr_planes.get(p), cdef_planes.get(p)) {
-            source_row(curr, cdef, x, y, geom, row);
-        } else {
-            for (sx, value) in row.iter_mut().enumerate() {
-                *value = get_source_sample(curr_planes, cdef_planes, plane, x + sx as i32, y, geom);
-            }
+        src_view.source_row(geom.x as i32 - 1 - r, y, geom, &mut row_buf);
+        for (v, &c) in row.iter_mut().zip(row_buf.iter()) {
+            *v = i64::from(c);
         }
     }
     // Horizontal running sums over `2r + 1` columns, then vertical
@@ -847,15 +785,15 @@ pub(crate) fn box_filter<P: Pixel>(
         let srow = &src[sy * sw..(sy + 1) * sw];
         let mut sb: i64 = 0;
         let mut sa: i64 = 0;
-        for c in srow[..win].iter().copied().map(i64::from) {
+        for &c in &srow[..win] {
             sb += c;
             sa += c * c;
         }
         row_b[sy * aw] = sb;
         row_a[sy * aw] = sa;
         for j in 1..aw {
-            let out = i64::from(srow[j - 1]);
-            let inc = i64::from(srow[j - 1 + win]);
+            let out = srow[j - 1];
+            let inc = srow[j - 1 + win];
             sb += inc - out;
             sa += inc * inc - out * out;
             row_b[sy * aw + j] = sb;
@@ -879,6 +817,14 @@ pub(crate) fn box_filter<P: Pixel>(
                 col_a[j] += row_a[in_row * aw + j] - row_a[out_row * aw + j];
             }
         }
+        // r487 — the `pass == 0` weights below read `A` / `B` only on
+        // the rows where `( i + dy ) & 1` is set, i.e. the EVEN rows
+        // of these arrays (`ai = i + dy + 1`): the odd rows are never
+        // read, so they are not computed (the sliding sums above
+        // still advance through them).
+        if pass == 0 && ai % 2 == 1 {
+            continue;
+        }
         for aj in 0..aw {
             let a_acc = col_a[aj];
             let b_acc = col_b[aj];
@@ -890,10 +836,13 @@ pub(crate) fn box_filter<P: Pixel>(
             // av1-spec p.332 line 18326: z = Round2(p * s, MTABLE_BITS).
             let z = round2_i64(p.saturating_mul(s_div), SGRPROJ_MTABLE_BITS) as i32;
             // av1-spec p.332 lines 18327-18332: piecewise a2.
+            // r487 — by table for `z` in `0..255` (every value a
+            // non-wrapped product reaches); the formula itself only
+            // for a wrapped negative `z`.
             let a2 = if z >= 255 {
                 256
-            } else if z == 0 {
-                1
+            } else if z >= 0 {
+                i32::from(SGR_A2_BY_Z[z as usize])
             } else {
                 ((z << SGRPROJ_SGR_BITS) + (z / 2)) / (z + 1)
             };
@@ -910,12 +859,6 @@ pub(crate) fn box_filter<P: Pixel>(
     }
     // av1-spec p.332 lines 18359-18385: F[i][j] from weighted 3×3 of
     // (A, B) and the centre `u = UpscaledCdefFrame[plane][y + i][x + j]`.
-    let Some(cdef) = cdef_planes.get(plane as usize) else {
-        return f;
-    };
-    let cdef_rows = cdef.rows as i32;
-    let cdef_cols = cdef.cols as i32;
-    let cdef_cols_usize = cdef.cols as usize;
     for i in 0..h {
         // av1-spec p.332 lines 18360-18362: shift = 5 by default, 4 on
         // odd rows when pass == 0.
@@ -959,11 +902,7 @@ pub(crate) fn box_filter<P: Pixel>(
             };
             // av1-spec p.332 line 18382: v = a * UpscaledCdefFrame[..] + b.
             let px = geom.x as i32 + j as i32;
-            let u = if py >= 0 && py < cdef_rows && px >= 0 && px < cdef_cols {
-                i64::from(cdef.samples[(py as usize) * cdef_cols_usize + px as usize].to_i32())
-            } else {
-                0
-            };
+            let u = i64::from(src_view.cdef_at(px, py));
             let v = a_sum * u + b_sum;
             // av1-spec p.332 line 18383: F = Round2(v, SGR_BITS + shift -
             //                                            RST_BITS).
@@ -985,7 +924,7 @@ pub(crate) fn box_filter<P: Pixel>(
 /// `LrFrame[plane][y + r][x + c]` via the 7-tap vertical filter.
 /// `(InterRound0, InterRound1)` follow the §7.11.3.2 single-ref
 /// schedule (`isCompound = 0`).
-pub fn wiener_filter<P: Pixel>(
+pub fn wiener_filter<P: Sample>(
     ctx: &LoopRestorationFrameContext<'_>,
     curr_planes: &[PlaneBuffer<'_, P>],
     cdef_planes: &[PlaneBuffer<'_, P>],
@@ -993,47 +932,34 @@ pub fn wiener_filter<P: Pixel>(
     plane: u8,
     geom: &LrBlockGeometry,
 ) {
-    let Some(lr) = lr_planes.get_mut(plane as usize) else { return };
-    wiener_filter_at(ctx, curr_planes, cdef_planes, lr, plane, geom, 0);
+    let Some(_curr) = curr_planes.get(plane as usize) else {
+        return;
+    };
+    let Some(_cdef) = cdef_planes.get(plane as usize) else {
+        return;
+    };
+    let Some(lr) = lr_planes.get_mut(plane as usize) else {
+        return;
+    };
+    let src = PlaneSource {
+        curr: curr_planes,
+        cdef: cdef_planes,
+        plane,
+    };
+    wiener_filter_src(ctx, &src, lr, 0, plane, geom);
 }
 
-#[inline]
-fn wiener_horizontal_scalar(src: &[i32], filter: &[i32; 7], shift: u32, low: i32, high: i32, dst: &mut [i32]) {
-    for (c, out) in dst.iter_mut().enumerate() {
-        let sum = filter[0] * (src[c] + src[c + 6])
-            + filter[1] * (src[c + 1] + src[c + 5])
-            + filter[2] * (src[c + 2] + src[c + 4])
-            + filter[3] * src[c + 3];
-        *out = clip3(low, high, round2_i32(sum, shift));
-    }
-}
-
-#[inline]
-fn wiener_vertical_scalar<P: Pixel>(rows: [&[i32]; 7], filter: &[i32; 7], shift: u32, max: i32, dst: &mut [P]) {
-    for (c, out) in dst.iter_mut().enumerate() {
-        let sum = filter[0] * (rows[0][c] + rows[6][c])
-            + filter[1] * (rows[1][c] + rows[5][c])
-            + filter[2] * (rows[2][c] + rows[4][c])
-            + filter[3] * rows[3][c];
-        *out = P::from_i32(clip3(0, max, round2_i32(sum, shift)));
-    }
-}
-
-fn wiener_filter_at<P: Pixel>(
+/// [`wiener_filter`] from an [`LrSource`] into one plane buffer that
+/// may be a row window of the plane (`out_row0` = the plane row at
+/// `lr.samples[ 0 ]`).
+pub(crate) fn wiener_filter_src<S: LrSource, P: Sample>(
     ctx: &LoopRestorationFrameContext<'_>,
-    curr_planes: &[PlaneBuffer<'_, P>],
-    cdef_planes: &[PlaneBuffer<'_, P>],
+    src: &S,
     lr: &mut PlaneBuffer<'_, P>,
+    out_row0: i32,
     plane: u8,
     geom: &LrBlockGeometry,
-    origin_y: u32,
 ) {
-    let Some(curr) = curr_planes.get(plane as usize) else {
-        return;
-    };
-    let Some(cdef) = cdef_planes.get(plane as usize) else {
-        return;
-    };
     // av1-spec p.333 lines 18429-18433: vfilter = wiener_coefficients(
     // LrWiener[plane][unitRow][unitCol][0]); hfilter = wiener_coefficients(
     // LrWiener[plane][unitRow][unitCol][1]).
@@ -1064,43 +990,54 @@ fn wiener_filter_at<P: Pixel>(
     let mut window = vec![0i32; (h + 6) * sw];
     for (r, row) in window.chunks_mut(sw).enumerate() {
         let sy = geom.y as i32 + r as i32 - 3;
-        source_row(curr, cdef, geom.x as i32 - 3, sy, geom, row);
+        src.source_row(geom.x as i32 - 3, sy, geom, row);
     }
-    let mut intermediate = vec![0i32; (h + 6) * w];
-    for r in 0..(h + 6) {
-        let wrow = &window[r * sw..(r + 1) * sw];
-        let dst = &mut intermediate[r * w..(r + 1) * w];
-        #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
-        wasm::horizontal(wrow, &hfilter, inter_round0, -offset, limit - offset, dst);
-        #[cfg(target_arch = "aarch64")]
-        neon::horizontal(wrow, &hfilter, inter_round0, -offset, limit - offset, dst);
-        #[cfg(not(any(target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128"))))]
-        wiener_horizontal_scalar(wrow, &hfilter, inter_round0, -offset, limit - offset, dst);
-    }
-    // av1-spec p.334 lines 18476-18484: vertical pass writes
-    // `LrFrame[plane][y + r][x + c]`.
-    let max_sample = (1i32 << bit_depth) - 1;
-    let x0 = geom.x as usize;
-    let width = w.min((lr.cols as usize).saturating_sub(x0));
-    if width == 0 {
+    if w == 0 || h == 0 {
         return;
     }
+    // r487 — both passes accumulate tap by tap across a whole row
+    // (fixed tap count outside, samples inside), so each tap is one
+    // multiply-add over the row with no per-sample branch; the sums
+    // are the §7.17.4 sums in a different order.
+    let mut intermediate = vec![0i32; (h + 6) * w];
+    for (wrow, out) in window
+        .chunks_exact(sw)
+        .zip(intermediate.chunks_exact_mut(w))
+    {
+        for (t, &hcoef) in hfilter.iter().enumerate() {
+            for (o, &sample) in out.iter_mut().zip(&wrow[t..t + w]) {
+                *o += hcoef * sample;
+            }
+        }
+        for o in out.iter_mut() {
+            *o = clip3(-offset, limit - offset, round2_i32(*o, inter_round0));
+        }
+    }
+    let max_sample = (1i32 << bit_depth) - 1;
+    let lr_cols = lr.cols as i32;
+    let lr_rows = lr.rows as i32;
+    // The output columns that land inside `lr`.
+    let x0 = geom.x as i32;
+    let c_lo = (-x0).clamp(0, w as i32) as usize;
+    let c_hi = (lr_cols - x0).clamp(c_lo as i32, w as i32) as usize;
+    let mut acc = vec![0i32; w];
     for r in 0..h {
-        let global_y = geom.y as usize + r;
-        if global_y < origin_y as usize { continue; }
-        let y = global_y - origin_y as usize;
-        if y >= lr.rows as usize {
+        let dst_y = geom.y as i32 + r as i32 - out_row0;
+        if dst_y < 0 || dst_y >= lr_rows || c_lo == c_hi {
             continue;
         }
-        let start = y * lr.cols as usize + x0;
-        let dst = &mut lr.samples[start..start + width];
-        let rows = core::array::from_fn(|k| &intermediate[(r + k) * w..(r + k) * w + width]);
-        #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
-        wasm::vertical(rows, &vfilter, inter_round1, max_sample, dst);
-        #[cfg(target_arch = "aarch64")]
-        neon::vertical(rows, &vfilter, inter_round1, max_sample, dst);
-        #[cfg(not(any(target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128"))))]
-        wiener_vertical_scalar(rows, &vfilter, inter_round1, max_sample, dst);
+        acc.fill(0);
+        for (t, &vcoef) in vfilter.iter().enumerate() {
+            let row = &intermediate[(r + t) * w..(r + t + 1) * w];
+            for (a, &sample) in acc.iter_mut().zip(row) {
+                *a += vcoef * sample;
+            }
+        }
+        let d0 = (dst_y as usize) * (lr.cols as usize) + (x0 + c_lo as i32) as usize;
+        let dst = &mut lr.samples[d0..d0 + (c_hi - c_lo)];
+        for (d, &a) in dst.iter_mut().zip(&acc[c_lo..c_hi]) {
+            *d = P::narrow(clip3(0, max_sample, round2_i32(a, inter_round1)));
+        }
     }
 }
 
@@ -1134,43 +1071,333 @@ pub fn wiener_coefficients(coeff: &[i32; WIENER_COEFFS]) -> [i32; 7] {
 }
 
 // =====================================================================
-// §7.17.6 Get source sample process — av1-spec p.335 lines 18516-18550.
+// r475 — §7.17.6 sources: whole planes, or one stripe in place.
 // =====================================================================
 
-fn source_row<P: Pixel>(
-    curr: &PlaneBuffer<'_, P>,
-    cdef: &PlaneBuffer<'_, P>,
-    x: i32,
-    y: i32,
-    geom: &LrBlockGeometry,
-    dst: &mut [i32],
-) {
-    let mut y = y.clamp(0, geom.plane_end_y.max(0));
-    let src = if y < geom.stripe_start_y {
-        y = y.max(geom.stripe_start_y - 2);
-        curr
-    } else if y > geom.stripe_end_y {
-        y = y.min(geom.stripe_end_y + 2);
-        curr
-    } else {
-        cdef
-    };
-    if src.rows == 0 || src.cols == 0 {
-        dst.fill(0);
-        return;
-    }
-    let y = y.clamp(0, src.rows as i32 - 1) as usize;
-    let stride = src.cols as usize;
-    let row = &src.samples[y * stride..(y + 1) * stride];
-    let last_x = geom.plane_end_x.max(0).min(src.cols as i32 - 1);
-    if x >= 0 && x as usize + dst.len() <= last_x as usize + 1 {
-        for (dst, &src) in dst.iter_mut().zip(&row[x as usize..]) { *dst = src.to_i32(); }
-    } else {
-        for (c, v) in dst.iter_mut().enumerate() {
-            *v = row[(x + c as i32).clamp(0, last_x) as usize].to_i32();
+/// r475 — where a §7.17 kernel reads its samples from: the §7.17.6
+/// `get_source_sample` routing (`UpscaledCurrFrame` at the stripe's
+/// 2-row skirts, `UpscaledCdefFrame` inside the stripe) and the
+/// in-rectangle `UpscaledCdefFrame` sample the self-guided projection
+/// centres on. [`PlaneSource`] is the pair of whole planes;
+/// [`StripeSource`] is one stripe's CDEF rows plus the saved pre-CDEF
+/// boundary rows — the in-place driver's view.
+pub(crate) trait LrSource {
+    /// §7.17.6 `get_source_sample( plane, x, y )`.
+    fn source(&self, x: i32, y: i32, geom: &LrBlockGeometry) -> i32;
+    /// `UpscaledCdefFrame[ plane ][ y ][ x ]` for a position inside
+    /// the plane (`0` outside — the kernels never write there).
+    fn cdef_at(&self, x: i32, y: i32) -> i32;
+    /// `out[ k ] = source( x0 + k, y )`.
+    fn source_row(&self, x0: i32, y: i32, geom: &LrBlockGeometry, out: &mut [i32]) {
+        for (k, o) in out.iter_mut().enumerate() {
+            *o = self.source(x0 + k as i32, y, geom);
         }
     }
 }
+
+/// The §7.17 frame driver's view: `UpscaledCurrFrame` /
+/// `UpscaledCdefFrame` as whole planes.
+pub(crate) struct PlaneSource<'a, 'b, P: Sample = i32> {
+    pub curr: &'b [PlaneBuffer<'a, P>],
+    pub cdef: &'b [PlaneBuffer<'a, P>],
+    pub plane: u8,
+}
+
+impl<P: Sample> LrSource for PlaneSource<'_, '_, P> {
+    #[inline]
+    fn source(&self, x: i32, y: i32, geom: &LrBlockGeometry) -> i32 {
+        get_source_sample(self.curr, self.cdef, self.plane, x, y, geom)
+    }
+
+    #[inline]
+    fn cdef_at(&self, x: i32, y: i32) -> i32 {
+        let Some(buf) = self.cdef.get(self.plane as usize) else {
+            return 0;
+        };
+        if y < 0 || x < 0 || y >= buf.rows as i32 || x >= buf.cols as i32 {
+            return 0;
+        }
+        buf.samples[(y as usize) * (buf.cols as usize) + x as usize].widen()
+    }
+}
+
+/// r475 — one stripe's §7.17.6 source for the in-place driver: the
+/// stripe's `UpscaledCdefFrame` rows `cdef_row0 ..` (a copy taken
+/// before the stripe is overwritten), and the pre-CDEF rows at the
+/// stripe's two skirts — `above` holds plane rows `StripeStartY - 2`
+/// and `StripeStartY - 1`, `below` rows `StripeEndY + 1` and
+/// `StripeEndY + 2`, each captured at its §7.17.6-clamped plane row
+/// (`None` where the stripe touches the picture edge, which the
+/// clamps make unreachable).
+pub(crate) struct StripeSource<'a, P: Sample = i32> {
+    pub cdef: &'a [P],
+    pub cdef_row0: i32,
+    pub cols: usize,
+    pub above: Option<&'a [P]>,
+    pub below: Option<&'a [P]>,
+    pub plane_end_x: i32,
+    pub plane_end_y: i32,
+}
+
+impl<P: Sample> StripeSource<'_, P> {
+    /// The source row for a clamped `y` (§7.17.6 routing) and the
+    /// column range `[0, plane_end_x]` it covers.
+    #[inline]
+    fn row(&self, y: i32, geom: &LrBlockGeometry) -> &[P] {
+        let y = y.clamp(0, self.plane_end_y.max(0));
+        if y < geom.stripe_start_y {
+            let k = (y.max(geom.stripe_start_y - 2) - (geom.stripe_start_y - 2)) as usize;
+            if let Some(a) = self.above {
+                return &a[k * self.cols..(k + 1) * self.cols];
+            }
+        } else if y > geom.stripe_end_y {
+            let k = (y.min(geom.stripe_end_y + 2) - (geom.stripe_end_y + 1)) as usize;
+            if let Some(b) = self.below {
+                return &b[k * self.cols..(k + 1) * self.cols];
+            }
+        }
+        let yy = (y - self.cdef_row0).max(0) as usize;
+        let start = (yy * self.cols).min(self.cdef.len().saturating_sub(self.cols));
+        &self.cdef[start..start + self.cols]
+    }
+}
+
+impl<P: Sample> LrSource for StripeSource<'_, P> {
+    #[inline]
+    fn source(&self, x: i32, y: i32, geom: &LrBlockGeometry) -> i32 {
+        let x = x.clamp(0, geom.plane_end_x.max(0)) as usize;
+        self.row(y, geom)[x.min(self.cols - 1)].widen()
+    }
+
+    #[inline]
+    fn cdef_at(&self, x: i32, y: i32) -> i32 {
+        if x < 0 || x > self.plane_end_x || y < 0 || y > self.plane_end_y {
+            return 0;
+        }
+        let yy = y - self.cdef_row0;
+        if yy < 0 {
+            return 0;
+        }
+        self.cdef
+            .get((yy as usize) * self.cols + x as usize)
+            .map_or(0, |v| v.widen())
+    }
+
+    fn source_row(&self, x0: i32, y: i32, geom: &LrBlockGeometry, out: &mut [i32]) {
+        let row = self.row(y, geom);
+        let end_x = geom.plane_end_x.max(0).min(self.cols as i32 - 1);
+        for (k, o) in out.iter_mut().enumerate() {
+            let x = (x0 + k as i32).clamp(0, end_x) as usize;
+            *o = row[x].widen();
+        }
+    }
+}
+
+/// r475 — the pre-CDEF rows §7.17.6 reads across every stripe
+/// boundary of one plane: for boundary `s >= 1` at
+/// `B = ( 64 s - 8 ) >> subY` (while `B <= PlaneEndY`), the four
+/// plane rows `B - 2, B - 1, B, B + 1`, each clamped to
+/// `[0, PlaneEndY]` as the fetch clamps them. Captured from the
+/// deblocked frame before CDEF runs.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct StripeBoundaryRows<P: Sample = i32> {
+    pub cols: usize,
+    /// `rows[ s - 1 ]` — four rows of `cols` samples for boundary `s`.
+    pub rows: Vec<Vec<P>>,
+}
+
+impl<P: Sample> StripeBoundaryRows<P> {
+    /// Capture the boundary rows of `plane` (`sub_y` its subsampling).
+    pub(crate) fn capture(plane: &PlaneBuffer<'_, P>, plane_end_y: i32, sub_y: u8) -> Self {
+        let mut out = Self {
+            cols: plane.cols as usize,
+            rows: Vec::new(),
+        };
+        while out.push_next(plane, plane_end_y, sub_y) {}
+        out
+    }
+
+    /// r481 — the number of boundaries a plane of last row
+    /// `plane_end_y` has (`s >= 1` with `( 64 s - 8 ) >> subY <=
+    /// PlaneEndY`).
+    pub(crate) fn boundary_count(plane_end_y: i32, sub_y: u8) -> usize {
+        let mut s = 1i32;
+        while (64 * s - 8) >> sub_y <= plane_end_y {
+            s += 1;
+        }
+        (s - 1) as usize
+    }
+
+    /// r481 — capture the next boundary (`s = rows.len() + 1`) from
+    /// `plane`; `false` (nothing captured) once past the last one. The
+    /// four rows must be final deblocked samples not yet touched by
+    /// CDEF.
+    pub(crate) fn push_next(
+        &mut self,
+        plane: &PlaneBuffer<'_, P>,
+        plane_end_y: i32,
+        sub_y: u8,
+    ) -> bool {
+        let cols = plane.cols as usize;
+        self.cols = cols;
+        let s = self.rows.len() as i32 + 1;
+        let b = (64 * s - 8) >> sub_y;
+        if b > plane_end_y {
+            return false;
+        }
+        let mut four = Vec::with_capacity(4 * cols);
+        for k in -2..2 {
+            let y = (b + k).clamp(0, plane_end_y.max(0)) as usize;
+            let y = y.min(plane.rows.saturating_sub(1) as usize);
+            four.extend_from_slice(&plane.samples[y * cols..(y + 1) * cols]);
+        }
+        self.rows.push(four);
+        true
+    }
+
+    /// The two rows above stripe `s` (`s >= 1`) / below stripe `s`.
+    fn above(&self, stripe: usize) -> Option<&[P]> {
+        if stripe == 0 {
+            return None;
+        }
+        self.rows.get(stripe - 1).map(|r| &r[..2 * self.cols])
+    }
+
+    fn below(&self, stripe: usize) -> Option<&[P]> {
+        self.rows.get(stripe).map(|r| &r[2 * self.cols..])
+    }
+}
+
+/// r475 — [`loop_restoration_frame`] in place: `planes` holds
+/// `UpscaledCdefFrame` and receives `LrFrame`, one stripe at a time.
+/// §7.17.6 reads CDEF samples only inside the unit's own stripe
+/// (`StripeStartY ..= StripeEndY`) and pre-CDEF samples only at the
+/// stripe's 2-row skirts, and a unit writes only its own rectangle, so
+/// a stripe restores from a copy of its CDEF rows plus the captured
+/// `boundary` rows — the frame-sized `UpscaledCurrFrame` and
+/// `UpscaledCdefFrame` copies (2 × 73 MiB at 12 MP 4:2:0) are gone.
+/// Every sample is computed from the same inputs as the frame driver.
+pub(crate) fn loop_restoration_frame_in_place<P: Sample>(
+    ctx: &LoopRestorationFrameContext<'_>,
+    planes: &mut [PlaneBuffer<'_, P>],
+    boundary: &[StripeBoundaryRows<P>],
+) {
+    if !ctx.lr_params.uses_lr {
+        return;
+    }
+    let num_planes = ctx.num_planes.min(planes.len() as u8);
+    let mut stripe_copy: Vec<P> = Vec::new();
+    for plane in 0..num_planes {
+        let Some(bnd) = boundary.get(plane as usize) else {
+            continue;
+        };
+        let pb = &mut planes[plane as usize];
+        for stripe in plane_stripes(ctx, plane) {
+            restore_stripe_in_place(ctx, plane, &stripe, bnd, pb, 0, &mut stripe_copy);
+        }
+    }
+}
+
+/// r475 — one stripe's restoration rectangles (`stripe_unit_rects`
+/// grouped by `stripe_start_y`): the stripe ordinal, its plane rows
+/// `[ y0, y1 )` and the rectangles.
+#[derive(Debug, Clone)]
+pub(crate) struct PlaneStripe {
+    pub stripe: usize,
+    pub y0: usize,
+    pub y1: usize,
+    pub rects: Vec<LrBlockGeometry>,
+}
+
+/// r475 — the stripes of `plane` that carry restoration (empty when
+/// the plane's `FrameRestorationType` is `RESTORE_NONE`).
+pub(crate) fn plane_stripes(ctx: &LoopRestorationFrameContext<'_>, plane: u8) -> Vec<PlaneStripe> {
+    let mut out = Vec::new();
+    if ctx.lr_params.frame_restoration_type[plane as usize] == FrameRestorationType::None {
+        return out;
+    }
+    let rects = stripe_unit_rects(ctx, plane);
+    let mut i = 0usize;
+    while i < rects.len() {
+        let stripe_start = rects[i].stripe_start_y;
+        let mut j = i;
+        while j < rects.len() && rects[j].stripe_start_y == stripe_start {
+            j += 1;
+        }
+        let g = &rects[i];
+        out.push(PlaneStripe {
+            stripe: stripe_index(stripe_start, ctx, plane),
+            y0: g.y as usize,
+            y1: (g.y + g.h) as usize,
+            rects: rects[i..j].to_vec(),
+        });
+        i = j;
+    }
+    out
+}
+
+/// r475 — restore one stripe in place: `out` holds the stripe's
+/// CDEF rows (the whole plane, or the stripe's own row window with
+/// `out_row0` its first plane row); the stripe is copied into
+/// `stripe_copy` first and every unit reads the copy plus the
+/// captured pre-CDEF `boundary` rows.
+pub(crate) fn restore_stripe_in_place<P: Sample>(
+    ctx: &LoopRestorationFrameContext<'_>,
+    plane: u8,
+    stripe: &PlaneStripe,
+    boundary: &StripeBoundaryRows<P>,
+    out: &mut PlaneBuffer<'_, P>,
+    out_row0: usize,
+    stripe_copy: &mut Vec<P>,
+) {
+    let cols = out.cols as usize;
+    let (y0, y1) = (stripe.y0, stripe.y1);
+    let (w0, w1) = (y0 - out_row0, y1 - out_row0);
+    stripe_copy.clear();
+    stripe_copy.extend_from_slice(&out.samples[w0 * cols..w1 * cols]);
+    let Some(g) = stripe.rects.first() else {
+        return;
+    };
+    let src = StripeSource {
+        cdef: stripe_copy,
+        cdef_row0: y0 as i32,
+        cols,
+        above: boundary.above(stripe.stripe),
+        below: boundary.below(stripe.stripe),
+        plane_end_x: g.plane_end_x,
+        plane_end_y: g.plane_end_y,
+    };
+    for geom in &stripe.rects {
+        let r_type = (ctx.lr_type)(plane, geom.unit_row, geom.unit_col);
+        match r_type {
+            FrameRestorationType::Wiener => {
+                wiener_filter_src(ctx, &src, out, out_row0 as i32, plane, geom);
+            }
+            FrameRestorationType::SgrProj => {
+                self_guided_filter_src(ctx, &src, out, out_row0 as i32, plane, geom);
+            }
+            FrameRestorationType::None | FrameRestorationType::Switchable => {}
+        }
+    }
+}
+
+/// The stripe ordinal `s` of a rectangle's `StripeStartY = ( -8 + 64
+/// s ) >> subY`.
+fn stripe_index(stripe_start_y: i32, ctx: &LoopRestorationFrameContext<'_>, plane: u8) -> usize {
+    let (_, sub_y) = subsampling_for_plane(plane, ctx.subsampling_x, ctx.subsampling_y);
+    let mut s = 0i32;
+    loop {
+        let start = (-8 + s * 64) >> sub_y;
+        if start >= stripe_start_y || s > 1 << 20 {
+            return s.max(0) as usize;
+        }
+        s += 1;
+    }
+}
+
+// =====================================================================
+// §7.17.6 Get source sample process — av1-spec p.335 lines 18516-18550.
+// =====================================================================
 
 /// §7.17.6 source-sample fetch — av1-spec p.335 lines 18516-18550.
 ///
@@ -1179,7 +1406,7 @@ fn source_row<P: Pixel>(
 /// `StripeStartY` or below `StripeEndY`, with the cropped
 /// `StripeStartY - 2` / `StripeEndY + 2` neighbour-line reach) or
 /// `UpscaledCdefFrame[plane]` (when `y` lands inside the stripe).
-pub fn get_source_sample<P: Pixel>(
+pub fn get_source_sample<P: Sample>(
     curr_planes: &[PlaneBuffer<'_, P>],
     cdef_planes: &[PlaneBuffer<'_, P>],
     plane: u8,
@@ -1209,7 +1436,7 @@ pub fn get_source_sample<P: Pixel>(
 /// `[StripeStartY - 2, StripeEndY + 2]` — but the planes the caller
 /// passes in may be sized differently, so the fetch here clamps
 /// defensively to the buffer's `[0, rows-1] × [0, cols-1]` extent.
-fn sample_at<P: Pixel>(planes: &[PlaneBuffer<'_, P>], plane: usize, x: i32, y: i32) -> i32 {
+fn sample_at<P: Sample>(planes: &[PlaneBuffer<'_, P>], plane: usize, x: i32, y: i32) -> i32 {
     let Some(buf) = planes.get(plane) else {
         return 0;
     };
@@ -1218,7 +1445,7 @@ fn sample_at<P: Pixel>(planes: &[PlaneBuffer<'_, P>], plane: usize, x: i32, y: i
     }
     let yc = y.clamp(0, buf.rows as i32 - 1) as usize;
     let xc = x.clamp(0, buf.cols as i32 - 1) as usize;
-    buf.samples[yc * (buf.cols as usize) + xc].to_i32()
+    buf.samples[yc * (buf.cols as usize) + xc].widen()
 }
 
 // =====================================================================
@@ -1282,33 +1509,21 @@ fn clip3(a: i32, b: i32, x: i32) -> i32 {
 /// `(subX, subY)` for `plane` per av1-spec p.328 lines 18138-18142.
 #[inline]
 fn subsampling_for_plane(plane: u8, sub_x: u8, sub_y: u8) -> (u8, u8) {
-    if plane == 0 {
-        (0, 0)
-    } else {
-        (sub_x, sub_y)
-    }
+    if plane == 0 { (0, 0) } else { (sub_x, sub_y) }
 }
 
 /// §7.11.3.2 `InterRound0` for `isCompound = 0` per av1-spec p.259
 /// lines 14423 / 14427 — `3` for `BitDepth ∈ {8, 10}`, `5` for `12`.
 #[inline]
 fn inter_round0(bit_depth: u8) -> u32 {
-    if bit_depth == 12 {
-        5
-    } else {
-        3
-    }
+    if bit_depth == 12 { 5 } else { 3 }
 }
 
 /// §7.11.3.2 `InterRound1` for `isCompound = 0` per av1-spec p.259
 /// lines 14425 / 14429 — `11` for `BitDepth ∈ {8, 10}`, `9` for `12`.
 #[inline]
 fn inter_round1(bit_depth: u8) -> u32 {
-    if bit_depth == 12 {
-        9
-    } else {
-        11
-    }
+    if bit_depth == 12 { 9 } else { 11 }
 }
 
 // =====================================================================
@@ -1319,50 +1534,6 @@ fn inter_round1(bit_depth: u8) -> u32 {
 mod tests {
     use super::*;
     use crate::uncompressed_header_tail::RESTORATION_TILESIZE_MAX;
-
-    #[test]
-    fn threaded_restoration_bands_match_serial_across_formats() {
-        for bit_depth in [8u8, 10, 12] {
-            for (sub_x, sub_y) in [(0u8, 0u8), (1, 0), (1, 1)] {
-                let dims: Vec<(u32, u32)> = (0..3).map(|p| {
-                    if p == 0 { (152, 264) } else { (152 >> sub_x, 264 >> sub_y) }
-                }).collect();
-                let mask = (1i32 << bit_depth) - 1;
-                let mut curr: Vec<Vec<i32>> = dims.iter().map(|&(w, h)| (0..w * h).map(|i| (i as i32 * 197 + 19) & mask).collect()).collect();
-                let mut cdef: Vec<Vec<i32>> = dims.iter().map(|&(w, h)| (0..w * h).map(|i| (i as i32 * 73 + 61) & mask).collect()).collect();
-                let curr: Vec<_> = curr.iter_mut().zip(&dims).map(|(samples, &(cols, rows))| PlaneBuffer { rows, cols, samples }).collect();
-                let cdef: Vec<_> = cdef.iter_mut().zip(&dims).map(|(samples, &(cols, rows))| PlaneBuffer { rows, cols, samples }).collect();
-                let mut params = make_lr_params(true, [64, 64 >> sub_y, 64 >> sub_y]);
-                params.frame_restoration_type = [FrameRestorationType::Switchable; 3];
-                let ctx = LoopRestorationFrameContext {
-                    mi_rows: 66, mi_cols: 38, num_planes: 3, bit_depth,
-                    subsampling_x: sub_x, subsampling_y: sub_y, frame_height: 259,
-                    upscaled_width: 149, lr_params: &params,
-                    lr_type: &|p, r, c| match (u32::from(p) + r + c) % 3 {
-                        0 => FrameRestorationType::Wiener,
-                        1 => FrameRestorationType::SgrProj,
-                        _ => FrameRestorationType::None,
-                    },
-                    lr_wiener: &|_, _, _, pass, i| if pass == 0 { [1, -3, 9][i] } else { [3, -7, 15][i] },
-                    lr_sgr_set: &|p, r, c| ((u32::from(p) + r + c) % 16) as u8,
-                    lr_sgr_xqd: &|_, _, _, i| [-16, 48][i],
-                };
-                let mut expected: Vec<Vec<i32>> = dims.iter().map(|&(w, h)| vec![0; (w * h) as usize]).collect();
-                {
-                    let mut dst: Vec<_> = expected.iter_mut().zip(&dims).map(|(samples, &(cols, rows))| PlaneBuffer { rows, cols, samples }).collect();
-                    loop_restoration_frame(&ctx, &curr, &cdef, &mut dst);
-                }
-                for workers in [2, 4, 10] {
-                    let mut actual: Vec<Vec<i32>> = dims.iter().map(|&(w, h)| vec![0; (w * h) as usize]).collect();
-                    {
-                        let mut dst: Vec<_> = actual.iter_mut().zip(&dims).map(|(samples, &(cols, rows))| PlaneBuffer { rows, cols, samples }).collect();
-                        loop_restoration_frame_with_workers(&ctx, &curr, &cdef, &mut dst, workers);
-                    }
-                    assert_eq!(actual, expected, "restoration {bit_depth}-bit {sub_x}:{sub_y}, {workers} workers");
-                }
-            }
-        }
-    }
 
     fn make_lr_params(uses_lr: bool, sizes: [u32; 3]) -> LrParams {
         LrParams {
@@ -1378,27 +1549,6 @@ mod tests {
 
     fn make_plane(rows: u32, cols: u32, fill: i32) -> Vec<i32> {
         vec![fill; (rows * cols) as usize]
-    }
-
-    #[test]
-    fn source_rows_match_individual_stripe_samples() {
-        let mut curr_samples: Vec<i32> = (0..17 * 19).collect();
-        let mut cdef_samples: Vec<i32> = (0..21 * 23).map(|i| 4095 - i * 3).collect();
-        let curr = [PlaneBuffer { rows: 17, cols: 19, samples: &mut curr_samples }];
-        let cdef = [PlaneBuffer { rows: 21, cols: 23, samples: &mut cdef_samples }];
-        let geom = LrBlockGeometry {
-            unit_row: 0, unit_col: 0, x: 0, y: 0, w: 23, h: 21,
-            stripe_start_y: 4, stripe_end_y: 12, plane_end_x: 22, plane_end_y: 20,
-        };
-        for y in -5..30 {
-            for x in -7..30 {
-                let mut actual = [0i32; 31];
-                source_row(&curr[0], &cdef[0], x, y, &geom, &mut actual);
-                for (c, &sample) in actual.iter().enumerate() {
-                    assert_eq!(sample, get_source_sample(&curr, &cdef, 0, x + c as i32, y, &geom));
-                }
-            }
-        }
     }
 
     #[test]

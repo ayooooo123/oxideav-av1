@@ -1,11 +1,17 @@
-//! Exact CDEF filtering and directional projections in eight signed sample lanes.
-use crate::loop_filter::Pixel;
+//! §7.15 arithmetic in eight signed 16-bit SIMD128 lanes: the same sums,
+//! envelopes and rounding as the scalar process (see `cdef/neon.rs` for the
+//! bounds that make 16 bits exact).
+//!
+//! WebAssembly has no run-time feature detection: this module is compiled
+//! only when the target enables `simd128`, so the entry points always run
+//! and report `true` / `Some`, with the same signatures as the NEON ones.
+use crate::loop_filter::Sample;
 use core::arch::wasm32::*;
 
 #[inline(always)]
-unsafe fn load<const W: usize, P: Pixel>(p: *const P) -> v128 {
-    // SAFETY: callers prove W readable samples; W is four or eight. Pixel is
-    // sealed to u8/u16/i32 and clipped AV1 values fit signed 16 bits.
+unsafe fn load<const W: usize, P: Sample>(p: *const P) -> v128 {
+    // SAFETY: callers prove W readable samples; W is four or eight. `Sample`
+    // storage is u8, u16 or i32 and clipped AV1 values fit signed 16 bits.
     unsafe {
         if core::mem::size_of::<P>() == 1 {
             i16x8_extend_low_u8x16(if W == 8 {
@@ -47,7 +53,7 @@ fn constrained(d: v128, strength: v128, shift: u32) -> v128 {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn filter<const W: usize, P: Pixel>(
+pub(super) fn filter<const W: usize, P: Sample>(
     src: &[P],
     base: usize,
     stride: usize,
@@ -60,7 +66,7 @@ pub(super) fn filter<const W: usize, P: Pixel>(
     sec_strength: i32,
     pri_shift: i32,
     sec_shift: i32,
-) {
+) -> bool {
     assert!(W == 4 || W == 8);
     assert!(height > 0);
     let mut lowest = 0;
@@ -134,14 +140,15 @@ pub(super) fn filter<const W: usize, P: Pixel>(
             }
         }
     }
+    true
 }
 
-pub(super) fn partial<P: Pixel>(
+pub(super) fn partial<P: Sample>(
     src: &[P],
     base: usize,
     stride: usize,
     shift: i32,
-) -> [[i32; 15]; 8] {
+) -> Option<[[i32; 15]; 8]> {
     assert!(base + 7 * stride + 8 <= src.len());
     let mut partial = [[0i16; 16]; 8];
     // SAFETY: source rows are checked above. Every projection offset leaves
@@ -176,240 +183,7 @@ pub(super) fn partial<P: Pixel>(
             }
         }
     }
-    core::array::from_fn(|d| core::array::from_fn(|i| partial[d][i] as i32))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::cdef::{cdef_interior_row, CDEF_DIRECTIONS, CDEF_PRI_TAPS, CDEF_SEC_TAPS};
-
-    fn next(state: &mut u32) -> u32 {
-        *state ^= *state << 13;
-        *state ^= *state >> 17;
-        *state ^= *state << 5;
-        *state
-    }
-
-    #[test]
-    fn projections_match_spec_full_depth_and_edges() {
-        let mut state = 0x91ab0347;
-        for depth in [8, 10, 12] {
-            let max = (1 << depth) - 1;
-            let mut src = [0i32; 17 * 11];
-            for case in 0..max + 4097 {
-                for (index, v) in src.iter_mut().enumerate() {
-                    *v = if case <= max {
-                        case
-                    } else if case <= max + 128 {
-                        if index % 64 == (case - max - 1) as usize % 64 {
-                            if case - max <= 64 {
-                                max
-                            } else {
-                                0
-                            }
-                        } else if case - max <= 64 {
-                            0
-                        } else {
-                            max
-                        }
-                    } else {
-                        next(&mut state) as i32 & max
-                    };
-                }
-                let base = 19;
-                let stride = 17;
-                let mut expected = [[0; 15]; 8];
-                for i in 0..8 {
-                    for j in 0..8 {
-                        let v = (src[base + i * stride + j] >> (depth - 8)) - 128;
-                        for (d, k) in [
-                            (0, i + j),
-                            (1, i + j / 2),
-                            (2, i),
-                            (3, 3 + i - j / 2),
-                            (4, 7 + i - j),
-                            (5, 3 - i / 2 + j),
-                            (6, j),
-                            (7, i / 2 + j),
-                        ] {
-                            expected[d][k] += v;
-                        }
-                    }
-                }
-                assert_eq!(
-                    partial(&src, base, stride, depth - 8),
-                    expected,
-                    "depth={depth} case={case}"
-                );
-                let native16 = src.map(|v| v as u16);
-                assert_eq!(partial(&native16, base, stride, depth - 8), expected);
-                if depth == 8 {
-                    let native8 = src.map(|v| v as u8);
-                    assert_eq!(partial(&native8, base, stride, 0), expected);
-                }
-            }
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn native_filter_matches<const W: usize, P: Pixel>(
-        source: &[i32],
-        expected: &[i32],
-        base: usize,
-        stride: usize,
-        height: usize,
-        pri: &[(isize, i32); 4],
-        sec: &[(isize, i32); 8],
-        strength: i32,
-        secondary: i32,
-        adj: i32,
-    ) {
-        let source: Vec<P> = source.iter().map(|&v| P::from_i32(v)).collect();
-        let mut actual = vec![P::from_i32(0x123456); expected.len()];
-        filter::<W, P>(
-            &source,
-            base,
-            stride,
-            &mut actual,
-            stride,
-            height,
-            pri,
-            sec,
-            strength,
-            secondary,
-            adj,
-            adj,
-        );
-        assert!(actual
-            .iter()
-            .zip(expected)
-            .all(|(&a, &b)| a == P::from_i32(b)));
-    }
-
-    fn filter_cases<const W: usize>() {
-        let mut state = 0x8f43c521;
-        const STRIDE: usize = 19;
-        const BASE: usize = 2 * STRIDE + 3;
-        let mut src = [0i32; STRIDE * 13];
-        for depth in [8, 10, 12] {
-            let scale = 1 << (depth - 8);
-            let max = (1 << depth) - 1;
-            for dir in 0..8 {
-                for strength in 0..=15 {
-                    for secondary in [0, 1, 2, 4] {
-                        let mut pri = [(0, 0); 4];
-                        let mut sec = [(0, 0); 8];
-                        for k in 0..2 {
-                            let [dy, dx] = CDEF_DIRECTIONS[dir][k];
-                            let off = dy as isize * STRIDE as isize + dx as isize;
-                            pri[2 * k] = (-off, CDEF_PRI_TAPS[strength & 1][k]);
-                            pri[2 * k + 1] = (off, CDEF_PRI_TAPS[strength & 1][k]);
-                            for (s, d) in [((dir + 6) & 7), ((dir + 2) & 7)].into_iter().enumerate()
-                            {
-                                let [dy, dx] = CDEF_DIRECTIONS[d][k];
-                                let off = dy as isize * STRIDE as isize + dx as isize;
-                                sec[4 * k + 2 * s] = (-off, CDEF_SEC_TAPS[strength & 1][k]);
-                                sec[4 * k + 2 * s + 1] = (off, CDEF_SEC_TAPS[strength & 1][k]);
-                            }
-                        }
-                        for adj in [0, 1, 2, 3, 4, 5, 6, 8, 16, 31, 32] {
-                            for case in 0..12 {
-                                for (i, v) in src.iter_mut().enumerate() {
-                                    *v = match case {
-                                        0 => 0,
-                                        1 => max,
-                                        2 => {
-                                            if i & 1 == 0 {
-                                                0
-                                            } else {
-                                                max
-                                            }
-                                        }
-                                        3 => {
-                                            if i % STRIDE & 1 == 0 {
-                                                max / 2
-                                            } else {
-                                                max / 2 + 1
-                                            }
-                                        }
-                                        4..=7 => (max / 2
-                                            + (i as i32 % 7 - 3) * strength as i32 * scale)
-                                            .clamp(0, max),
-                                        _ => next(&mut state) as i32 & max,
-                                    };
-                                }
-                                let height = 1 + case % 8;
-                                let mut expected = [0x123456; STRIDE * 8];
-                                let mut actual = expected;
-                                for y in 0..height {
-                                    cdef_interior_row::<W, i32>(
-                                        &src,
-                                        BASE + y * STRIDE,
-                                        (&mut expected[y * STRIDE..y * STRIDE + W])
-                                            .try_into()
-                                            .unwrap(),
-                                        &pri,
-                                        &sec,
-                                        strength as i32 * scale,
-                                        secondary * scale,
-                                        adj,
-                                        adj,
-                                    );
-                                }
-                                filter::<W, i32>(
-                                    &src,
-                                    BASE,
-                                    STRIDE,
-                                    &mut actual,
-                                    STRIDE,
-                                    height,
-                                    &pri,
-                                    &sec,
-                                    strength as i32 * scale,
-                                    secondary * scale,
-                                    adj,
-                                    adj,
-                                );
-                                assert_eq!(actual, expected,
-                                    "W={W} depth={depth} direction={dir} strength={strength} secondary={secondary} adj={adj} case={case}");
-                                native_filter_matches::<W, u16>(
-                                    &src,
-                                    &expected,
-                                    BASE,
-                                    STRIDE,
-                                    height,
-                                    &pri,
-                                    &sec,
-                                    strength as i32 * scale,
-                                    secondary * scale,
-                                    adj,
-                                );
-                                if depth == 8 {
-                                    native_filter_matches::<W, u8>(
-                                        &src,
-                                        &expected,
-                                        BASE,
-                                        STRIDE,
-                                        height,
-                                        &pri,
-                                        &sec,
-                                        strength as i32 * scale,
-                                        secondary * scale,
-                                        adj,
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn filter_matches_scalar_all_strengths_directions_and_shapes() {
-        filter_cases::<4>();
-        filter_cases::<8>();
-    }
+    Some(core::array::from_fn(|d| {
+        core::array::from_fn(|i| partial[d][i] as i32)
+    }))
 }

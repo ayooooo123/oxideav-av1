@@ -69,14 +69,14 @@ use crate::cdf::{
     TX_WIDTH, TX_WIDTH_LOG2, V_ADST, V_DCT, V_FLIPADST,
 };
 
+// The lossy two-dimensional transform in explicit NEON lanes; the passes
+// of `inverse_transform_2d_passes` are the reference and the fallback.
 #[cfg(target_arch = "aarch64")]
-mod neon;
-#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
-mod wasm;
-#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
-use wasm as simd;
-#[cfg(target_arch = "aarch64")]
-use neon as simd;
+#[path = "transform/neon.rs"]
+mod simd;
+#[cfg(all(test, target_arch = "aarch64"))]
+#[path = "transform/simd_tests.rs"]
+mod simd_tests;
 
 /// `Cos128_Lookup[65]` (§7.13.2.1 av1-spec p.296). Quarter-period
 /// table: `Cos128_Lookup[k] = round(4096 * cos(k * pi / 128))` for
@@ -154,11 +154,12 @@ pub fn clip3(low: i64, high: i64, x: i64) -> i64 {
 /// the low `num_bits` of `x`.
 #[inline]
 pub fn brev(num_bits: u32, x: u32) -> u32 {
-    if num_bits == 0 {
-        0
-    } else {
-        x.reverse_bits() >> (32 - num_bits)
+    let mut t = 0u32;
+    for i in 0..num_bits {
+        let bit = (x >> i) & 1;
+        t += bit << (num_bits - 1 - i);
     }
+    t
 }
 
 /// §7.13.2.1 `cos128( angle )` (av1-spec p.296). Implements
@@ -198,7 +199,17 @@ pub fn sin128(angle: i32) -> i32 {
 /// for spec faithfulness but the runtime does not enforce the bound.
 #[inline]
 pub fn butterfly_b(t: &mut [i64], a: usize, b: usize, angle: i32, flip: u8, _r: u32) {
-    dct_b(t, a, b, angle, flip, _r);
+    let cos_a = cos128(angle) as i64;
+    let sin_a = sin128(angle) as i64;
+    let ta = t[a];
+    let tb = t[b];
+    let x = ta * cos_a - tb * sin_a;
+    let y = ta * sin_a + tb * cos_a;
+    t[a] = round2(x, 12);
+    t[b] = round2(y, 12);
+    if flip == 1 {
+        t.swap(a, b);
+    }
 }
 
 /// §7.13.2.1 Hadamard `H( a, b, flip, r )` (av1-spec p.297). For
@@ -207,397 +218,51 @@ pub fn butterfly_b(t: &mut [i64], a: usize, b: usize, angle: i32, flip: u8, _r: 
 /// `H(b, a, 0, r)` (i.e. flips the input argument order).
 #[inline]
 pub fn butterfly_h(t: &mut [i64], a: usize, b: usize, flip: u8, r: u32) {
-    dct_h(t, a, b, flip, r);
-}
-
-trait DctValue: Copy {
-    fn rotate(a: Self, b: Self, cos: i32, sin: i32) -> (Self, Self);
-    fn hadamard(a: Self, b: Self, r: u32) -> (Self, Self);
-}
-
-impl DctValue for i64 {
-    #[inline(always)]
-    fn rotate(a: Self, b: Self, cos: i32, sin: i32) -> (Self, Self) {
-        let (cos, sin) = (i64::from(cos), i64::from(sin));
-        (round2(a * cos - b * sin, 12), round2(a * sin + b * cos, 12))
-    }
-
-    #[inline(always)]
-    fn hadamard(a: Self, b: Self, r: u32) -> (Self, Self) {
-        let lo = -(1i64 << (r - 1));
-        let hi = (1i64 << (r - 1)) - 1;
-        (clip3(lo, hi, a + b), clip3(lo, hi, a - b))
-    }
-}
-
-impl DctValue for [i32; 4] {
-    #[inline(always)]
-    fn rotate(a: Self, b: Self, cos: i32, sin: i32) -> (Self, Self) {
-        let (cos, sin) = (i64::from(cos), i64::from(sin));
-        let mut x = [0i32; 4];
-        let mut y = [0i32; 4];
-        for lane in 0..4 {
-            let (a, b) = (i64::from(a[lane]), i64::from(b[lane]));
-            x[lane] = round2(a * cos - b * sin, 12) as i32;
-            y[lane] = round2(a * sin + b * cos, 12) as i32;
-        }
-        (x, y)
-    }
-
-    #[inline(always)]
-    fn hadamard(a: Self, b: Self, r: u32) -> (Self, Self) {
-        let lo = -(1i32 << (r - 1));
-        let hi = (1i32 << (r - 1)) - 1;
-        let mut sum = [0i32; 4];
-        let mut diff = [0i32; 4];
-        for lane in 0..4 {
-            sum[lane] = (a[lane] + b[lane]).clamp(lo, hi);
-            diff[lane] = (a[lane] - b[lane]).clamp(lo, hi);
-        }
-        (sum, diff)
-    }
-}
-
-#[inline(always)]
-fn dct_b<T: DctValue>(t: &mut [T], a: usize, b: usize, angle: i32, flip: u8, _r: u32) {
-    let (x, y) = T::rotate(t[a], t[b], cos128(angle), sin128(angle));
-    t[a] = x;
-    t[b] = y;
-    if flip == 1 {
-        t.swap(a, b);
-    }
-}
-
-#[inline(always)]
-fn dct_h<T: DctValue>(t: &mut [T], a: usize, b: usize, flip: u8, r: u32) {
     let (ai, bi) = if flip == 1 { (b, a) } else { (a, b) };
-    let (sum, diff) = T::hadamard(t[ai], t[bi], r);
-    t[ai] = sum;
-    t[bi] = diff;
-}
-
-#[inline]
-pub fn inverse_dct_4(t: &mut [i64], r: u32) {
-    inverse_dct_4_impl((&mut t[..4]).try_into().unwrap(), r);
-}
-
-#[inline]
-pub fn inverse_dct_8(t: &mut [i64], r: u32) {
-    inverse_dct_8_impl((&mut t[..8]).try_into().unwrap(), r);
-}
-
-#[inline]
-pub fn inverse_dct_16(t: &mut [i64], r: u32) {
-    inverse_dct_16_impl((&mut t[..16]).try_into().unwrap(), r);
-}
-
-#[inline]
-pub fn inverse_dct_32(t: &mut [i64], r: u32) {
-    inverse_dct_32_impl((&mut t[..32]).try_into().unwrap(), r);
-}
-
-#[inline]
-pub fn inverse_dct_64(t: &mut [i64], r: u32) {
-    inverse_dct_64_impl((&mut t[..64]).try_into().unwrap(), r);
-}
-
-fn inverse_dct_columns(t: &mut [[i32; 4]], n: u32, r: u32) {
-    match n {
-        2 => inverse_dct_4_impl((&mut t[..4]).try_into().unwrap(), r),
-        3 => inverse_dct_8_impl((&mut t[..8]).try_into().unwrap(), r),
-        4 => inverse_dct_16_impl((&mut t[..16]).try_into().unwrap(), r),
-        5 => inverse_dct_32_impl((&mut t[..32]).try_into().unwrap(), r),
-        6 => inverse_dct_64_impl((&mut t[..64]).try_into().unwrap(), r),
-        _ => unreachable!("AV1 DCT column size"),
-    }
+    let x = t[ai];
+    let y = t[bi];
+    let lo: i64 = -(1i64 << (r - 1));
+    let hi: i64 = (1i64 << (r - 1)) - 1;
+    t[ai] = clip3(lo, hi, x + y);
+    t[bi] = clip3(lo, hi, x - y);
 }
 
 /// §7.13.2.2 inverse DCT permutation (av1-spec p.297). Permutes the
 /// length-`2^n` array `T` in place via `T[i] = copyT[brev(n, i)]`.
-#[inline]
-pub fn inverse_dct_permute<T>(t: &mut [T], n: u32) {
+pub fn inverse_dct_permute(t: &mut [i64], n: u32) {
     let len = 1usize << n;
-    let slice = &mut t[..len];
-    for i in 0..len {
-        let j = ((i as u32).reverse_bits() >> (32 - n)) as usize;
-        if i < j {
-            slice.swap(i, j);
-        }
+    // r475 — a stack copy + the precomputed bit-reversal table (the
+    // per-call heap copy was 7 % of a 12 MP still decode).
+    let mut copy = [0i64; 64];
+    copy[..len].copy_from_slice(&t[..len]);
+    let table = &BREV_TABLE[n.min(6) as usize];
+    for (i, slot) in t.iter_mut().take(len).enumerate() {
+        *slot = copy[table[i] as usize];
     }
 }
 
-#[inline]
-fn inverse_dct_4_impl<T: DctValue>(t: &mut [T; 4], r: u32) {
-    use self::dct_b as butterfly_b;
-    use self::dct_h as butterfly_h;
-    t.swap(1, 2);
-    butterfly_b(t, 0, 1, 32, 1, r);
-    butterfly_b(t, 2, 3, 48, 0, r);
-    butterfly_h(t, 0, 3, 0, r);
-    butterfly_h(t, 1, 2, 0, r);
-}
-
-#[inline]
-fn inverse_dct_8_impl<T: DctValue>(t: &mut [T; 8], r: u32) {
-    use self::dct_b as butterfly_b;
-    use self::dct_h as butterfly_h;
-    t.swap(1, 4);
-    t.swap(3, 6);
-    butterfly_b(t, 4, 7, 56, 0, r);
-    butterfly_b(t, 5, 6, 24, 0, r);
-    butterfly_b(t, 0, 1, 32, 1, r);
-    butterfly_b(t, 2, 3, 48, 0, r);
-    butterfly_h(t, 4, 5, 0, r);
-    butterfly_h(t, 6, 7, 1, r);
-    butterfly_h(t, 0, 3, 0, r);
-    butterfly_h(t, 1, 2, 0, r);
-    butterfly_b(t, 6, 5, 32, 1, r);
-    butterfly_h(t, 0, 7, 0, r);
-    butterfly_h(t, 1, 6, 0, r);
-    butterfly_h(t, 2, 5, 0, r);
-    butterfly_h(t, 3, 4, 0, r);
-}
-
-#[inline]
-fn inverse_dct_16_impl<T: DctValue>(t: &mut [T; 16], r: u32) {
-    use self::dct_b as butterfly_b;
-    use self::dct_h as butterfly_h;
-    t.swap(1, 8);
-    t.swap(2, 4);
-    t.swap(3, 12);
-    t.swap(5, 10);
-    t.swap(7, 14);
-    t.swap(11, 13);
-    butterfly_b(t, 8, 15, 60, 0, r);
-    butterfly_b(t, 9, 14, 28, 0, r);
-    butterfly_b(t, 10, 13, 44, 0, r);
-    butterfly_b(t, 11, 12, 12, 0, r);
-    butterfly_b(t, 4, 7, 56, 0, r);
-    butterfly_b(t, 5, 6, 24, 0, r);
-    butterfly_h(t, 8, 9, 0, r);
-    butterfly_h(t, 10, 11, 1, r);
-    butterfly_h(t, 12, 13, 0, r);
-    butterfly_h(t, 14, 15, 1, r);
-    butterfly_b(t, 0, 1, 32, 1, r);
-    butterfly_b(t, 2, 3, 48, 0, r);
-    butterfly_h(t, 4, 5, 0, r);
-    butterfly_h(t, 6, 7, 1, r);
-    butterfly_b(t, 14, 9, 48, 1, r);
-    butterfly_b(t, 13, 10, 112, 1, r);
-    butterfly_h(t, 0, 3, 0, r);
-    butterfly_h(t, 1, 2, 0, r);
-    butterfly_b(t, 6, 5, 32, 1, r);
-    butterfly_h(t, 8, 11, 0, r);
-    butterfly_h(t, 9, 10, 0, r);
-    butterfly_h(t, 12, 15, 1, r);
-    butterfly_h(t, 13, 14, 1, r);
-    for i in 0..4 {
-        butterfly_h(t, i, 7 - i, 0, r);
-    }
-    butterfly_b(t, 13, 10, 32, 1, r);
-    butterfly_b(t, 12, 11, 32, 1, r);
-    for i in 0..8 {
-        butterfly_h(t, i, 15 - i, 0, r);
-    }
-}
-
-#[inline]
-fn inverse_dct_32_impl<T: DctValue>(t: &mut [T; 32], r: u32) {
-    use self::dct_b as butterfly_b;
-    use self::dct_h as butterfly_h;
-    inverse_dct_permute(t, 5);
-    const STEP3_ANGLES: [i32; 8] = [62, 30, 46, 14, 54, 22, 38, 6];
-    for i in 0..8 {
-        butterfly_b(t, 16 + i, 31 - i, STEP3_ANGLES[i], 0, r);
-    }
-    butterfly_b(t, 8, 15, 60, 0, r);
-    butterfly_b(t, 9, 14, 28, 0, r);
-    butterfly_b(t, 10, 13, 44, 0, r);
-    butterfly_b(t, 11, 12, 12, 0, r);
-    for i in 0..8 {
-        butterfly_h(t, 16 + 2 * i, 17 + 2 * i, (i & 1) as u8, r);
-    }
-    butterfly_b(t, 4, 7, 56, 0, r);
-    butterfly_b(t, 5, 6, 24, 0, r);
-    butterfly_h(t, 8, 9, 0, r);
-    butterfly_h(t, 10, 11, 1, r);
-    butterfly_h(t, 12, 13, 0, r);
-    butterfly_h(t, 14, 15, 1, r);
-    for i in 0..2 {
-        for j in 0..2 {
-            let a = 30 - 4 * i - j;
-            let b = 17 + 4 * i + j;
-            let angle = 24 + ((j as i32) << 6) + (((1 - i) as i32) << 5);
-            butterfly_b(t, a, b, angle, 1, r);
+/// `brev( n, i )` for `n ∈ 0..=6`, `i < 1 << n` — the §7.13.2.2 bit
+/// reversal the DCT permutation step indexes by.
+const BREV_TABLE: [[u8; 64]; 7] = {
+    let mut table = [[0u8; 64]; 7];
+    let mut n = 0;
+    while n < 7 {
+        let len = 1usize << n;
+        let mut i = 0;
+        while i < len {
+            let mut t = 0u32;
+            let mut b = 0;
+            while b < n {
+                t += ((i as u32 >> b) & 1) << (n - 1 - b);
+                b += 1;
+            }
+            table[n][i] = t as u8;
+            i += 1;
         }
+        n += 1;
     }
-    butterfly_b(t, 0, 1, 32, 1, r);
-    butterfly_b(t, 2, 3, 48, 0, r);
-    butterfly_h(t, 4, 5, 0, r);
-    butterfly_h(t, 6, 7, 1, r);
-    butterfly_b(t, 14, 9, 48, 1, r);
-    butterfly_b(t, 13, 10, 112, 1, r);
-    for i in 0..4 {
-        for j in 0..2 {
-            let a = 16 + 4 * i + j;
-            let b = 19 + 4 * i - j;
-            butterfly_h(t, a, b, (i & 1) as u8, r);
-        }
-    }
-    butterfly_h(t, 0, 3, 0, r);
-    butterfly_h(t, 1, 2, 0, r);
-    butterfly_b(t, 6, 5, 32, 1, r);
-    butterfly_h(t, 8, 11, 0, r);
-    butterfly_h(t, 9, 10, 0, r);
-    butterfly_h(t, 12, 15, 1, r);
-    butterfly_h(t, 13, 14, 1, r);
-    for i in 0..4 {
-        butterfly_b(t, 29 - i, 18 + i, 48 + ((i >> 1) as i32) * 64, 1, r);
-    }
-    for i in 0..4 {
-        butterfly_h(t, i, 7 - i, 0, r);
-    }
-    butterfly_b(t, 13, 10, 32, 1, r);
-    butterfly_b(t, 12, 11, 32, 1, r);
-    for i in 0..2 {
-        for j in 0..4 {
-            let a = 16 + i * 8 + j;
-            let b = 23 + i * 8 - j;
-            butterfly_h(t, a, b, i as u8, r);
-        }
-    }
-    for i in 0..8 {
-        butterfly_h(t, i, 15 - i, 0, r);
-    }
-    for i in 0..4 {
-        butterfly_b(t, 27 - i, 20 + i, 32, 1, r);
-    }
-    for i in 0..16 {
-        butterfly_h(t, i, 31 - i, 0, r);
-    }
-}
-
-#[inline]
-fn inverse_dct_64_impl<T: DctValue>(t: &mut [T; 64], r: u32) {
-    use self::dct_b as butterfly_b;
-    use self::dct_h as butterfly_h;
-    inverse_dct_permute(t, 6);
-    const STEP2_ANGLES: [i32; 16] = [63, 31, 47, 15, 55, 23, 39, 7, 59, 27, 43, 11, 51, 19, 35, 3];
-    for i in 0..16 {
-        butterfly_b(t, 32 + i, 63 - i, STEP2_ANGLES[i], 0, r);
-    }
-    const STEP3_ANGLES: [i32; 8] = [62, 30, 46, 14, 54, 22, 38, 6];
-    for i in 0..8 {
-        butterfly_b(t, 16 + i, 31 - i, STEP3_ANGLES[i], 0, r);
-    }
-    for i in 0..16 {
-        butterfly_h(t, 32 + i * 2, 33 + i * 2, (i & 1) as u8, r);
-    }
-    butterfly_b(t, 8, 15, 60, 0, r);
-    butterfly_b(t, 9, 14, 28, 0, r);
-    butterfly_b(t, 10, 13, 44, 0, r);
-    butterfly_b(t, 11, 12, 12, 0, r);
-    for i in 0..8 {
-        butterfly_h(t, 16 + 2 * i, 17 + 2 * i, (i & 1) as u8, r);
-    }
-    const STEP7_ANGLES: [i32; 4] = [60, 28, 44, 12];
-    for i in 0..4 {
-        for j in 0..2 {
-            butterfly_b(t, 62 - i * 4 - j, 33 + i * 4 + j, STEP7_ANGLES[i] + 64 * (j as i32), 1, r);
-        }
-    }
-    butterfly_b(t, 4, 7, 56, 0, r);
-    butterfly_b(t, 5, 6, 24, 0, r);
-    butterfly_h(t, 8, 9, 0, r);
-    butterfly_h(t, 10, 11, 1, r);
-    butterfly_h(t, 12, 13, 0, r);
-    butterfly_h(t, 14, 15, 1, r);
-    for i in 0..2 {
-        for j in 0..2 {
-            let a = 30 - 4 * i - j;
-            let b = 17 + 4 * i + j;
-            let angle = 24 + ((j as i32) << 6) + (((1 - i) as i32) << 5);
-            butterfly_b(t, a, b, angle, 1, r);
-        }
-    }
-    for i in 0..8 {
-        for j in 0..2 {
-            butterfly_h(t, 32 + i * 4 + j, 35 + i * 4 - j, (i & 1) as u8, r);
-        }
-    }
-    butterfly_b(t, 0, 1, 32, 1, r);
-    butterfly_b(t, 2, 3, 48, 0, r);
-    butterfly_h(t, 4, 5, 0, r);
-    butterfly_h(t, 6, 7, 1, r);
-    butterfly_b(t, 14, 9, 48, 1, r);
-    butterfly_b(t, 13, 10, 112, 1, r);
-    for i in 0..4 {
-        for j in 0..2 {
-            let a = 16 + 4 * i + j;
-            let b = 19 + 4 * i - j;
-            butterfly_h(t, a, b, (i & 1) as u8, r);
-        }
-    }
-    for i in 0..2usize {
-        for j in 0..4usize {
-            let a = 61 - i * 8 - j;
-            let b = 34 + i * 8 + j;
-            let angle: i32 = 56 - (i as i32) * 32 + ((j >> 1) as i32) * 64;
-            butterfly_b(t, a, b, angle, 1, r);
-        }
-    }
-    butterfly_h(t, 0, 3, 0, r);
-    butterfly_h(t, 1, 2, 0, r);
-    butterfly_b(t, 6, 5, 32, 1, r);
-    butterfly_h(t, 8, 11, 0, r);
-    butterfly_h(t, 9, 10, 0, r);
-    butterfly_h(t, 12, 15, 1, r);
-    butterfly_h(t, 13, 14, 1, r);
-    for i in 0..4 {
-        butterfly_b(t, 29 - i, 18 + i, 48 + ((i >> 1) as i32) * 64, 1, r);
-    }
-    for i in 0..4 {
-        for j in 0..4 {
-            butterfly_h(t, 32 + 8 * i + j, 39 + 8 * i - j, (i & 1) as u8, r);
-        }
-    }
-    for i in 0..4 {
-        butterfly_h(t, i, 7 - i, 0, r);
-    }
-    butterfly_b(t, 13, 10, 32, 1, r);
-    butterfly_b(t, 12, 11, 32, 1, r);
-    for i in 0..2 {
-        for j in 0..4 {
-            let a = 16 + i * 8 + j;
-            let b = 23 + i * 8 - j;
-            butterfly_h(t, a, b, i as u8, r);
-        }
-    }
-    for i in 0..8 {
-        let angle = if i < 4 { 48 } else { 112 };
-        butterfly_b(t, 59 - i, 36 + i, angle, 1, r);
-    }
-    for i in 0..8 {
-        butterfly_h(t, i, 15 - i, 0, r);
-    }
-    for i in 0..4 {
-        butterfly_b(t, 27 - i, 20 + i, 32, 1, r);
-    }
-    for i in 0..8 {
-        butterfly_h(t, 32 + i, 47 - i, 0, r);
-        butterfly_h(t, 48 + i, 63 - i, 1, r);
-    }
-    for i in 0..16 {
-        butterfly_h(t, i, 31 - i, 0, r);
-    }
-    for i in 0..8 {
-        butterfly_b(t, 55 - i, 40 + i, 32, 1, r);
-    }
-    for i in 0..32 {
-        butterfly_h(t, i, 63 - i, 0, r);
-    }
-}
-
+    table
+};
 
 /// §7.13.2.3 inverse DCT process for arrays of length `2^n` with
 /// `2 <= n <= 6` (av1-spec p.297-300). Performs the §7.13.2.2
@@ -608,13 +273,583 @@ fn inverse_dct_64_impl<T: DctValue>(t: &mut [T; 64], r: u32) {
 #[allow(clippy::too_many_arguments)]
 pub fn inverse_dct(t: &mut [i64], n: u32, r: u32) {
     debug_assert!((2..=6).contains(&n));
-    match n {
-        2 => inverse_dct_4(t, r),
-        3 => inverse_dct_8(t, r),
-        4 => inverse_dct_16(t, r),
-        5 => inverse_dct_32(t, r),
-        6 => inverse_dct_64(t, r),
-        _ => panic!("oxideav-av1 §7.13.2.3: inverse_dct expects n in 2..=6, got {n}"),
+    inverse_dct_permute(t, n);
+    inverse_dct_flow(&mut DirectFlow { t, r }, n);
+}
+
+/// The two butterfly kinds of the §7.13.2.3 schedule, as the schedule
+/// invokes them: `rotate` is the §7.13.2.1 `B( a, b, angle, flip )`
+/// and `add_sub` the `H( a, b, flip )`.
+trait DctFlow {
+    fn rotate(&mut self, a: usize, b: usize, angle: i32, flip: u8);
+    fn add_sub(&mut self, a: usize, b: usize, flip: u8);
+}
+
+/// The schedule applied straight to one array (the spec's reading).
+struct DirectFlow<'a> {
+    t: &'a mut [i64],
+    r: u32,
+}
+
+impl DctFlow for DirectFlow<'_> {
+    #[inline(always)]
+    fn rotate(&mut self, a: usize, b: usize, angle: i32, flip: u8) {
+        butterfly_b(self.t, a, b, angle, flip, self.r);
+    }
+    #[inline(always)]
+    fn add_sub(&mut self, a: usize, b: usize, flip: u8) {
+        butterfly_h(self.t, a, b, flip, self.r);
+    }
+}
+
+/// The §7.13.2.3 butterfly schedule (everything after the §7.13.2.2
+/// input permutation) over any [`DctFlow`].
+fn inverse_dct_flow<F: DctFlow>(f: &mut F, n: u32) {
+    // Step 1: permutation.
+    // Step 2: n == 6 only.
+    if n == 6 {
+        for i in 0..16 {
+            let a = 32 + i;
+            let b = 63 - i;
+            let angle = 63 - 4 * (brev(4, i as u32) as i32);
+            f.rotate(a, b, angle, 0);
+        }
+    }
+    // Step 3: n >= 5.
+    if n >= 5 {
+        for i in 0..8 {
+            let a = 16 + i;
+            let b = 31 - i;
+            let angle = 6 + ((brev(3, (7 - i) as u32) as i32) << 3);
+            f.rotate(a, b, angle, 0);
+        }
+    }
+    // Step 4: n == 6.
+    if n == 6 {
+        for i in 0..16 {
+            f.add_sub(32 + i * 2, 33 + i * 2, (i & 1) as u8);
+        }
+    }
+    // Step 5: n >= 4.
+    if n >= 4 {
+        for i in 0..4 {
+            let a = 8 + i;
+            let b = 15 - i;
+            let angle = 12 + ((brev(2, (3 - i) as u32) as i32) << 4);
+            f.rotate(a, b, angle, 0);
+        }
+    }
+    // Step 6: n >= 5.
+    if n >= 5 {
+        for i in 0..8 {
+            f.add_sub(16 + 2 * i, 17 + 2 * i, (i & 1) as u8);
+        }
+    }
+    // Step 7: n == 6.
+    if n == 6 {
+        for i in 0..4 {
+            for j in 0..2 {
+                let a = 62 - i * 4 - j;
+                let b = 33 + i * 4 + j;
+                let angle = 60 - 16 * (brev(2, i as u32) as i32) + 64 * (j as i32);
+                f.rotate(a, b, angle, 1);
+            }
+        }
+    }
+    // Step 8: n >= 3.
+    if n >= 3 {
+        for i in 0..2 {
+            f.rotate(4 + i, 7 - i, 56 - 32 * (i as i32), 0);
+        }
+    }
+    // Step 9: n >= 4.
+    if n >= 4 {
+        for i in 0..4 {
+            f.add_sub(8 + 2 * i, 9 + 2 * i, (i & 1) as u8);
+        }
+    }
+    // Step 10: n >= 5.
+    if n >= 5 {
+        for i in 0..2 {
+            for j in 0..2 {
+                let a = 30 - 4 * i - j;
+                let b = 17 + 4 * i + j;
+                let angle = 24 + ((j as i32) << 6) + (((1 - i) as i32) << 5);
+                f.rotate(a, b, angle, 1);
+            }
+        }
+    }
+    // Step 11: n == 6.
+    if n == 6 {
+        for i in 0..8 {
+            for j in 0..2 {
+                let a = 32 + i * 4 + j;
+                let b = 35 + i * 4 - j;
+                f.add_sub(a, b, (i & 1) as u8);
+            }
+        }
+    }
+    // Step 12: always.
+    for i in 0..2 {
+        f.rotate(2 * i, 2 * i + 1, 32 + 16 * (i as i32), (1 - i) as u8);
+    }
+    // Step 13: n >= 3.
+    if n >= 3 {
+        for i in 0..2 {
+            f.add_sub(4 + 2 * i, 5 + 2 * i, i as u8);
+        }
+    }
+    // Step 14: n >= 4.
+    if n >= 4 {
+        for i in 0..2 {
+            f.rotate(14 - i, 9 + i, 48 + 64 * (i as i32), 1);
+        }
+    }
+    // Step 15: n >= 5.
+    if n >= 5 {
+        for i in 0..4 {
+            for j in 0..2 {
+                let a = 16 + 4 * i + j;
+                let b = 19 + 4 * i - j;
+                f.add_sub(a, b, (i & 1) as u8);
+            }
+        }
+    }
+    // Step 16: n == 6.
+    if n == 6 {
+        for i in 0..2usize {
+            for j in 0..4usize {
+                let a = 61 - i * 8 - j;
+                let b = 34 + i * 8 + j;
+                let angle: i32 = 56 - (i as i32) * 32 + ((j >> 1) as i32) * 64;
+                f.rotate(a, b, angle, 1);
+            }
+        }
+    }
+    // Step 17: always.
+    for i in 0..2 {
+        f.add_sub(i, 3 - i, 0);
+    }
+    // Step 18: n >= 3.
+    if n >= 3 {
+        f.rotate(6, 5, 32, 1);
+    }
+    // Step 19: n >= 4.
+    if n >= 4 {
+        for i in 0..2 {
+            for j in 0..2 {
+                f.add_sub(8 + 4 * i + j, 11 + 4 * i - j, i as u8);
+            }
+        }
+    }
+    // Step 20: n >= 5.
+    if n >= 5 {
+        for i in 0..4 {
+            f.rotate(29 - i, 18 + i, 48 + ((i >> 1) as i32) * 64, 1);
+        }
+    }
+    // Step 21: n == 6.
+    if n == 6 {
+        for i in 0..4 {
+            for j in 0..4 {
+                let a = 32 + 8 * i + j;
+                let b = 39 + 8 * i - j;
+                f.add_sub(a, b, (i & 1) as u8);
+            }
+        }
+    }
+    // Step 22: n >= 3.
+    if n >= 3 {
+        for i in 0..4 {
+            f.add_sub(i, 7 - i, 0);
+        }
+    }
+    // Step 23: n >= 4.
+    if n >= 4 {
+        for i in 0..2 {
+            f.rotate(13 - i, 10 + i, 32, 1);
+        }
+    }
+    // Step 24: n >= 5.
+    if n >= 5 {
+        for i in 0..2 {
+            for j in 0..4 {
+                let a = 16 + i * 8 + j;
+                let b = 23 + i * 8 - j;
+                f.add_sub(a, b, i as u8);
+            }
+        }
+    }
+    // Step 25: n == 6.
+    if n == 6 {
+        for i in 0..8 {
+            let angle = if i < 4 { 48 } else { 112 };
+            f.rotate(59 - i, 36 + i, angle, 1);
+        }
+    }
+    // Step 26: n >= 4.
+    if n >= 4 {
+        for i in 0..8 {
+            f.add_sub(i, 15 - i, 0);
+        }
+    }
+    // Step 27: n >= 5.
+    if n >= 5 {
+        for i in 0..4 {
+            f.rotate(27 - i, 20 + i, 32, 1);
+        }
+    }
+    // Step 28: n == 6.
+    if n == 6 {
+        for i in 0..8 {
+            f.add_sub(32 + i, 47 - i, 0);
+            f.add_sub(48 + i, 63 - i, 1);
+        }
+    }
+    // Step 29: n >= 5.
+    if n >= 5 {
+        for i in 0..16 {
+            f.add_sub(i, 31 - i, 0);
+        }
+    }
+    // Step 30: n == 6.
+    if n == 6 {
+        for i in 0..8 {
+            f.rotate(55 - i, 40 + i, 32, 1);
+        }
+    }
+    // Step 31: n == 6.
+    if n == 6 {
+        for i in 0..32 {
+            f.add_sub(i, 63 - i, 0);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// r487 — the §7.13.2.3 schedule over several arrays at once.
+//
+// The 2-D inverse transform runs the same 1-D kernel on every row and
+// then on every column. Recording the schedule once per size (each
+// butterfly with its indices, flip and `cos128` / `sin128` factors
+// resolved) and replaying it over `L` arrays held side by side — slot
+// `i` of all `L` arrays in one `[_; L]` lane group — turns every
+// butterfly into a fixed-width loop with no per-sample branch, and
+// pays the schedule's own bookkeeping once per `L` rows / columns.
+//
+// Lanes are 64-bit by default (the reading of §7.13.2.1 the scalar
+// kernel uses). A group whose inputs are small enough runs in 32-bit
+// lanes instead: `DctProgram::narrow_limit` is a bound on the input
+// magnitude under which NO value the schedule forms — neither a
+// product, nor a sum of two products before its `Round2`, nor a sum
+// before its clamp — can leave the signed 32-bit range, derived by
+// propagating a magnitude bound through the recorded schedule. Under
+// it both lane widths compute the same integers, so the choice never
+// changes a sample.
+// ---------------------------------------------------------------------
+
+/// One recorded butterfly.
+#[derive(Clone, Copy, Debug)]
+enum FlowStep {
+    /// §7.13.2.1 `B()`: `x = T[ a ] * cos - T[ b ] * sin`, `y = T[ a ]
+    /// * sin + T[ b ] * cos`, each `Round2( _, 12 )`; `x` lands in
+    /// slot `x_to` and `y` in `y_to` (the flip resolved).
+    Rotate {
+        a: u8,
+        b: u8,
+        cos: i32,
+        sin: i32,
+        x_to: u8,
+        y_to: u8,
+    },
+    /// §7.13.2.1 `H()`: slot `sum` takes the clamped sum, slot `diff`
+    /// the clamped difference `T[ sum ] - T[ diff ]` (the flip
+    /// resolved).
+    AddSub { sum: u8, diff: u8 },
+}
+
+/// The recorded §7.13.2.3 schedule of one size.
+struct DctProgram {
+    steps: Vec<FlowStep>,
+    /// Largest input magnitude for which the 32-bit lanes are exact
+    /// (see the section comment).
+    narrow_limit: i64,
+}
+
+struct FlowRecorder(Vec<FlowStep>);
+
+impl DctFlow for FlowRecorder {
+    fn rotate(&mut self, a: usize, b: usize, angle: i32, flip: u8) {
+        let (x_to, y_to) = if flip == 1 { (b, a) } else { (a, b) };
+        self.0.push(FlowStep::Rotate {
+            a: a as u8,
+            b: b as u8,
+            cos: cos128(angle),
+            sin: sin128(angle),
+            x_to: x_to as u8,
+            y_to: y_to as u8,
+        });
+    }
+    fn add_sub(&mut self, a: usize, b: usize, flip: u8) {
+        let (sum, diff) = if flip == 1 { (b, a) } else { (a, b) };
+        self.0.push(FlowStep::AddSub {
+            sum: sum as u8,
+            diff: diff as u8,
+        });
+    }
+}
+
+/// The recorded schedule for arrays of length `1 << n` (`2 <= n <= 6`).
+fn dct_program(n: u32) -> &'static DctProgram {
+    static PROGRAMS: [std::sync::OnceLock<DctProgram>; 5] = [
+        std::sync::OnceLock::new(),
+        std::sync::OnceLock::new(),
+        std::sync::OnceLock::new(),
+        std::sync::OnceLock::new(),
+        std::sync::OnceLock::new(),
+    ];
+    debug_assert!((2..=6).contains(&n));
+    PROGRAMS[(n - 2) as usize].get_or_init(|| {
+        let mut rec = FlowRecorder(Vec::new());
+        inverse_dct_flow(&mut rec, n);
+        let steps = rec.0;
+        // Magnitude bound per slot as `gain * m + slack` for inputs
+        // of magnitude at most `m`. A rotation's pre-rounding sum is
+        // at most `|cos| * B( a ) + |sin| * B( b )` (each product at
+        // most its own term), its rounded output that over 4096 plus
+        // one; an add / subtract is at most `B( sum ) + B( diff )`
+        // before the clamp, which only shrinks it. Every such
+        // quantity (plus the rounding offset) must stay below `2^31`.
+        const CEILING: f64 = 2_147_483_647.0 - 2048.0 - 1.0;
+        let mut gain = [1f64; 64];
+        let mut slack = [0f64; 64];
+        let mut limit = f64::INFINITY;
+        for step in &steps {
+            match *step {
+                FlowStep::Rotate {
+                    a,
+                    b,
+                    cos,
+                    sin,
+                    x_to,
+                    y_to,
+                } => {
+                    let (c, s) = (f64::from(cos.abs()), f64::from(sin.abs()));
+                    let g = c * gain[a as usize] + s * gain[b as usize];
+                    let e = c * slack[a as usize] + s * slack[b as usize];
+                    limit = limit.min((CEILING - e) / g);
+                    for slot in [x_to, y_to] {
+                        gain[slot as usize] = g / 4096.0;
+                        slack[slot as usize] = e / 4096.0 + 1.0;
+                    }
+                }
+                FlowStep::AddSub { sum, diff } => {
+                    let g = gain[sum as usize] + gain[diff as usize];
+                    let e = slack[sum as usize] + slack[diff as usize];
+                    limit = limit.min((CEILING - e) / g);
+                    for slot in [sum, diff] {
+                        gain[slot as usize] = g;
+                        slack[slot as usize] = e;
+                    }
+                }
+            }
+        }
+        // A safety margin far above the floating-point error of the
+        // propagation.
+        let narrow_limit = ((limit * 0.999).floor() as i64 - 1).max(0);
+        DctProgram {
+            steps,
+            narrow_limit,
+        }
+    })
+}
+
+macro_rules! dct_lane_runner {
+    ($name:ident, $lane:ty) => {
+        /// Replay a recorded §7.13.2.3 schedule over `L` arrays of
+        /// length `N` held side by side (`t[ i ][ l ]` is slot `i` of
+        /// array `l`; `N` is the schedule's own power-of-two length),
+        /// clamping the add / subtract butterflies to `r` bits.
+        #[inline(always)]
+        fn $name<const L: usize, const N: usize>(
+            steps: &[FlowStep],
+            t: &mut [[$lane; L]; N],
+            r: u32,
+        ) {
+            let lo = (-(1i64 << (r - 1))) as $lane;
+            let hi = ((1i64 << (r - 1)) - 1) as $lane;
+            for step in steps {
+                match *step {
+                    FlowStep::Rotate {
+                        a,
+                        b,
+                        cos,
+                        sin,
+                        x_to,
+                        y_to,
+                    } => {
+                        let (ta, tb) = (t[usize::from(a) & (N - 1)], t[usize::from(b) & (N - 1)]);
+                        let (cos, sin) = (cos as $lane, sin as $lane);
+                        let mut x = [0 as $lane; L];
+                        let mut y = [0 as $lane; L];
+                        for l in 0..L {
+                            x[l] = (ta[l].wrapping_mul(cos))
+                                .wrapping_sub(tb[l].wrapping_mul(sin))
+                                .wrapping_add(2048)
+                                >> 12;
+                            y[l] = (ta[l].wrapping_mul(sin))
+                                .wrapping_add(tb[l].wrapping_mul(cos))
+                                .wrapping_add(2048)
+                                >> 12;
+                        }
+                        t[usize::from(x_to) & (N - 1)] = x;
+                        t[usize::from(y_to) & (N - 1)] = y;
+                    }
+                    FlowStep::AddSub { sum, diff } => {
+                        let (x, y) = (
+                            t[usize::from(sum) & (N - 1)],
+                            t[usize::from(diff) & (N - 1)],
+                        );
+                        let mut s = [0 as $lane; L];
+                        let mut d = [0 as $lane; L];
+                        for l in 0..L {
+                            s[l] = x[l].wrapping_add(y[l]).max(lo).min(hi);
+                            d[l] = x[l].wrapping_sub(y[l]).max(lo).min(hi);
+                        }
+                        t[usize::from(sum) & (N - 1)] = s;
+                        t[usize::from(diff) & (N - 1)] = d;
+                    }
+                }
+            }
+        }
+    };
+}
+dct_lane_runner!(run_dct_lanes_wide, i64);
+dct_lane_runner!(run_dct_lanes_narrow, i32);
+
+/// The §7.13.2.3 inverse DCT of `L` arrays at once: `input[ i ][ l ]`
+/// is element `i` of array `l` in NATURAL order (the §7.13.2.2
+/// permutation happens here); the outputs replace it. `len = 1 << n`
+/// slots are used.
+#[inline(always)]
+fn inverse_dct_lanes<const L: usize, const N: usize>(io: &mut [[i64; L]; N], r: u32) {
+    let n = N.trailing_zeros();
+    let program = dct_program(n);
+    let order = &BREV_TABLE[n as usize];
+    let mut max_abs: u64 = 0;
+    for row in io.iter() {
+        for &v in row {
+            max_abs = max_abs.max(v.unsigned_abs());
+        }
+    }
+    if max_abs <= program.narrow_limit as u64 {
+        let mut t = [[0i32; L]; N];
+        for (i, slot) in t.iter_mut().enumerate() {
+            let src = &io[usize::from(order[i]) & (N - 1)];
+            for l in 0..L {
+                slot[l] = src[l] as i32;
+            }
+        }
+        run_dct_lanes_narrow(&program.steps, &mut t, r);
+        for (dst, src) in io.iter_mut().zip(&t) {
+            for l in 0..L {
+                dst[l] = i64::from(src[l]);
+            }
+        }
+    } else {
+        let mut t = [[0i64; L]; N];
+        for (i, slot) in t.iter_mut().enumerate() {
+            *slot = io[usize::from(order[i]) & (N - 1)];
+        }
+        run_dct_lanes_wide(&program.steps, &mut t, r);
+        *io = t;
+    }
+}
+
+/// The §7.13.3 row pass for the DCT row kernels, `L` rows at a time:
+/// `Residual[ i ][ j ] = Round2( T[ j ], rowShift )` for every row `i`
+/// below 32 (rows past it, and columns past 32 of the input, read as
+/// zero); `rect_scale` applies the §7.13.3 `Round2( T[ j ] * 2896, 12
+/// )` pre-scale of the 2:1 rectangles. `residual` arrives zeroed.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn dct_row_pass<const L: usize, const N: usize>(
+    dequant: &[i64],
+    residual: &mut [i64],
+    h: usize,
+    rect_scale: bool,
+    r: u32,
+    row_shift: u32,
+) {
+    let w = N;
+    let in_w = w.min(32);
+    let mut i0 = 0;
+    while i0 < h.min(32) {
+        let group = &dequant[i0 * w..(i0 + L) * w];
+        if group.iter().all(|&v| v == 0) {
+            // Zero rows transform to zero rows.
+            i0 += L;
+            continue;
+        }
+        let mut io = [[0i64; L]; N];
+        for (j, slot) in io[..in_w].iter_mut().enumerate() {
+            for l in 0..L {
+                let v = group[l * w + j];
+                slot[l] = if rect_scale { round2(v * 2896, 12) } else { v };
+            }
+        }
+        inverse_dct_lanes(&mut io, r);
+        for l in 0..L {
+            let out = &mut residual[(i0 + l) * w..(i0 + l + 1) * w];
+            for (j, cell) in out.iter_mut().enumerate() {
+                *cell = round2(io[j][l], row_shift);
+            }
+        }
+        i0 += L;
+    }
+}
+
+/// The §7.13.3 column pass for the DCT column kernels, `L` columns at
+/// a time, in place over `residual` (`Round2( T[ i ], colShift )`).
+#[inline(always)]
+fn dct_column_pass<const L: usize, const N: usize>(
+    residual: &mut [i64],
+    w: usize,
+    r: u32,
+    col_shift: u32,
+) {
+    let h = N;
+    let log2_h = N.trailing_zeros();
+    // Every column equal (a block whose rows are constant — the
+    // DC-only block above all): one column, replicated.
+    if residual
+        .chunks_exact(w)
+        .all(|row| row.iter().all(|&v| v == row[0]))
+    {
+        let mut col = [0i64; 64];
+        for (i, row) in residual.chunks_exact(w).enumerate() {
+            col[i] = row[0];
+        }
+        inverse_dct(&mut col[..h], log2_h, r);
+        for (i, row) in residual.chunks_exact_mut(w).enumerate() {
+            row.fill(round2(col[i], col_shift));
+        }
+        return;
+    }
+    let mut j0 = 0;
+    while j0 < w {
+        let mut io = [[0i64; L]; N];
+        for (i, slot) in io.iter_mut().enumerate() {
+            slot.copy_from_slice(&residual[i * w + j0..i * w + j0 + L]);
+        }
+        inverse_dct_lanes(&mut io, r);
+        for (i, slot) in io.iter().enumerate() {
+            let out = &mut residual[i * w + j0..i * w + j0 + L];
+            for l in 0..L {
+                out[l] = round2(slot[l], col_shift);
+            }
+        }
+        j0 += L;
     }
 }
 
@@ -623,8 +858,7 @@ pub fn inverse_dct(t: &mut [i64], n: u32, r: u32) {
 /// for `i in 0..n0` where `n0 = 1 << n`. `3 <= n <= 4`.
 pub fn inverse_adst_input_permute(t: &mut [i64], n: u32) {
     let n0 = 1usize << n;
-    let mut copy = [0i64; 16];
-    copy[..n0].copy_from_slice(&t[..n0]);
+    let copy: Vec<i64> = t[..n0].to_vec();
     for (i, slot) in t[..n0].iter_mut().enumerate() {
         let idx = if i & 1 == 1 { i - 1 } else { n0 - i - 1 };
         *slot = copy[idx];
@@ -636,8 +870,7 @@ pub fn inverse_adst_input_permute(t: &mut [i64], n: u32) {
 /// reads `copyT[idx]`; odd `i` values negate the result.
 pub fn inverse_adst_output_permute(t: &mut [i64], n: u32) {
     let n0 = 1usize << n;
-    let mut copy = [0i64; 16];
-    copy[..n0].copy_from_slice(&t[..n0]);
+    let copy: Vec<i64> = t[..n0].to_vec();
     for (i, slot) in t[..n0].iter_mut().enumerate() {
         let a = ((i >> 3) & 1) as u32;
         let b = (((i >> 2) & 1) ^ ((i >> 3) & 1)) as u32;
@@ -872,41 +1105,95 @@ pub fn inverse_transform_2d(
     bit_depth: u32,
     lossless: bool,
 ) -> Vec<i64> {
-    if !lossless && tx_type == DCT_DCT && tx_sz < TX_SIZES_ALL
-        && matches!(bit_depth, 8 | 10 | 12)
-        && dequant.len() == TX_WIDTH[tx_sz] * TX_HEIGHT[tx_sz]
-        && dequant[0] >= -(1i64 << (bit_depth + 7))
-        && dequant[0] < (1i64 << (bit_depth + 7))
-        && dequant[1..].iter().all(|&v| v == 0)
-    {
-        let mut dc = dequant[0];
-        let log2_w = TX_WIDTH_LOG2[tx_sz] as u32;
-        let log2_h = (TX_HEIGHT[tx_sz] as u32).trailing_zeros();
-        if log2_w.abs_diff(log2_h) == 1 {
-            dc = round2(dc * 2896, 12);
-        }
-        dc = round2(round2(dc * 2896, 12), TRANSFORM_ROW_SHIFT[tx_sz]);
-        let precision = (bit_depth + 6).max(16);
-        dc = dc.clamp(-(1 << (precision - 1)), (1 << (precision - 1)) - 1);
-        dc = round2(round2(dc * 2896, 12), 4);
-        return vec![dc; dequant.len()];
-    }
-    #[cfg(any(target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128")))]
-    if !lossless && tx_sz < TX_SIZES_ALL && dequant.len() == TX_WIDTH[tx_sz] * TX_HEIGHT[tx_sz] {
-        if let Some(residual) = simd::inverse_2d(dequant, tx_sz, tx_type, bit_depth) {
-            return residual;
-        }
-    }
-    inverse_transform_2d_scalar(dequant, tx_sz, tx_type, bit_depth, lossless)
+    let mut residual = Vec::new();
+    inverse_transform_2d_into(dequant, tx_sz, tx_type, bit_depth, lossless, &mut residual);
+    residual
 }
 
-fn inverse_transform_2d_scalar(
+/// r481 — [`inverse_transform_2d`] into a reused buffer.
+///
+/// A DC-only `DCT_DCT` block takes its closed form and, where the target
+/// has them, the other lossy blocks the explicit lanes; everything else
+/// (and every target without lanes) runs [`inverse_transform_2d_passes`].
+pub(crate) fn inverse_transform_2d_into(
     dequant: &[i64],
     tx_sz: usize,
     tx_type: usize,
     bit_depth: u32,
     lossless: bool,
-) -> Vec<i64> {
+    residual: &mut Vec<i64>,
+) {
+    assert!(
+        tx_sz < TX_SIZES_ALL,
+        "oxideav-av1 §7.13.3: tx_sz {tx_sz} out of range (TX_SIZES_ALL = {TX_SIZES_ALL})"
+    );
+    assert_eq!(
+        dequant.len(),
+        TX_WIDTH[tx_sz] * TX_HEIGHT[tx_sz],
+        "oxideav-av1 §7.13.3: dequant length mismatch"
+    );
+    if !lossless {
+        if tx_type == DCT_DCT
+            && let Some(dc) = dc_only_dct(dequant, tx_sz, bit_depth)
+        {
+            residual.clear();
+            residual.resize(dequant.len(), dc);
+            return;
+        }
+        #[cfg(target_arch = "aarch64")]
+        if simd::inverse_2d(dequant, tx_sz, tx_type, bit_depth, residual) {
+            return;
+        }
+    }
+    inverse_transform_2d_passes(dequant, tx_sz, tx_type, bit_depth, lossless, residual);
+}
+
+/// The value every `Residual` sample of a `DCT_DCT` block takes when
+/// only its DC coefficient is set, or `None` when the block is not one.
+///
+/// §7.13.2.3 starts with `B( 0, 1, 32, 1 )`, which turns `{ dc, 0, .. }`
+/// into two copies of `Round2( dc * cos128( 32 ), 12 )` that the `H()`
+/// butterflies then carry to every output; a coefficient inside the
+/// `8 + BitDepth` bits §7.12.3 clamps it to shrinks on the way, so no
+/// `H()` clamp touches it. Each §7.13.3 pass is therefore that one
+/// scaling with its `Round2` (and the 2:1 rectangles' pre-scale).
+#[inline]
+fn dc_only_dct(dequant: &[i64], tx_sz: usize, bit_depth: u32) -> Option<i64> {
+    if !matches!(bit_depth, 8 | 10 | 12) {
+        return None;
+    }
+    let (&dc, rest) = dequant.split_first()?;
+    let limit = 1i64 << (bit_depth + 7);
+    if dc < -limit || dc >= limit || rest.iter().any(|&v| v != 0) {
+        return None;
+    }
+    let log2_w = TX_WIDTH_LOG2[tx_sz] as u32;
+    let log2_h = (TX_HEIGHT[tx_sz] as u32).trailing_zeros();
+    let mut dc = dc;
+    if log2_w.abs_diff(log2_h) == 1 {
+        dc = round2(dc * 2896, 12);
+    }
+    dc = round2(round2(dc * 2896, 12), TRANSFORM_ROW_SHIFT[tx_sz]);
+    let column_range = core::cmp::max(bit_depth + 6, 16);
+    dc = clip3(
+        -(1i64 << (column_range - 1)),
+        (1i64 << (column_range - 1)) - 1,
+        dc,
+    );
+    Some(round2(round2(dc * 2896, 12), 4))
+}
+
+/// The §7.13.3 row and column passes in portable code: the recorded DCT
+/// schedule several rows / columns at a time, the other kernels one array
+/// at a time.
+fn inverse_transform_2d_passes(
+    dequant: &[i64],
+    tx_sz: usize,
+    tx_type: usize,
+    bit_depth: u32,
+    lossless: bool,
+    residual: &mut Vec<i64>,
+) {
     assert!(
         tx_sz < TX_SIZES_ALL,
         "oxideav-av1 §7.13.3: tx_sz {tx_sz} out of range (TX_SIZES_ALL = {TX_SIZES_ALL})"
@@ -930,38 +1217,101 @@ fn inverse_transform_2d_scalar(
     let row_clamp_range = bit_depth + 8;
     let col_clamp_range = core::cmp::max(bit_depth + 6, 16);
 
-    let mut residual = vec![0i64; w * h];
-    // Row transforms.
-    let mut tbuf_arr = [0i64; 64];
-    for i in 0..h {
-        if i >= 32 || dequant[i * w..i * w + w.min(32)].iter().all(|&v| v == 0) {
-            continue;
-        }
-        let tbuf = &mut tbuf_arr[..w];
-        // Populate T[j] from Dequant[i][j], zero for j or i >= 32.
-        for j in 0..w {
-            tbuf[j] = if i < 32 && j < 32 {
-                dequant[i * w + j]
-            } else {
-                0
+    residual.clear();
+    residual.resize(w * h, 0);
+    // r487 — the DCT row kernels run several rows per pass (see
+    // `dct_row_pass`); the other kernels keep the row-at-a-time loop.
+    let row_is_dct = !lossless
+        && matches!(tx_type, x if x == DCT_DCT || x == ADST_DCT || x == FLIPADST_DCT || x == H_DCT);
+    if row_is_dct {
+        let rect_scale = log2_w.abs_diff(log2_h) == 1;
+        // Lane count by block height, array length by block width.
+        macro_rules! rows {
+            ($lanes:literal) => {
+                match w {
+                    4 => dct_row_pass::<$lanes, 4>(
+                        dequant,
+                        residual,
+                        h,
+                        rect_scale,
+                        row_clamp_range,
+                        row_shift,
+                    ),
+                    8 => dct_row_pass::<$lanes, 8>(
+                        dequant,
+                        residual,
+                        h,
+                        rect_scale,
+                        row_clamp_range,
+                        row_shift,
+                    ),
+                    16 => dct_row_pass::<$lanes, 16>(
+                        dequant,
+                        residual,
+                        h,
+                        rect_scale,
+                        row_clamp_range,
+                        row_shift,
+                    ),
+                    32 => dct_row_pass::<$lanes, 32>(
+                        dequant,
+                        residual,
+                        h,
+                        rect_scale,
+                        row_clamp_range,
+                        row_shift,
+                    ),
+                    _ => dct_row_pass::<$lanes, 64>(
+                        dequant,
+                        residual,
+                        h,
+                        rect_scale,
+                        row_clamp_range,
+                        row_shift,
+                    ),
+                }
             };
         }
-        // Abs(log2W - log2H) == 1 scaling.
-        if log2_w.abs_diff(log2_h) == 1 {
-            for slot in tbuf.iter_mut() {
-                *slot = round2(*slot * 2896, 12);
+        if h >= 8 { rows!(8) } else { rows!(4) }
+    } else {
+        // Row transforms. r475 — stack scratch (the per-call heap buffers
+        // were measurable at 12 MP), and an all-zero input row is left as
+        // the all-zero output row it transforms to (every §7.13.2 kernel
+        // maps zeros to zeros and `Round2( 0, n ) == 0`), which skips the
+        // kernel for the rows past the block's non-zero extent.
+        let mut tbuf = [0i64; 64];
+        let tbuf = &mut tbuf[..w];
+        for i in 0..h {
+            // Populate T[j] from Dequant[i][j], zero for j or i >= 32.
+            let mut any_nonzero = false;
+            for j in 0..w {
+                tbuf[j] = if i < 32 && j < 32 {
+                    dequant[i * w + j]
+                } else {
+                    0
+                };
+                any_nonzero |= tbuf[j] != 0;
             }
-        }
-        if lossless {
-            // §7.13.3 Lossless row pass: inverse WHT, shift = 2.
-            // Only reachable for TX_4X4 (the spec's Lossless
-            // constraint).
-            inverse_wht4(tbuf, 2);
-        } else {
-            apply_row_kernel(tbuf, tx_type, log2_w, row_clamp_range);
-        }
-        for j in 0..w {
-            residual[i * w + j] = round2(tbuf[j], row_shift);
+            if !any_nonzero {
+                continue;
+            }
+            // Abs(log2W - log2H) == 1 scaling.
+            if log2_w.abs_diff(log2_h) == 1 {
+                for slot in tbuf.iter_mut() {
+                    *slot = round2(*slot * 2896, 12);
+                }
+            }
+            if lossless {
+                // §7.13.3 Lossless row pass: inverse WHT, shift = 2.
+                // Only reachable for TX_4X4 (the spec's Lossless
+                // constraint).
+                inverse_wht4(tbuf, 2);
+            } else {
+                apply_row_kernel(tbuf, tx_type, log2_w, row_clamp_range);
+            }
+            for j in 0..w {
+                residual[i * w + j] = round2(tbuf[j], row_shift);
+            }
         }
     }
     // Between-stage clamp at col_clamp_range bits.
@@ -970,44 +1320,60 @@ fn inverse_transform_2d_scalar(
     for cell in residual.iter_mut() {
         *cell = clip3(lo, hi, *cell);
     }
-    // Column transforms.
-    if !lossless && col_clamp_range <= 18
-        && matches!(tx_type, DCT_DCT | DCT_ADST | DCT_FLIPADST | V_DCT)
-    {
-        // Columns start clamped to at most 18 signed bits. All butterfly
-        // values fit i32; rotations still use their exact i64 products.
-        let mut columns = [[0i32; 4]; 64];
-        for j in (0..w).step_by(4) {
-            for i in 0..h {
-                for lane in 0..4 {
-                    columns[i][lane] = residual[i * w + j + lane] as i32;
+    // r487 — likewise for the DCT column kernels (`dct_column_pass`).
+    let col_is_dct = !lossless
+        && matches!(tx_type, x if x == DCT_DCT || x == DCT_ADST || x == DCT_FLIPADST || x == V_DCT);
+    if col_is_dct {
+        macro_rules! columns {
+            ($lanes:literal) => {
+                match h {
+                    4 => dct_column_pass::<$lanes, 4>(residual, w, col_clamp_range, col_shift),
+                    8 => dct_column_pass::<$lanes, 8>(residual, w, col_clamp_range, col_shift),
+                    16 => dct_column_pass::<$lanes, 16>(residual, w, col_clamp_range, col_shift),
+                    32 => dct_column_pass::<$lanes, 32>(residual, w, col_clamp_range, col_shift),
+                    _ => dct_column_pass::<$lanes, 64>(residual, w, col_clamp_range, col_shift),
                 }
-            }
-            inverse_dct_columns(&mut columns[..h], log2_h, col_clamp_range);
-            for i in 0..h {
-                for lane in 0..4 {
-                    residual[i * w + j + lane] = i64::from((columns[i][lane] + 8) >> 4);
-                }
-            }
+            };
         }
-    } else {
-        let mut tbuf_arr = [0i64; 64];
-        for j in 0..w {
-            let tbuf = &mut tbuf_arr[..h];
+        if w >= 8 {
+            columns!(8)
+        } else {
+            columns!(4)
+        }
+        return;
+    }
+    // Column transforms. r481 — the column process is a function of
+    // the column's input alone, so a column whose input equals the
+    // previous column's input takes that column's output (a DC-only
+    // block's row pass leaves every column the same input: one column
+    // transform instead of `w`).
+    let mut tbuf = [0i64; 64];
+    let tbuf = &mut tbuf[..h];
+    let mut prev_in = [0i64; 64];
+    let prev_in = &mut prev_in[..h];
+    for j in 0..w {
+        let mut same = j > 0;
+        for i in 0..h {
+            let v = residual[i * w + j];
+            same &= v == prev_in[i];
+            tbuf[i] = v;
+        }
+        if same {
             for i in 0..h {
-                tbuf[i] = residual[i * w + j];
+                residual[i * w + j] = residual[i * w + j - 1];
             }
-            if lossless {
-                inverse_wht4(tbuf, 0);
-            } else {
-                apply_col_kernel(tbuf, tx_type, log2_h, col_clamp_range);
-            }
-            for i in 0..h {
-                residual[i * w + j] = round2(tbuf[i], col_shift);
-            }
+            continue;
+        }
+        prev_in.copy_from_slice(tbuf);
+        if lossless {
+            inverse_wht4(tbuf, 0);
+        } else {
+            apply_col_kernel(tbuf, tx_type, log2_h, col_clamp_range);
+        }
+        for i in 0..h {
+            residual[i * w + j] = round2(tbuf[i], col_shift);
         }
     }
-    residual
 }
 
 /// §7.13.3 row-pass kernel selector (av1-spec p.306). DCT path for
@@ -1070,58 +1436,302 @@ fn apply_col_kernel(t: &mut [i64], tx_type: usize, log2_h: u32, col_clamp_range:
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn dc_only_dct_matches_full_scalar_every_size_and_depth() {
-        for size in 0..TX_SIZES_ALL {
-            for depth in [8, 10, 12] {
-                let limit = 1i64 << (depth + 7);
-                let mut input = vec![0; TX_WIDTH[size] * TX_HEIGHT[size]];
-                for dc in [-limit, -limit + 1, -4097, -4096, -4095, -129, -128,
-                    -127, -65, -64, -63, -33, -32, -31, -17, -16, -15, -1,
-                    0, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128,
-                    129, 4095, 4096, 4097, limit - 1]
-                {
-                    input[0] = dc;
-                    assert_eq!(inverse_transform_2d(&input, size, DCT_DCT, depth, false),
-                        inverse_transform_2d_scalar(&input, size, DCT_DCT, depth, false),
-                        "size={size} depth={depth} dc={dc}");
+    use super::*;
+    use crate::cdf::{TX_4X4, TX_4X8, TX_8X8, TX_16X16, TX_32X32, TX_64X64};
+
+    /// The §7.13.3 2-D inverse transform one row, then one column, at
+    /// a time through the scalar kernels — the model the lane passes
+    /// are checked against.
+    pub(super) fn inverse_transform_2d_scalar(
+        dequant: &[i64],
+        tx_sz: usize,
+        tx_type: usize,
+        bit_depth: u32,
+    ) -> Vec<i64> {
+        let log2_w = TX_WIDTH_LOG2[tx_sz] as u32;
+        let log2_h = (TX_HEIGHT[tx_sz] as u32).trailing_zeros();
+        let (w, h) = (TX_WIDTH[tx_sz], TX_HEIGHT[tx_sz]);
+        let row_shift = TRANSFORM_ROW_SHIFT[tx_sz];
+        let row_clamp_range = bit_depth + 8;
+        let col_clamp_range = core::cmp::max(bit_depth + 6, 16);
+        let mut residual = vec![0i64; w * h];
+        for i in 0..h {
+            let mut t: Vec<i64> = (0..w)
+                .map(|j| {
+                    if i < 32 && j < 32 {
+                        dequant[i * w + j]
+                    } else {
+                        0
+                    }
+                })
+                .collect();
+            if log2_w.abs_diff(log2_h) == 1 {
+                for v in t.iter_mut() {
+                    *v = round2(*v * 2896, 12);
                 }
             }
+            apply_row_kernel(&mut t, tx_type, log2_w, row_clamp_range);
+            for j in 0..w {
+                residual[i * w + j] = round2(t[j], row_shift);
+            }
+        }
+        let lo = -(1i64 << (col_clamp_range - 1));
+        let hi = (1i64 << (col_clamp_range - 1)) - 1;
+        for v in residual.iter_mut() {
+            *v = clip3(lo, hi, *v);
+        }
+        for j in 0..w {
+            let mut t: Vec<i64> = (0..h).map(|i| residual[i * w + j]).collect();
+            apply_col_kernel(&mut t, tx_type, log2_h, col_clamp_range);
+            for i in 0..h {
+                residual[i * w + j] = round2(t[i], 4);
+            }
+        }
+        residual
+    }
+
+    /// r487 — the recorded-schedule lane passes equal the scalar
+    /// kernels on every transform size and on every transform type
+    /// with a DCT row or column kernel, across coefficient magnitudes
+    /// from a few units to the dequantiser's clamp (so both the
+    /// 32-bit and the 64-bit lanes run), sparse and dense blocks,
+    /// DC-only blocks included.
+    #[test]
+    fn lane_dct_passes_match_the_scalar_kernels() {
+        use crate::cdf::{
+            ADST_DCT, DCT_ADST, DCT_DCT, DCT_FLIPADST, FLIPADST_DCT, H_DCT, IDTX, TX_SIZES_ALL,
+            V_DCT,
+        };
+        let mut state = 0xD1CE_F00D_0BAD_5EEDu64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut narrow_groups = 0usize;
+        let mut wide_groups = 0usize;
+        for tx_sz in 0..TX_SIZES_ALL {
+            let (w, h) = (TX_WIDTH[tx_sz], TX_HEIGHT[tx_sz]);
+            let types: &[usize] = if w.max(h) > 32 {
+                &[DCT_DCT]
+            } else if w.max(h) == 32 {
+                &[DCT_DCT, IDTX]
+            } else {
+                &[
+                    DCT_DCT,
+                    ADST_DCT,
+                    DCT_ADST,
+                    FLIPADST_DCT,
+                    DCT_FLIPADST,
+                    V_DCT,
+                    H_DCT,
+                    IDTX,
+                ]
+            };
+            for &tx_type in types {
+                for bit_depth in [8u32, 10, 12] {
+                    for trial in 0..24u32 {
+                        let cap = 1i64 << (7 + bit_depth);
+                        let bits = 2 + (trial % 5) * ((5 + bit_depth) / 4);
+                        let mut dequant = vec![0i64; w * h];
+                        let fill = |v: u64| -> i64 {
+                            let mag = (v >> 8) as i64 & ((1i64 << bits) - 1);
+                            (if v & 1 == 0 { mag } else { -mag }).clamp(-cap, cap - 1)
+                        };
+                        match trial % 4 {
+                            // DC only.
+                            0 => dequant[0] = fill(next()) | 1,
+                            // A few low-frequency coefficients.
+                            1 => {
+                                for _ in 0..4 {
+                                    let (i, j) =
+                                        ((next() % 4) as usize % h, (next() % 4) as usize % w);
+                                    dequant[i * w + j] = fill(next());
+                                }
+                            }
+                            // Dense inside the coded 32 × 32 corner.
+                            2 => {
+                                for i in 0..h.min(32) {
+                                    for j in 0..w.min(32) {
+                                        dequant[i * w + j] = fill(next());
+                                    }
+                                }
+                            }
+                            // Every coefficient at the clamp.
+                            _ => {
+                                for i in 0..h.min(32) {
+                                    for j in 0..w.min(32) {
+                                        dequant[i * w + j] =
+                                            if next() & 1 == 0 { cap - 1 } else { -cap };
+                                    }
+                                }
+                            }
+                        }
+                        let max_abs = dequant.iter().map(|v| v.unsigned_abs()).max().unwrap_or(0);
+                        if max_abs <= dct_program(TX_WIDTH_LOG2[tx_sz] as u32).narrow_limit as u64 {
+                            narrow_groups += 1;
+                        } else {
+                            wide_groups += 1;
+                        }
+                        let mut got = Vec::new();
+                        inverse_transform_2d_passes(
+                            &dequant, tx_sz, tx_type, bit_depth, false, &mut got,
+                        );
+                        let want = inverse_transform_2d_scalar(&dequant, tx_sz, tx_type, bit_depth);
+                        assert_eq!(
+                            got, want,
+                            "tx_sz={tx_sz} tx_type={tx_type} bd={bit_depth} trial={trial}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(narrow_groups > 0 && wide_groups > 0, "both lane widths ran");
+    }
+
+    /// A DC-only `DCT_DCT` block's closed form equals the scalar kernels
+    /// on every transform size and depth, up to both ends of the
+    /// dequantiser's clamp, and is not taken outside it.
+    #[test]
+    fn dc_only_dct_matches_the_scalar_kernels() {
+        use crate::cdf::{DCT_DCT, TX_SIZES_ALL};
+        for tx_sz in 0..TX_SIZES_ALL {
+            for bit_depth in [8u32, 10, 12] {
+                let limit = 1i64 << (bit_depth + 7);
+                let mut dequant = vec![0i64; TX_WIDTH[tx_sz] * TX_HEIGHT[tx_sz]];
+                for magnitude in [
+                    0,
+                    1,
+                    15,
+                    16,
+                    17,
+                    31,
+                    32,
+                    33,
+                    63,
+                    64,
+                    65,
+                    127,
+                    128,
+                    129,
+                    4095,
+                    4096,
+                    4097,
+                    limit - 1,
+                    limit,
+                ] {
+                    for dc in [magnitude, -magnitude] {
+                        dequant[0] = dc;
+                        let want = inverse_transform_2d_scalar(&dequant, tx_sz, DCT_DCT, bit_depth);
+                        if let Some(value) = dc_only_dct(&dequant, tx_sz, bit_depth) {
+                            assert!(
+                                want.iter().all(|&v| v == value),
+                                "tx_sz={tx_sz} bd={bit_depth} dc={dc}"
+                            );
+                        } else {
+                            assert_eq!(dc, limit, "tx_sz={tx_sz} bd={bit_depth}");
+                        }
+                        assert_eq!(
+                            inverse_transform_2d(&dequant, tx_sz, DCT_DCT, bit_depth, false),
+                            want,
+                            "tx_sz={tx_sz} bd={bit_depth} dc={dc}"
+                        );
+                    }
+                }
+                dequant[0] = 64;
+                *dequant.last_mut().unwrap() = 1;
+                assert_eq!(dc_only_dct(&dequant, tx_sz, bit_depth), None);
+            }
+            assert_eq!(dc_only_dct(&[64], tx_sz, 9), None);
         }
     }
 
-    use super::*;
-    use crate::cdf::{TX_16X16, TX_32X32, TX_4X4, TX_4X8, TX_64X64, TX_8X8};
-
+    /// r487 — the 32-bit lane bound is sound: at inputs of exactly
+    /// `narrow_limit` magnitude (every sign pattern class) the 32-bit
+    /// and 64-bit lane replays agree, and no 64-bit intermediate
+    /// leaves the signed 32-bit range.
     #[test]
-    fn four_column_dct_matches_scalar_at_precision_limits() {
-        let mut state = 0x6d2b79f5u32;
-        for n in 2..=6u32 {
-            let len = 1usize << n;
-            for r in [16u32, 18] {
-                for _ in 0..128 {
-                    let mut columns = [[0i32; 4]; 64];
-                    for row in &mut columns[..len] {
-                        for value in row {
-                            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
-                            *value = ((state & ((1 << r) - 1)) as i32) - (1 << (r - 1));
+    fn narrow_lane_limit_keeps_every_intermediate_in_32_bits() {
+        let mut state = 0xA5A5_5A5A_1234_4321u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        fn check<const N: usize>(next: &mut dyn FnMut() -> u64) {
+            let n = N.trailing_zeros();
+            let program = dct_program(n);
+            let m = program.narrow_limit;
+            assert!(m >= 64, "n={n}: limit {m} too small to be useful");
+            for trial in 0..400u32 {
+                let mut wide = [[0i64; 8]; N];
+                for slot in wide.iter_mut() {
+                    for v in slot.iter_mut() {
+                        let r = next();
+                        *v = match trial % 4 {
+                            0 => m,
+                            1 => -m,
+                            2 => {
+                                if r & 1 == 0 {
+                                    m
+                                } else {
+                                    -m
+                                }
+                            }
+                            _ => (r % (2 * m as u64 + 1)) as i64 - m,
+                        };
+                    }
+                }
+                let mut narrow = [[0i32; 8]; N];
+                for (dst, src) in narrow.iter_mut().zip(&wide) {
+                    for (d, &v) in dst.iter_mut().zip(src) {
+                        *d = v as i32;
+                    }
+                }
+                // Replay step by step on the wide lanes, checking the
+                // unrounded sums of every step.
+                for step in &program.steps {
+                    match *step {
+                        FlowStep::Rotate { a, b, cos, sin, .. } => {
+                            for (&ta, &tb) in wide[a as usize].iter().zip(&wide[b as usize]) {
+                                for v in [
+                                    ta * i64::from(cos),
+                                    tb * i64::from(sin),
+                                    ta * i64::from(cos) - tb * i64::from(sin) + 2048,
+                                    ta * i64::from(sin) + tb * i64::from(cos) + 2048,
+                                ] {
+                                    assert!(
+                                        i32::try_from(v).is_ok(),
+                                        "n={n} trial={trial}: rotation term {v} overflows"
+                                    );
+                                }
+                            }
+                        }
+                        FlowStep::AddSub { sum, diff } => {
+                            for (&x, &y) in wide[sum as usize].iter().zip(&wide[diff as usize]) {
+                                assert!(
+                                    i32::try_from(x + y).is_ok() && i32::try_from(x - y).is_ok()
+                                );
+                            }
                         }
                     }
-                    let original = columns;
-                    inverse_dct_columns(&mut columns[..len], n, r);
-                    for lane in 0..4 {
-                        let mut scalar = [0i64; 64];
-                        for i in 0..len {
-                            scalar[i] = i64::from(original[i][lane]);
-                        }
-                        inverse_dct(&mut scalar[..len], n, r);
-                        for i in 0..len {
-                            assert_eq!(i64::from(columns[i][lane]), scalar[i]);
-                        }
+                    run_dct_lanes_wide(core::slice::from_ref(step), &mut wide, 20);
+                }
+                run_dct_lanes_narrow(&program.steps, &mut narrow, 20);
+                for (ns, ws) in narrow.iter().zip(&wide) {
+                    for (&a, &b) in ns.iter().zip(ws) {
+                        assert_eq!(i64::from(a), b, "n={n} trial={trial}");
                     }
                 }
             }
         }
+        check::<4>(&mut next);
+        check::<8>(&mut next);
+        check::<16>(&mut next);
+        check::<32>(&mut next);
+        check::<64>(&mut next);
     }
 
     #[test]
@@ -1131,7 +1741,7 @@ mod tests {
         assert_eq!(cos128(64), 0); // cos(pi/2) * 4096.
         assert_eq!(cos128(128), -4096); // cos(pi) * 4096.
         assert_eq!(cos128(192), 0); // cos(3pi/2) * 4096.
-                                    // angle2 = 32 -> Cos128_Lookup[32] = 2896.
+        // angle2 = 32 -> Cos128_Lookup[32] = 2896.
         assert_eq!(cos128(32), 2896);
         // angle = 32 + 64 = 96, falls in (64..=128): -Cos128_Lookup[32] = -2896.
         assert_eq!(cos128(96), -2896);
@@ -1167,7 +1777,7 @@ mod tests {
         assert_eq!(round2(4096, 12), 1);
         assert_eq!(round2(2048, 12), 1); // (2048 + 2048) >> 12 = 1.
         assert_eq!(round2(2047, 12), 0); // (2047 + 2048) >> 12 = 0.
-                                         // Negative: arithmetic shift; (-2048 + 2048) >> 12 = 0 >> 12 = 0.
+        // Negative: arithmetic shift; (-2048 + 2048) >> 12 = 0 >> 12 = 0.
         assert_eq!(round2(-2048, 12), 0);
         // (-4096 + 2048) = -2048; -2048 >> 12 (arith) = -1.
         assert_eq!(round2(-4096, 12), -1);

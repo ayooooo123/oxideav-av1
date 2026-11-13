@@ -61,20 +61,20 @@
 //!   stub through the recursion.
 
 use oxideav_av1::encoder::block_mode_info::{
-    write_intra_frame_else_arm, write_intra_frame_intrabc_arm, write_skip, IntrabcArmInputs,
+    IntrabcArmInputs, write_intra_frame_else_arm, write_intra_frame_intrabc_arm, write_skip,
 };
 use oxideav_av1::encoder::symbol_writer::SymbolWriter;
 use oxideav_av1::uncompressed_header_tail::{SEG_LVL_GLOBALMV, SEG_LVL_MAX, SEG_LVL_REF_FRAME};
 use oxideav_av1::{
-    get_palette_color_context, interintra_ctx, palette_color_ctx, BILINEAR, INTERINTRA_MODES,
-    PALETTE_COLORS, V_PRED,
+    BILINEAR, INTERINTRA_MODES, PALETTE_COLORS, V_PRED, get_palette_color_context, interintra_ctx,
+    palette_color_ctx,
 };
 use oxideav_av1::{
-    DecodedBlock, DecodedInterFrameModeInfo, DecodedPaletteMap, Error, FrameInterOrderHints,
-    InterFrameContext, MotionFieldMvs, PartitionWalker, QuantizerParams, SymbolDecoder,
-    TileCdfContext, TileDecodeParams, TileGeometry, BLOCK_16X16, BLOCK_4X4, BLOCK_8X16, BLOCK_8X8,
-    GM_TYPE_IDENTITY, MAX_SEGMENTS, MAX_TX_DEPTH, MAX_VARTX_DEPTH, SKIP_CONTEXTS, TX_16X16, TX_4X4,
-    TX_8X8, TX_SIZE_CONTEXTS, WARPEDMODEL_PREC_BITS,
+    BLOCK_4X4, BLOCK_8X8, BLOCK_8X16, BLOCK_16X16, DecodedBlock, DecodedInterFrameModeInfo,
+    DecodedPaletteMap, Error, FrameInterOrderHints, GM_TYPE_IDENTITY, InterFrameContext,
+    MAX_SEGMENTS, MAX_TX_DEPTH, MAX_VARTX_DEPTH, MotionFieldMvs, PartitionWalker, QuantizerParams,
+    SKIP_CONTEXTS, SymbolDecoder, TX_4X4, TX_8X8, TX_16X16, TX_SIZE_CONTEXTS, TileCdfContext,
+    TileDecodeParams, TileGeometry, WARPEDMODEL_PREC_BITS,
 };
 
 /// §5.9.14 `FeatureEnabled` table with segment 0's `SEG_LVL_REF_FRAME`
@@ -136,7 +136,7 @@ fn walker_n(n: u32) -> PartitionWalker {
         mi_col_start: 0,
         mi_col_end: n,
     };
-    PartitionWalker::<i32>::new(n, n, geom).unwrap()
+    PartitionWalker::new(n, n, geom).unwrap()
 }
 
 /// §5.11.5 baseline path: a single keyframe / intra-only block at the
@@ -170,8 +170,8 @@ fn decode_block_syntax_reaches_compute_prediction_stub_after_intra_mode_info() {
     let mut walker = walker_n(16);
     let mut cdfs = TileCdfContext::new_from_defaults();
     let rigged_skip = force_binary_cdf(0);
-    for ctx_idx in 0..SKIP_CONTEXTS {
-        cdfs.skip[ctx_idx] = rigged_skip;
+    for slot in cdfs.skip.iter_mut().take(SKIP_CONTEXTS) {
+        *slot = rigged_skip;
     }
     let bytes = [0u8; 16];
     let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -950,7 +950,13 @@ fn extract_curr_planes(walker: &PartitionWalker) -> Vec<(u32, u32, Vec<i32>)> {
     (0..3)
         .map(|p| {
             let (rows, cols) = walker.curr_frame_dims(p).unwrap();
-            (rows, cols, walker.curr_frame(p).unwrap().to_vec())
+            let samples = walker
+                .curr_frame(p)
+                .unwrap()
+                .iter()
+                .map(|&v| i32::from(v))
+                .collect();
+            (rows, cols, samples)
         })
         .collect()
 }
@@ -1662,8 +1668,8 @@ fn read_block_tx_size_tx_mode_select_depth_zero_keeps_max_rect() {
         a[..v.len()].copy_from_slice(&v);
         a
     };
-    for ctx in 0..TX_SIZE_CONTEXTS {
-        cdfs.tx_16x16[ctx] = rigged;
+    for slot in cdfs.tx_16x16.iter_mut().take(TX_SIZE_CONTEXTS) {
+        *slot = rigged;
     }
     let bytes = [0u8; 8];
     let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -1706,8 +1712,8 @@ fn read_block_tx_size_tx_mode_select_depth_one_splits_once() {
         a[..v.len()].copy_from_slice(&v);
         a
     };
-    for ctx in 0..TX_SIZE_CONTEXTS {
-        cdfs.tx_16x16[ctx] = rigged;
+    for slot in cdfs.tx_16x16.iter_mut().take(TX_SIZE_CONTEXTS) {
+        *slot = rigged;
     }
     let bytes = [0u8; 8];
     let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -1743,8 +1749,8 @@ fn read_block_tx_size_tx_mode_select_depth_two_splits_twice() {
         a[..v.len()].copy_from_slice(&v);
         a
     };
-    for ctx in 0..TX_SIZE_CONTEXTS {
-        cdfs.tx_16x16[ctx] = rigged;
+    for slot in cdfs.tx_16x16.iter_mut().take(TX_SIZE_CONTEXTS) {
+        *slot = rigged;
     }
     let bytes = [0u8; 8];
     let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -1901,8 +1907,8 @@ fn decode_block_syntax_with_tx_mode_select_reaches_compute_prediction() {
         a[..v.len()].copy_from_slice(&v);
         a
     };
-    for ctx in 0..TX_SIZE_CONTEXTS {
-        cdfs.tx_16x16[ctx] = rigged;
+    for slot in cdfs.tx_16x16.iter_mut().take(TX_SIZE_CONTEXTS) {
+        *slot = rigged;
     }
     let bytes = [0u8; 16];
     let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -2812,8 +2818,8 @@ fn decoded_inter_frame_mode_info_struct_public_api_smoke() {
 // ----------------------------------------------------------------
 
 use oxideav_av1::{
-    get_plane_residual_size, predict_intra_dc_pred, ComputePredictionReadout, PlanePredictionTask,
-    BLOCK_16X8, BLOCK_4X8,
+    BLOCK_4X8, BLOCK_16X8, ComputePredictionReadout, PlanePredictionTask, get_plane_residual_size,
+    predict_intra_dc_pred,
 };
 
 /// §5.11.38 `get_plane_residual_size` table sanity — plane 0 is a
@@ -3575,7 +3581,7 @@ fn r190_decode_block_syntax_with_inter_ctx_runs_inter_arm_to_completion() {
 /// frame's top-left 8×8 window.
 #[test]
 fn r346_two_pass_inter_decode_reconstructs_pixels_from_bitstream() {
-    use oxideav_av1::{PlaneRefSpec, RefFrameStoreEntry, LAST_FRAME};
+    use oxideav_av1::{LAST_FRAME, PlaneRefSpec, RefFrameStoreEntry};
 
     // 2×2 mi walker → an 8×8 luma frame; one BLOCK_8X8 inter leaf covers it.
     let mut walker = walker_n(2);
@@ -3676,12 +3682,7 @@ fn r346_two_pass_inter_decode_reconstructs_pixels_from_bitstream() {
     // window verbatim into CurrFrame[0].
     let (rows, cols) = walker.curr_frame_dims(0).unwrap();
     assert_eq!((rows, cols), (8, 8));
-    let got: Vec<u16> = walker
-        .curr_frame(0)
-        .unwrap()
-        .iter()
-        .map(|&s| s as u16)
-        .collect();
+    let got: Vec<u16> = walker.curr_frame(0).unwrap().to_vec();
     assert_eq!(
         got, refp,
         "two-pass inter decode: zero-MV MC must copy the reference 8×8 window into CurrFrame[0]"
@@ -3700,7 +3701,7 @@ fn r346_two_pass_inter_decode_reconstructs_pixels_from_bitstream() {
 /// zero-MV integer-position EIGHTTAP copy of the reference window).
 #[test]
 fn r387_in_walk_inter_prediction_reconstructs_during_decode_block_syntax() {
-    use oxideav_av1::{InterWalkPixels, PlaneRefSpec, RefFrameStoreEntry, LAST_FRAME};
+    use oxideav_av1::{InterWalkPixels, LAST_FRAME, PlaneRefSpec, RefFrameStoreEntry};
 
     let mut walker = walker_n(2);
     let mut cdfs = TileCdfContext::new_from_defaults();
@@ -3797,12 +3798,7 @@ fn r387_in_walk_inter_prediction_reconstructs_during_decode_block_syntax() {
     // the MC pixels.
     let (rows, cols) = walker.curr_frame_dims(0).unwrap();
     assert_eq!((rows, cols), (8, 8));
-    let got: Vec<u16> = walker
-        .curr_frame(0)
-        .unwrap()
-        .iter()
-        .map(|&s| s as u16)
-        .collect();
+    let got: Vec<u16> = walker.curr_frame(0).unwrap().to_vec();
     assert_eq!(
         got, refp,
         "in-walk §5.11.33 prediction: zero-MV MC must copy the reference window into CurrFrame[0]"
@@ -4058,12 +4054,7 @@ fn decode_inter_intra_then_frame_walk(ii_mode: usize, ref_fill: u16) -> Vec<u16>
         .reconstruct_inter_frame_into_curr_frame(&ref_frame_idx, 8, &[ref_spec])
         .expect("frame-scope inter-intra reconstruction from the decoded grids");
 
-    walker
-        .curr_frame(0)
-        .unwrap()
-        .iter()
-        .map(|&s| s as u16)
-        .collect()
+    walker.curr_frame(0).unwrap().to_vec()
 }
 
 /// r359 end-to-end: the §5.11.33 frame-walk bridge dispatches a real
@@ -4238,7 +4229,7 @@ fn r190_decode_block_syntax_inter_arm_without_ctx_keeps_legacy_stub() {
 #[test]
 fn r190_inter_frame_context_identity_default_matches_spec_identity_warp() {
     let mfmvs = MotionFieldMvs::new_invalid(16, 16);
-    let ctx = InterFrameContext::<u16>::identity_default(&mfmvs);
+    let ctx = InterFrameContext::identity_default(&mfmvs);
     for ref_idx in 0..8 {
         assert_eq!(
             ctx.gm_params[ref_idx][2],

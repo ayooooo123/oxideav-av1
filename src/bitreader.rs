@@ -23,21 +23,16 @@ use crate::Error;
 /// `FloorLog2(x)` per §4.7: floor of log base 2 of `x`. For `x == 0`
 /// we return 0 (the §4.7 helper is undefined at zero; ns() is only
 /// invoked with `n >= 1`, so this convention is never reached).
-#[inline(always)]
-pub(crate) fn floor_log2(x: u32) -> u32 {
-    if x == 0 {
-        0
-    } else {
-        31 - x.leading_zeros()
-    }
+fn floor_log2(x: u32) -> u32 {
+    if x == 0 { 0 } else { 31 - x.leading_zeros() }
 }
 
 /// MSB-first bit reader.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct BitReader<'a> {
-    pub(crate) bytes: &'a [u8],
+    bytes: &'a [u8],
     /// Total bit position from the start of `bytes`, in bits.
-    pub(crate) pos: usize,
+    pos: usize,
 }
 
 impl<'a> BitReader<'a> {
@@ -85,7 +80,8 @@ impl<'a> BitReader<'a> {
             while remaining != 0 {
                 let bits = remaining.min(8 - (self.pos & 7) as u32);
                 let shift = 8 - (self.pos & 7) as u32 - bits;
-                value = (value << bits) | u64::from((self.bytes[self.pos >> 3] >> shift) & (255 >> (8 - bits)));
+                value = (value << bits)
+                    | u64::from((self.bytes[self.pos >> 3] >> shift) & (255 >> (8 - bits)));
                 self.pos += bits as usize;
                 remaining -= bits;
             }
@@ -192,7 +188,10 @@ mod tests {
                     for _ in 0..n {
                         match scalar.read_bit() {
                             Ok(bit) => expected = expected.map(|v| (v << 1) | u64::from(bit)),
-                            Err(e) => { expected = Err(e); break; }
+                            Err(e) => {
+                                expected = Err(e);
+                                break;
+                            }
                         }
                     }
                     assert_eq!(fast.f(n), expected, "len={len} pos={pos} n={n}");

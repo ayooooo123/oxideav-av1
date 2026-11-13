@@ -85,7 +85,7 @@
 //!   input  = `Round2(FrameHeight, subY) × Round2(FrameWidth, subX)`,
 //!   output = `Round2(FrameHeight, subY) × Round2(UpscaledWidth, subX)`.
 
-use crate::loop_filter::{Pixel, PlaneBuffer};
+use crate::loop_filter::{PlaneBuffer, Sample};
 
 // =====================================================================
 // §3 constants — av1-spec p.32 lines 1395-1412.
@@ -279,10 +279,10 @@ pub struct SuperresFrameContext {
 ///
 /// `output_planes.len()` and `input_planes.len()` must both be at least
 /// `ctx.num_planes`. Any excess buffers are ignored.
-pub fn upscale_frame<P: Pixel>(
+pub fn upscale_frame<S: Sample>(
     ctx: &SuperresFrameContext,
-    input_planes: &[PlaneBuffer<'_, P>],
-    output_planes: &mut [PlaneBuffer<'_, P>],
+    input_planes: &[PlaneBuffer<'_, S>],
+    output_planes: &mut [PlaneBuffer<'_, S>],
 ) -> Result<(), SuperresError> {
     let num_planes = ctx.num_planes as usize;
     if input_planes.len() < num_planes || output_planes.len() < num_planes {
@@ -323,11 +323,11 @@ pub fn upscale_frame<P: Pixel>(
 /// stepX, err, initialSubpelX, miW, minX, maxX)` per the spec, then
 /// invokes [`upscale_sample`] for each `(y, x) ∈ [0, planeH) × [0,
 /// upscaledPlaneW)`.
-pub fn upscale_plane<P: Pixel>(
+pub fn upscale_plane<S: Sample>(
     ctx: &SuperresFrameContext,
     plane: u8,
-    input: &PlaneBuffer<'_, P>,
-    output: &mut PlaneBuffer<'_, P>,
+    input: &PlaneBuffer<'_, S>,
+    output: &mut PlaneBuffer<'_, S>,
 ) -> Result<(), SuperresError> {
     // av1-spec p.325 lines 17979-17985 — (subX, subY) for `plane`.
     let (sub_x, sub_y) = subsampling_for_plane(plane, ctx.subsampling_x, ctx.subsampling_y);
@@ -403,7 +403,7 @@ pub fn upscale_plane<P: Pixel>(
                 max_x,
                 bit_depth,
             );
-            output.samples[out_row_off + (x as usize)] = P::from_i32(sample);
+            output.samples[out_row_off + (x as usize)] = S::narrow(sample);
         }
     }
     Ok(())
@@ -419,8 +419,8 @@ pub fn upscale_plane<P: Pixel>(
 /// `in_row` is the source `downscaledPlaneW`-wide row that the spec
 /// addresses as `frame[plane][y][.]`; the caller is responsible for
 /// passing the row for the matching `y`.
-pub fn upscale_sample<P: Pixel>(
-    in_row: &[P],
+pub fn upscale_sample<S: Sample>(
+    in_row: &[S],
     src_x_px: i32,
     src_x_subpel: usize,
     min_x: i32,
@@ -439,7 +439,7 @@ pub fn upscale_sample<P: Pixel>(
         // reference reads `frame[plane][y][sampleX]` so we replicate
         // the rightmost real sample.
         let idx = sample_x.clamp(0, in_row.len() as i32 - 1) as usize;
-        sum += in_row[idx].to_i32() * tap;
+        sum += in_row[idx].widen() * tap;
     }
     clip1(bit_depth, round2_i32(sum, FILTER_BITS))
 }
@@ -494,17 +494,13 @@ fn clip1(bit_depth: u8, x: i32) -> i32 {
 /// lines 17980-17986.
 #[inline]
 fn subsampling_for_plane(plane: u8, sub_x: u8, sub_y: u8) -> (u8, u8) {
-    if plane == 0 {
-        (0, 0)
-    } else {
-        (sub_x, sub_y)
-    }
+    if plane == 0 { (0, 0) } else { (sub_x, sub_y) }
 }
 
 /// Verbatim plane copy used by the `use_superres == 0` short-circuit.
-fn copy_plane<P: Pixel>(
-    input_planes: &[PlaneBuffer<'_, P>],
-    output_planes: &mut [PlaneBuffer<'_, P>],
+fn copy_plane<S: Sample>(
+    input_planes: &[PlaneBuffer<'_, S>],
+    output_planes: &mut [PlaneBuffer<'_, S>],
     plane: u8,
 ) -> Result<(), SuperresError> {
     let p = plane as usize;

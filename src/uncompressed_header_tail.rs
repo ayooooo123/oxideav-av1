@@ -59,8 +59,8 @@
 //!   * `MAX_LOOP_FILTER = 63` — clip bound for the four loop-filter
 //!     features (per §5.9.14 `Segmentation_Feature_Max`).
 
-use crate::bitreader::BitReader;
 use crate::Error;
+use crate::bitreader::BitReader;
 
 // ---------------------------------------------------------------------
 // §3 constants
@@ -2019,8 +2019,8 @@ pub(crate) fn read_film_grain_params(
 
     let num_pos_luma = 2 * usize::from(fg.ar_coeff_lag) * (usize::from(fg.ar_coeff_lag) + 1);
     let num_pos_chroma = if fg.num_y_points > 0 {
-        for i in 0..num_pos_luma {
-            fg.ar_coeffs_y_plus_128[i] = br.f(8)? as u8;
+        for coeff in &mut fg.ar_coeffs_y_plus_128[..num_pos_luma] {
+            *coeff = br.f(8)? as u8;
         }
         num_pos_luma + 1
     } else {
@@ -2028,13 +2028,13 @@ pub(crate) fn read_film_grain_params(
     };
 
     if fg.chroma_scaling_from_luma || fg.num_cb_points > 0 {
-        for i in 0..num_pos_chroma {
-            fg.ar_coeffs_cb_plus_128[i] = br.f(8)? as u8;
+        for coeff in &mut fg.ar_coeffs_cb_plus_128[..num_pos_chroma] {
+            *coeff = br.f(8)? as u8;
         }
     }
     if fg.chroma_scaling_from_luma || fg.num_cr_points > 0 {
-        for i in 0..num_pos_chroma {
-            fg.ar_coeffs_cr_plus_128[i] = br.f(8)? as u8;
+        for coeff in &mut fg.ar_coeffs_cr_plus_128[..num_pos_chroma] {
+            *coeff = br.f(8)? as u8;
         }
     }
 
@@ -2520,8 +2520,8 @@ mod tests {
         // walks 8×8 = 64 feature_enabled bits, all zero ⇒ no further
         // reads. Total = 1 + 64 = 65 bits.
         let mut bits = vec![1u8]; // segmentation_enabled
-                                  // 64 zero `feature_enabled` bits — one per (segment, feature)
-                                  // slot, all disabled.
+        // 64 zero `feature_enabled` bits — one per (segment, feature)
+        // slot, all disabled.
         bits.resize(1 + MAX_SEGMENTS * SEG_LVL_MAX, 0);
         let mut payload = vec![0u8; bits.len().div_ceil(8)];
         for (i, &b) in bits.iter().enumerate() {
@@ -2586,7 +2586,7 @@ mod tests {
         //   features 1..7: enabled=0.
         // Segments 1..7: feature_enabled[*][*] = 0 ⇒ 7 × 8 = 56 bits.
         let mut bits = vec![1u8]; // segmentation_enabled
-                                  // Segment 0, feature 0: enabled=1, su(9) = -50 ⇒ 462 = 0b111001110.
+        // Segment 0, feature 0: enabled=1, su(9) = -50 ⇒ 462 = 0b111001110.
         bits.push(1); // feature_enabled
         for i in (0..9).rev() {
             bits.push(((462u32 >> i) & 1) as u8);
@@ -2607,10 +2607,10 @@ mod tests {
         assert!(s.segment_feature_active[0][SEG_LVL_ALT_Q]);
         assert_eq!(s.segment_feature_data[0][SEG_LVL_ALT_Q], -50);
         // All other features inactive.
-        for i in 0..MAX_SEGMENTS {
-            for j in 0..SEG_LVL_MAX {
+        for (i, features) in s.segment_feature_active.iter().enumerate() {
+            for (j, &active) in features.iter().enumerate() {
                 if (i, j) != (0, SEG_LVL_ALT_Q) {
-                    assert!(!s.segment_feature_active[i][j]);
+                    assert!(!active);
                 }
             }
         }
@@ -2654,7 +2654,7 @@ mod tests {
         // SEG_LVL_REF_FRAME has bits=3, signed=0, max=7.
         // Encode feature_value = 6 = 0b110 as f(3).
         let mut bits = vec![1u8]; // segmentation_enabled
-                                  // Segment 0, features 0..=4: enabled=0 (5 zero bits).
+        // Segment 0, features 0..=4: enabled=0 (5 zero bits).
         bits.resize(bits.len() + SEG_LVL_REF_FRAME, 0);
         // Segment 0, feature 5 (SEG_LVL_REF_FRAME): enabled=1, value=6.
         bits.push(1);
@@ -2684,12 +2684,12 @@ mod tests {
         // SEG_LVL_SKIP (j=6) has bits=0 ⇒ no feature_value read,
         // feature_data forced to 0. Activate it for segment 3.
         let mut bits = vec![1u8]; // segmentation_enabled
-                                  // Segments 0..=2: all 8 features enabled=0 (24 zero bits)
-                                  // plus segment 3 features 0..=5 disabled (6 zero bits).
+        // Segments 0..=2: all 8 features enabled=0 (24 zero bits)
+        // plus segment 3 features 0..=5 disabled (6 zero bits).
         bits.resize(bits.len() + 3 * SEG_LVL_MAX + SEG_LVL_SKIP, 0);
         bits.push(1); // feature_enabled[3][6]
         bits.push(0); // feature_enabled[3][7]
-                      // Segments 4..=7: all 8 features enabled=0 — 4×8 = 32 zero bits.
+        // Segments 4..=7: all 8 features enabled=0 — 4×8 = 32 zero bits.
         bits.resize(bits.len() + (MAX_SEGMENTS - 4) * SEG_LVL_MAX, 0);
         let mut payload = vec![0u8; bits.len().div_ceil(8)];
         for (i, &b) in bits.iter().enumerate() {
@@ -3539,8 +3539,8 @@ mod tests {
         // the identity initialiser persist for [2] / [5].
         let one = 1i32 << WARPEDMODEL_PREC_BITS;
         assert_eq!(gm.gm_params[LAST_FRAME], [0, 0, one, 0, 0, one]);
-        for r in (LAST_FRAME + 1)..=ALTREF_FRAME {
-            assert_eq!(gm.gm_type[r], WarpModelType::Identity);
+        for ty in &gm.gm_type[(LAST_FRAME + 1)..=ALTREF_FRAME] {
+            assert_eq!(*ty, WarpModelType::Identity);
         }
     }
 
@@ -3709,11 +3709,11 @@ mod tests {
         }
         fields.push((1, 2)); // ar_coeff_shift_minus_6 = 1 ⇒ 7
         fields.push((2, 2)); // grain_scale_shift = 2
-                             // num_cb_points>0 ⇒ cb mult/offset.
+        // num_cb_points>0 ⇒ cb mult/offset.
         fields.push((128, 8)); // cb_mult
         fields.push((192, 8)); // cb_luma_mult
         fields.push((256, 9)); // cb_offset
-                               // num_cr_points>0 ⇒ cr mult/offset.
+        // num_cr_points>0 ⇒ cr mult/offset.
         fields.push((130, 8)); // cr_mult
         fields.push((190, 8)); // cr_luma_mult
         fields.push((300, 9)); // cr_offset

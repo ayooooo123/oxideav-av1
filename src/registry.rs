@@ -25,6 +25,15 @@
 //! at a time — returning `Error::NeedMore` while empty and `Error::Eof`
 //! once the stream has been flushed and the queue is exhausted.
 //!
+//! A mid-stream change of the output shape (a new sequence header's
+//! layout / colour signal / picture rate, a new frame size) is
+//! announced in band: `receive_frame` returns one
+//! [`CoreFrame::StreamParams`] event carrying the new
+//! [`Decoder::output_params`] immediately before the first frame of
+//! the new shape, after every frame of the old shape (one per change,
+//! never for the first shape; `output_params_generation` moves with
+//! it).
+//!
 //! Registration claims the three container identifiers an AV1
 //! elementary stream is carried under:
 //!
@@ -47,19 +56,18 @@
 //! diagnosable [`crate::Error`] the direct API returns.
 
 use oxideav_core::{
-    CodecCapabilities, CodecId, CodecInfo, CodecParameters, CodecRegistry, CodecTag, Decoder,
-    Encoder, Error as CoreError, Frame as CoreFrame, Packet, PixelFormat, Result as CoreResult,
-    RuntimeContext, TimeBase, VideoFrame, VideoPlane,
+    CodecCapabilities, CodecId, CodecInfo, CodecParameters, CodecRegistry, CodecTag, ColorSignal,
+    Decoder, Encoder, Error as CoreError, Frame as CoreFrame, Packet, PixelFormat, Rational,
+    Result as CoreResult, RuntimeContext, TimeBase, VideoFrame, VideoPlane,
 };
 
 use crate::codec_config::Av1CodecConfig;
-use crate::decoder::{SpecDecodeSession, SpecFrame};
-#[cfg(not(target_arch = "wasm32"))]
-use crate::decoder::frame_driver::frame_threads::FrameThreadDecoder;
+use crate::decoder::{PendingSpecFrame, SpecDecodeSession, SpecFrame};
 use crate::encoder::{
-    encode_key_frame_yuv_with_options, encode_still_yuv, quality_to_base_q_idx, ChromaFormat,
-    StillOptions, StillSpeed, YuvFrame, DEFAULT_STILL_BASE_Q_IDX,
+    ChromaFormat, DEFAULT_STILL_BASE_Q_IDX, StillOptions, StillSpeed, YuvFrame,
+    encode_key_frame_yuv_with_options, encode_still_yuv, quality_to_base_q_idx,
 };
+use crate::sequence_header::SequenceHeader;
 use oxideav_core::ExecutionContext;
 
 /// Canonical codec id. `oxideav-meta::register_all` calls
@@ -124,12 +132,13 @@ pub fn make_decoder(params: &CodecParameters) -> CoreResult<Box<dyn Decoder>> {
         codec_id: params.codec_id.clone(),
         session,
         queue: std::collections::VecDeque::new(),
-        last_output: None,
         eof: false,
-        #[cfg(not(target_arch = "wasm32"))]
-        parallel: None,
-        #[cfg(not(target_arch = "wasm32"))]
-        pending_error: None,
+        shown: None,
+        generation: 0,
+        held: None,
+        config_pixel_format: Av1CodecConfig::parse(&params.extradata)
+            .as_ref()
+            .and_then(config_record_pixel_format),
     }))
 }
 
@@ -154,69 +163,152 @@ struct Av1Decoder {
     codec_id: CodecId,
     /// The cross-packet §7.20 session-state stack.
     session: SpecDecodeSession,
-    /// Frames recovered from already-decoded packets, awaiting drain by
-    /// `receive_frame`, in output order, each with its [`Layout`].
-    queue: std::collections::VecDeque<(VideoFrame, Layout)>,
-    /// The [`Layout`] of the frame `receive_frame` last returned.
-    last_output: Option<Layout>,
+    /// Frames recovered from already-sent packets, awaiting drain by
+    /// `receive_frame`, in output order with their packet's pts. Under
+    /// a worker budget a non-reference frame may still be decoding.
+    queue: std::collections::VecDeque<(PendingSpecFrame, Option<i64>, SeqShape)>,
     eof: bool,
-    #[cfg(not(target_arch = "wasm32"))]
-    parallel: Option<FrameThreadDecoder>,
-    #[cfg(not(target_arch = "wasm32"))]
-    pending_error: Option<CoreError>,
+    /// The output description of the frame `receive_frame` returned
+    /// last (`None` before the first one).
+    shown: Option<OutputShape>,
+    /// `Decoder::output_params_generation` — bumped (wrapping) when a
+    /// returned frame's shape differs from the previous one's, as the
+    /// `Frame::StreamParams` event announcing it is returned.
+    generation: u64,
+    /// The first frame of a new shape, held back for one call while
+    /// the `Frame::StreamParams` event announcing it is returned
+    /// (`shown` already describes it).
+    held: Option<VideoFrame>,
+    /// The layout an `av1C` extradata record states — the answer
+    /// before any sequence header was seen (a record without
+    /// `configOBUs` carries no size).
+    config_pixel_format: Option<PixelFormat>,
 }
 
-/// The visible size and pixel layout of a decoded frame.
-type Layout = ((u32, u32), Option<PixelFormat>);
-
-/// The [`Layout`] of `frame`: its post-superres `UpscaledWidth` ×
-/// `FrameHeight` (the size FFmpeg's AV1 decoders output; the render size
-/// only sets the aspect ratio), and the layout of its packed planes. The
-/// chroma subsampling is read off the plane sizes (§5.5.2 allows no 4:4:0).
-/// At a one-sample width or height two layouts give the same plane sizes;
-/// the one picked then packs exactly the planes the frame holds.
-fn frame_layout(frame: &SpecFrame) -> Layout {
-    use PixelFormat::*;
-    let (w, h) = (frame.width, frame.height);
-    let family = match frame.plane_dims.get(1) {
-        None => [Gray8, Gray10Le, Gray12Le],
-        Some(&(_, ch)) if ch != h => [Yuv420P, Yuv420P10Le, Yuv420P12Le],
-        Some(&(cw, _)) if cw != w => [Yuv422P, Yuv422P10Le, Yuv422P12Le],
-        Some(_) => [Yuv444P, Yuv444P10Le, Yuv444P12Le],
-    };
-    let format = match frame.bit_depth {
-        8 => Some(family[0]),
-        10 => Some(family[1]),
-        12 => Some(family[2]),
-        _ => None,
-    };
-    ((w, h), format)
+/// The stream-level part of the output description a §5.5 sequence
+/// header fixes: the §5.5.2 colour configuration (pixel layout and
+/// colour signal) and the §5.5.3 timing info. Captured per temporal
+/// unit, so a queued frame keeps the header it was decoded under.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SeqShape {
+    /// The emitted planes' layout: §5.5.2 `BitDepth` × `mono_chrome` ×
+    /// `subsampling_x` / `subsampling_y`.
+    pixel_format: Option<PixelFormat>,
+    /// §5.5.2 `color_range` + the colour description code points
+    /// (`CP_UNSPECIFIED` / `TC_UNSPECIFIED` / `MC_UNSPECIFIED` when the
+    /// description is absent).
+    color: ColorSignal,
+    /// §5.5.3 `time_scale / (num_units_in_display_tick ×
+    /// (num_ticks_per_picture_minus_1 + 1))`, only when
+    /// `equal_picture_interval` makes it a picture rate.
+    frame_rate: Option<Rational>,
+    /// §5.5.1 `max_frame_width_minus_1 + 1` × `max_frame_height_minus_1
+    /// + 1` — the size the stream announces before any frame header.
+    max_size: (u32, u32),
 }
 
-impl Av1Decoder {
-    /// The [`Layout`] `output_*` report: the frame last returned, or before
-    /// the first one the next queued frame.
-    fn reported_layout(&self) -> Option<Layout> {
-        let layout = self.last_output
-            .or_else(|| self.queue.front().map(|(_, layout)| *layout));
-        #[cfg(not(target_arch = "wasm32"))]
-        if layout.is_none() {
-            if let Some((w, h, depth, mono, sub_x, sub_y)) = self.parallel.as_ref().and_then(FrameThreadDecoder::next_frame_layout) {
-                use PixelFormat::*;
-                let family = if mono {
-                    [Gray8, Gray10Le, Gray12Le]
-                } else if sub_y && h.div_ceil(2) != h {
-                    [Yuv420P, Yuv420P10Le, Yuv420P12Le]
-                } else if sub_x && w.div_ceil(2) != w {
-                    [Yuv422P, Yuv422P10Le, Yuv422P12Le]
-                } else {
-                    [Yuv444P, Yuv444P10Le, Yuv444P12Le]
-                };
-                let format = match depth { 8 => Some(family[0]), 10 => Some(family[1]), 12 => Some(family[2]), _ => None };
-                return Some(((w, h), format));
+impl SeqShape {
+    fn of(seq: &SequenceHeader) -> Self {
+        let cc = &seq.color_config;
+        let pixel_format = emitted_pixel_format(
+            cc.bit_depth,
+            cc.mono_chrome,
+            cc.subsampling_x,
+            cc.subsampling_y,
+        );
+        let color = ColorSignal::from_code_points(
+            cc.color_primaries,
+            cc.transfer_characteristics,
+            cc.matrix_coefficients,
+            cc.color_range,
+        );
+        let frame_rate = seq.timing_info.as_ref().and_then(|t| {
+            if !t.equal_picture_interval || t.num_units_in_display_tick == 0 || t.time_scale == 0 {
+                return None;
             }
+            let ticks = u64::from(t.num_ticks_per_picture_minus_1.unwrap_or(0)) + 1;
+            let den = u64::from(t.num_units_in_display_tick) * ticks;
+            Some(Rational::new(i64::from(t.time_scale), den as i64).reduced())
+        });
+        Self {
+            pixel_format,
+            color,
+            frame_rate,
+            max_size: (
+                seq.max_frame_width_minus_1.saturating_add(1),
+                seq.max_frame_height_minus_1.saturating_add(1),
+            ),
         }
-        layout
+    }
+}
+
+/// The [`PixelFormat`] of the planes [`spec_frame_to_video_frame`]
+/// emits for a §5.5.2 colour configuration: `[Y]` alone for
+/// `mono_chrome`, else `[Y, U, V]` subsampled per `subsampling_x` /
+/// `subsampling_y`; one byte per sample at 8-bit, little-endian `u16`
+/// at 10 / 12-bit. `None` for a pairing AV1 does not define.
+fn emitted_pixel_format(bit_depth: u8, mono: bool, ss_x: bool, ss_y: bool) -> Option<PixelFormat> {
+    Some(match (bit_depth, mono, ss_x, ss_y) {
+        (8, true, ..) => PixelFormat::Gray8,
+        (10, true, ..) => PixelFormat::Gray10Le,
+        (12, true, ..) => PixelFormat::Gray12Le,
+        (8, false, true, true) => PixelFormat::Yuv420P,
+        (8, false, true, false) => PixelFormat::Yuv422P,
+        (8, false, false, false) => PixelFormat::Yuv444P,
+        (10, false, true, true) => PixelFormat::Yuv420P10Le,
+        (10, false, true, false) => PixelFormat::Yuv422P10Le,
+        (10, false, false, false) => PixelFormat::Yuv444P10Le,
+        (12, false, true, true) => PixelFormat::Yuv420P12Le,
+        (12, false, true, false) => PixelFormat::Yuv422P12Le,
+        (12, false, false, false) => PixelFormat::Yuv444P12Le,
+        _ => return None,
+    })
+}
+
+/// The layout an `av1C` record states (AV1 ISOBMFF Binding §2.3:
+/// `high_bitdepth` / `twelve_bit` / `monochrome` /
+/// `chroma_subsampling_x` / `_y` mirror the sequence header's
+/// §5.5.2 fields, `BitDepth` derived as there).
+fn config_record_pixel_format(cfg: &Av1CodecConfig) -> Option<PixelFormat> {
+    let bit_depth = match (cfg.seq_profile, cfg.high_bitdepth, cfg.twelve_bit) {
+        (2, true, true) => 12,
+        (_, true, _) => 10,
+        _ => 8,
+    };
+    emitted_pixel_format(
+        bit_depth,
+        cfg.monochrome,
+        cfg.chroma_subsampling_x,
+        cfg.chroma_subsampling_y,
+    )
+}
+
+/// The full output description of one emitted frame.
+#[derive(Clone, Copy, Debug)]
+struct OutputShape {
+    /// Luma plane size as emitted (`UpscaledWidth × FrameHeight`).
+    size: (u32, u32),
+    seq: SeqShape,
+}
+
+impl OutputShape {
+    /// Whether `self` and `other` describe the same output (the
+    /// announced maximum size is not part of the description).
+    fn same_output(&self, other: &Self) -> bool {
+        self.size == other.size
+            && self.seq.pixel_format == other.seq.pixel_format
+            && self.seq.color == other.seq.color
+            && self.seq.frame_rate == other.seq.frame_rate
+    }
+
+    fn to_params(self, codec_id: &CodecId) -> CodecParameters {
+        let mut p = CodecParameters::video(codec_id.clone());
+        p.width = Some(self.size.0);
+        p.height = Some(self.size.1);
+        p.pixel_format = self.seq.pixel_format;
+        p.frame_rate = self.seq.frame_rate;
+        p.color_signal = self.seq.color;
+        p
     }
 }
 
@@ -239,45 +331,18 @@ impl Decoder for Av1Decoder {
         &self.codec_id
     }
 
-    fn set_execution_context(&mut self, ctx: &ExecutionContext) {
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            if ctx.threads > 1 {
-                if let Some(parallel) = self.parallel.as_mut() {
-                    parallel.set_execution_context(ctx);
-                } else {
-                    self.parallel = Some(FrameThreadDecoder::new(&self.session, ctx));
-                }
-            } else if let Some(parallel) = self.parallel.take() {
-                match parallel.finish_into_session() {
-                    Ok((session, frames)) => {
-                        self.session = session;
-                        self.queue.extend(frames.into_iter().map(|(frame, pts)| {
-                            let layout = frame_layout(&frame);
-                            (spec_frame_to_video_frame(std::sync::Arc::unwrap_or_clone(frame), pts), layout)
-                        }));
-                    }
-                    Err(error) => self.pending_error = Some(CoreError::invalid(format!("oxideav-av1: {error}"))),
-                }
-            }
-        }
-        self.session.set_execution_context(ctx);
-    }
-
     fn send_packet(&mut self, packet: &Packet) -> CoreResult<()> {
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            if let Some(error) = self.pending_error.take() { return Err(error); }
-            if let Some(parallel) = self.parallel.as_mut() {
-                self.eof = false;
-                return parallel.send_packet(&packet.data, packet.pts)
-                    .map_err(|error| CoreError::invalid(format!("oxideav-av1: {error}")));
-            }
-        }
-        let mut push = |frames: Vec<SpecFrame>| {
+        // Each frame is queued with the sequence-header shape current
+        // right after its temporal unit decoded (a new coded video
+        // sequence starts with its header, ahead of its frames).
+        let push = |queue: &mut std::collections::VecDeque<_>,
+                    session: &SpecDecodeSession,
+                    frames: Vec<PendingSpecFrame>| {
+            let Some(shape) = session.sequence_header().map(SeqShape::of) else {
+                return;
+            };
             for frame in frames {
-                let layout = frame_layout(&frame);
-                self.queue.push_back((spec_frame_to_video_frame(frame, packet.pts), layout));
+                queue.push_back((frame, packet.pts, shape));
             }
         };
         if packet.data.len() >= 4 && &packet.data[..4] == IVF_MAGIC {
@@ -293,73 +358,76 @@ impl Decoder for Av1Decoder {
             for record in records {
                 let frames = self
                     .session
-                    .decode_temporal_unit(&record.payload)
+                    .decode_temporal_unit_pipelined(&record.payload)
                     .map_err(|e| CoreError::invalid(format!("oxideav-av1: {e}")))?;
-                push(frames);
+                push(&mut self.queue, &self.session, frames);
             }
         } else {
             // One §7.5 temporal-unit body per packet (the container
             // demuxer framing).
             let frames = self
                 .session
-                .decode_temporal_unit(&packet.data)
+                .decode_temporal_unit_pipelined(&packet.data)
                 .map_err(|e| CoreError::invalid(format!("oxideav-av1: {e}")))?;
-            push(frames);
+            push(&mut self.queue, &self.session, frames);
         }
+        // The session bounds the frames in flight on its workers.
         Ok(())
     }
 
     fn receive_frame(&mut self) -> CoreResult<CoreFrame> {
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            if let Some(error) = self.pending_error.take() { return Err(error); }
-            if self.queue.is_empty() {
-                if let Some(parallel) = self.parallel.as_mut() {
-                    return match parallel.receive_frame()
-                        .map_err(|error| CoreError::invalid(format!("oxideav-av1: {error}")))? {
-                        Some((frame, pts)) => {
-                            self.last_output = Some(frame_layout(&frame));
-                            Ok(CoreFrame::Video(spec_frame_to_video_frame(std::sync::Arc::unwrap_or_clone(frame), pts)))
-                        }
-                        None if self.eof => Err(CoreError::Eof),
-                        None => Err(CoreError::NeedMore),
-                    };
-                }
-            }
+        // The frame whose shape change was announced on the previous
+        // call comes out first.
+        if let Some(frame) = self.held.take() {
+            return Ok(CoreFrame::Video(frame));
         }
-        match self.queue.pop_front() {
-            Some((vf, layout)) => {
-                self.last_output = Some(layout);
-                Ok(CoreFrame::Video(vf))
-            }
-            None => {
-                if self.eof {
-                    Err(CoreError::Eof)
-                } else {
-                    Err(CoreError::NeedMore)
-                }
-            }
+        // A frame still decoding holds back the queue until the caller
+        // flushes (then it is waited for).
+        let ready = match self.queue.front() {
+            Some((f, _, _)) => self.eof || f.is_ready(),
+            None => false,
+        };
+        if !ready {
+            return Err(if self.eof && self.queue.is_empty() {
+                CoreError::Eof
+            } else {
+                CoreError::NeedMore
+            });
         }
-    }
-
-    fn output_video_dimensions(&self) -> Option<(u32, u32)> {
-        self.reported_layout()
-            .map(|(size, _)| size)
-            .filter(|&(w, h)| w > 0 && h > 0)
-    }
-
-    fn output_pixel_format(&self) -> Option<PixelFormat> {
-        self.reported_layout().and_then(|(_, format)| format)
+        let (frame, pts, seq) = self.queue.pop_front().expect("front checked above");
+        let frame = frame
+            .into_frame()
+            .map_err(|e| CoreError::invalid(format!("oxideav-av1: {e}")))?;
+        let size = frame
+            .plane_dims
+            .first()
+            .copied()
+            .unwrap_or((frame.width, frame.height));
+        let shape = OutputShape { size, seq };
+        // The first frame resolves the description (no bump, no
+        // event). A later frame of a different shape — a new sequence
+        // header's layout / colour signal / picture rate, or a new
+        // frame size (§5.9.5 / §5.9.7 / §5.9.8 superres, a §7.21
+        // `show_existing_frame` of a slot holding another size) — is
+        // announced first: the generation moves and a
+        // `Frame::StreamParams` event carrying the new description is
+        // returned, with the frame held for the next call. The queue is
+        // in output order, so every frame of the old shape (the ones
+        // still decoding included) has already been returned.
+        let changed = self.shown.is_some_and(|prev| !prev.same_output(&shape));
+        self.shown = Some(shape);
+        let video = spec_frame_to_video_frame(frame, pts);
+        if changed {
+            self.generation = self.generation.wrapping_add(1);
+            self.held = Some(video);
+            return Ok(CoreFrame::StreamParams(Box::new(
+                shape.to_params(&self.codec_id),
+            )));
+        }
+        Ok(CoreFrame::Video(video))
     }
 
     fn flush(&mut self) -> CoreResult<()> {
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            if let Some(error) = self.pending_error.take() { return Err(error); }
-            if let Some(parallel) = self.parallel.as_mut() {
-                parallel.flush().map_err(|error| CoreError::invalid(format!("oxideav-av1: {error}")))?;
-            }
-        }
         self.eof = true;
         Ok(())
     }
@@ -369,16 +437,74 @@ impl Decoder for Av1Decoder {
         // reference store (the landing point must be a KEY frame,
         // which rebuilds every slot); keep the cached sequence header
         // (containers need not repeat it mid-stream).
+        // A frame held behind its `StreamParams` event is dropped too:
+        // the event was returned, so `shown` (the shape the next
+        // frame is compared against) stays the announced one.
         self.queue.clear();
-        self.last_output = None;
+        self.held = None;
         self.session.reset_references();
         self.eof = false;
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            self.pending_error = None;
-            if let Some(parallel) = self.parallel.as_mut() { parallel.reset(); }
-        }
         Ok(())
+    }
+
+    /// The emitted frames' description: after a frame was returned,
+    /// that frame's size / layout / colour signal / §5.5.3 picture
+    /// rate (after a `Frame::StreamParams` event, the held frame's —
+    /// the event's payload is exactly this answer); before, the sequence header's (from the extradata
+    /// configuration OBUs or the first temporal unit), with the
+    /// §5.5.1 maximum frame size as the size; before any sequence
+    /// header, the layout alone from an `av1C` extradata record.
+    fn output_params(&self) -> Option<CodecParameters> {
+        let shape = self.shown.or_else(|| {
+            let seq = SeqShape::of(self.session.sequence_header()?);
+            Some(OutputShape {
+                size: seq.max_size,
+                seq,
+            })
+        });
+        match shape {
+            Some(shape) => Some(shape.to_params(&self.codec_id)),
+            None => {
+                let mut p = CodecParameters::video(self.codec_id.clone());
+                p.pixel_format = Some(self.config_pixel_format?);
+                Some(p)
+            }
+        }
+    }
+
+    /// The layout of the frame returned last (after a
+    /// `Frame::StreamParams` event, the held frame's); before the first
+    /// frame, the next queued frame's — not the newest sequence
+    /// header's, which may belong to a later coded video sequence —
+    /// and with nothing queued the [`Self::output_params`] answer.
+    fn output_pixel_format(&self) -> Option<PixelFormat> {
+        match (self.shown, self.queue.front()) {
+            (Some(shape), _) => shape.seq.pixel_format,
+            (None, Some((_, _, seq))) => seq.pixel_format,
+            (None, None) => self.output_params().and_then(|p| p.pixel_format),
+        }
+    }
+
+    /// `UpscaledWidth` × `FrameHeight` of the frame returned last (the
+    /// size FFmpeg's AV1 decoders output; the render size only sets the
+    /// aspect ratio); before the first frame, the next queued frame's,
+    /// known from its header while it may still be decoding.
+    fn output_video_dimensions(&self) -> Option<(u32, u32)> {
+        self.shown
+            .map(|shape| shape.size)
+            .or_else(|| self.queue.front().map(|(frame, _, _)| frame.dimensions()))
+            .filter(|&(w, h)| w > 0 && h > 0)
+    }
+
+    fn output_params_generation(&self) -> u64 {
+        self.generation
+    }
+
+    fn set_execution_context(&mut self, ctx: &ExecutionContext) {
+        // r475 — the worker budget: a multi-tile intra frame walks its
+        // tiles `threads`-wide and the post-filters run by row band,
+        // byte-identical to the serial decode for any budget.
+        self.session.set_threads(ctx.threads.max(1));
     }
 }
 
@@ -392,6 +518,8 @@ impl Decoder for Av1Decoder {
 /// stride (`width` samples × 1 or 2 bytes).
 fn spec_frame_to_video_frame(frame: SpecFrame, pts: Option<i64>) -> VideoFrame {
     let bytes_per_sample: usize = if frame.bit_depth > 8 { 2 } else { 1 };
+    // r475 — the plane bytes MOVE into the framework frame (the
+    // pre-r475 clone was a second copy of every output plane).
     let planes = frame
         .planes
         .into_iter()
@@ -429,6 +557,7 @@ fn spec_frame_to_video_frame(frame: SpecFrame, pts: Option<i64>) -> VideoFrame {
 /// sequence header repeated per temporal unit (an all-intra AV1
 /// video every packet of which is a sync sample).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Av1EncoderOptions {
     /// See the schema table.
     pub still: bool,
@@ -453,6 +582,62 @@ pub struct Av1EncoderOptions {
     /// explicit `tile_*_log2` was given; only matters when more than
     /// one thread runs).
     pub auto_tiles: bool,
+}
+
+impl Av1EncoderOptions {
+    /// Set `still`.
+    pub fn with_still(mut self, still: bool) -> Self {
+        self.still = still;
+        self
+    }
+
+    /// Set `base_q_idx`.
+    pub fn with_base_q_idx(mut self, base_q_idx: u8) -> Self {
+        self.base_q_idx = base_q_idx;
+        self
+    }
+
+    /// Set `speed`.
+    pub fn with_speed(mut self, speed: StillSpeed) -> Self {
+        self.speed = speed;
+        self
+    }
+
+    /// Set `tile_cols_log2`.
+    pub fn with_tile_cols_log2(mut self, tile_cols_log2: u32) -> Self {
+        self.tile_cols_log2 = tile_cols_log2;
+        self
+    }
+
+    /// Set `tile_rows_log2`.
+    pub fn with_tile_rows_log2(mut self, tile_rows_log2: u32) -> Self {
+        self.tile_rows_log2 = tile_rows_log2;
+        self
+    }
+
+    /// Set `full_range`.
+    pub fn with_full_range(mut self, full_range: bool) -> Self {
+        self.full_range = full_range;
+        self
+    }
+
+    /// Set `color_description`.
+    pub fn with_color_description(mut self, color_description: Option<(u8, u8, u8)>) -> Self {
+        self.color_description = color_description;
+        self
+    }
+
+    /// Set `threads`.
+    pub fn with_threads(mut self, threads: Option<usize>) -> Self {
+        self.threads = threads;
+        self
+    }
+
+    /// Set `auto_tiles`.
+    pub fn with_auto_tiles(mut self, auto_tiles: bool) -> Self {
+        self.auto_tiles = auto_tiles;
+        self
+    }
 }
 
 impl Av1EncoderOptions {
@@ -531,7 +716,7 @@ impl Av1EncoderOptions {
                 _ => {
                     return Err(CoreError::invalid(format!(
                         "oxideav-av1: unknown option {k:?}"
-                    )))
+                    )));
                 }
             }
         }
@@ -542,7 +727,7 @@ impl Av1EncoderOptions {
                 return Err(CoreError::invalid(
                     "oxideav-av1: color_primaries / transfer_characteristics / \
                      matrix_coefficients must be given together",
-                ))
+                ));
             }
         }
         if let Some(q) = quality {
@@ -623,11 +808,14 @@ pub fn make_encoder(params: &CodecParameters) -> CoreResult<Box<dyn Encoder>> {
         CoreError::invalid(format!("oxideav-av1: unsupported pixel format {pf:?}"))
     })?;
     let opts = Av1EncoderOptions::from_params(params)?;
-    // Probe the geometry the same way the encoder will (the r410 shape
-    // rules) so a bad size fails at construction, not at the first
-    // frame.
+    // Probe the geometry the same way the encoder will so a bad size
+    // fails at construction, not at the first frame. r487 — both
+    // arms of this encoder (the still and the all-intra KEY) code any
+    // extent (the picture is padded to the §5.9.5 mi grid and the
+    // true `frame_size` is coded), so the probe is the any-extent
+    // one; it used to demand multiples of 8 the encode never needed.
     YuvFrame::filled(width, height, bit_depth, format, 0)
-        .validate()
+        .validate_any_extent()
         .map_err(|e| CoreError::invalid(format!("oxideav-av1: unsupported geometry: {e}")))?;
     // The av1C fields follow from the pairing + size alone (the tool
     // gates the encoder opens do not appear in the record).
@@ -726,7 +914,9 @@ impl Av1Encoder {
                     out.extend(row.iter().map(|&b| u16::from(b)));
                 } else {
                     out.extend(
-                        row.chunks_exact(2)
+                        row.as_chunks::<2>()
+                            .0
+                            .iter()
                             .map(|c| u16::from_le_bytes([c[0], c[1]])),
                     );
                 }
@@ -767,10 +957,22 @@ impl Encoder for Av1Encoder {
     }
 
     fn send_frame(&mut self, frame: &CoreFrame) -> CoreResult<()> {
-        let CoreFrame::Video(vf) = frame else {
-            return Err(CoreError::invalid(
-                "oxideav-av1: encoder takes video frames",
-            ));
+        let vf = match frame {
+            CoreFrame::Video(vf) => vf,
+            // The coded size, layout and sequence header are fixed at
+            // construction (`output_params` / the `av1C` extradata
+            // already describe them), so a mid-stream input-shape
+            // change is not re-configured.
+            CoreFrame::StreamParams(_) => {
+                return Err(CoreError::unsupported(
+                    "oxideav-av1: encoder cannot re-configure for a mid-stream input-shape change",
+                ));
+            }
+            _ => {
+                return Err(CoreError::invalid(
+                    "oxideav-av1: encoder takes video frames",
+                ));
+            }
         };
         let input = self.to_yuv(vf)?;
         let opts = self.opts.still_options(self.thread_budget);
@@ -979,6 +1181,68 @@ mod tests {
         }
     }
 
+    /// r487 — the framework encoder takes any extent on both arms
+    /// (the still and the all-intra KEY), like the direct entries it
+    /// wraps: the packet equals the direct encode and decodes to its
+    /// reconstruction at the true extent. Zero and over-budget extents
+    /// still fail at construction.
+    #[test]
+    fn framework_encoder_takes_extents_off_the_mi_grid() {
+        for (w, h, pf) in [
+            (33u32, 17u32, PixelFormat::Yuv420P),
+            (34, 18, PixelFormat::Yuv420P10Le),
+            (36, 20, PixelFormat::Yuv444P),
+            (5, 9, PixelFormat::Gray8),
+        ] {
+            for still in ["true", "false"] {
+                let mut params = video_params(w, h, pf);
+                params.options.insert("still", still);
+                params.options.insert("quality", "70");
+                let mut enc = make_encoder(&params)
+                    .unwrap_or_else(|e| panic!("{w}x{h} {pf:?} still={still}: {e}"));
+                let (frame, yuv) = textured_frame(w, h, pf);
+                enc.send_frame(&CoreFrame::Video(frame)).expect("frame");
+                let pkt = enc.receive_packet().expect("packet");
+                let opts = Av1EncoderOptions::from_params(&params).unwrap();
+                let direct = if still == "true" {
+                    encode_still_yuv(&yuv, &opts.still_options(1))
+                } else {
+                    encode_key_frame_yuv_with_options(&yuv, &opts.still_options(1))
+                }
+                .expect("direct encode");
+                assert_eq!(direct.temporal_unit_bytes, pkt.data);
+                let mut dparams = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+                dparams.extradata = enc.output_params().extradata.clone();
+                let mut dec = make_decoder(&dparams).expect("decoder");
+                dec.send_packet(&pkt).expect("decodes");
+                let mut out = dec.receive_frame().expect("frame");
+                if matches!(out, CoreFrame::StreamParams(_)) {
+                    out = dec.receive_frame().expect("frame after stream params");
+                }
+                let CoreFrame::Video(out) = out else {
+                    panic!("video frame expected");
+                };
+                let bps = if opts_bit_depth(pf) > 8 { 2 } else { 1 };
+                let mut got = Vec::new();
+                for y in 0..h as usize {
+                    let row = &out.planes[0].data[y * out.planes[0].stride..][..w as usize * bps];
+                    if bps == 2 {
+                        got.extend(row.chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])));
+                    } else {
+                        got.extend(row.iter().map(|&b| u16::from(b)));
+                    }
+                }
+                assert_eq!(got, direct.recon_y, "{w}x{h} {pf:?} still={still}");
+            }
+        }
+        assert!(make_encoder(&video_params(0, 16, PixelFormat::Yuv420P)).is_err());
+        assert!(make_encoder(&video_params(16, 70000, PixelFormat::Yuv420P)).is_err());
+    }
+
+    fn opts_bit_depth(pf: PixelFormat) -> u8 {
+        pixel_format_layout(pf).expect("supported").0
+    }
+
     #[test]
     fn encoder_options_and_geometry_are_validated() {
         let mut params = video_params(16, 16, PixelFormat::Yuv420P);
@@ -1011,8 +1275,6 @@ mod tests {
     /// arm riding the same options. A budgeted 4-thread encode of a
     /// multi-tile still equals the direct 4-thread encode byte for
     /// byte, and the serial encode is the single-tile one.
-    // This test explicitly requests parallel encoder workers, unavailable in WASI.
-    #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn defaults_are_fast_and_auto_threaded_under_the_execution_budget() {
         let params = video_params(512, 256, PixelFormat::Yuv420P);
@@ -1097,7 +1359,7 @@ mod tests {
     /// same pixels.
     #[test]
     fn av1c_extradata_config_obus_seed_the_sequence_header() {
-        use crate::encoder::{encode_still_yuv420, StillOptions, Yuv420Frame};
+        use crate::encoder::{StillOptions, Yuv420Frame, encode_still_yuv420};
         use crate::obu::{ObuIter, ObuType};
         let mut frame = Yuv420Frame::filled(32, 16, 60);
         for (i, s) in frame.y.iter_mut().enumerate() {
@@ -1177,5 +1439,32 @@ mod tests {
             Some(CODEC_ID_STR),
             "Matroska V_AV1 must resolve to av1"
         );
+    }
+
+    /// §5.5.3 timing info states the picture rate only under
+    /// `equal_picture_interval`: `time_scale / (num_units_in_display_tick
+    /// × (num_ticks_per_picture_minus_1 + 1))`.
+    #[test]
+    fn timing_info_picture_rate() {
+        let mut seq =
+            crate::encoder::build_intra_only_seq_yuv(16, 16, 8, ChromaFormat::Yuv420).unwrap();
+        assert_eq!(SeqShape::of(&seq).frame_rate, None);
+        seq.timing_info = Some(crate::sequence_header::TimingInfo {
+            num_units_in_display_tick: 1001,
+            time_scale: 60_000,
+            equal_picture_interval: true,
+            num_ticks_per_picture_minus_1: Some(1),
+        });
+        assert_eq!(
+            SeqShape::of(&seq).frame_rate,
+            Some(Rational::new(30_000, 1001))
+        );
+        seq.timing_info = Some(crate::sequence_header::TimingInfo {
+            num_units_in_display_tick: 1,
+            time_scale: 25,
+            equal_picture_interval: false,
+            num_ticks_per_picture_minus_1: None,
+        });
+        assert_eq!(SeqShape::of(&seq).frame_rate, None);
     }
 }

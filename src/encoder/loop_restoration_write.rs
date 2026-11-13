@@ -16,17 +16,17 @@
 //! state ([`LrWriteState`]) so the emitted subexp codes reference the
 //! same value the decoder will, byte-for-byte.
 
+use crate::Error;
 use crate::cdf::{
-    count_units_in_frame_pub, round2_pub, LrParams, LrUnit, TileCdfContext, RESTORE_NONE,
-    RESTORE_SGRPROJ, RESTORE_SWITCHABLE, RESTORE_WIENER,
+    LrParams, LrUnit, RESTORE_NONE, RESTORE_SGRPROJ, RESTORE_SWITCHABLE, RESTORE_WIENER,
+    TileCdfContext, count_units_in_frame_pub, round2_pub,
 };
 use crate::encoder::symbol_writer::SymbolWriter;
 use crate::loop_restoration::{
-    SGRPROJ_PARAMS_BITS, SGRPROJ_PRJ_BITS, SGRPROJ_PRJ_SUBEXP_K, SGRPROJ_XQD_MAX, SGRPROJ_XQD_MID,
-    SGRPROJ_XQD_MIN, SGR_PARAMS, WIENER_COEFFS, WIENER_TAPS_K, WIENER_TAPS_MAX, WIENER_TAPS_MID,
-    WIENER_TAPS_MIN,
+    SGR_PARAMS, SGRPROJ_PARAMS_BITS, SGRPROJ_PRJ_BITS, SGRPROJ_PRJ_SUBEXP_K, SGRPROJ_XQD_MAX,
+    SGRPROJ_XQD_MID, SGRPROJ_XQD_MIN, WIENER_COEFFS, WIENER_TAPS_K, WIENER_TAPS_MAX,
+    WIENER_TAPS_MID, WIENER_TAPS_MIN,
 };
-use crate::Error;
 
 const MI_SIZE: u32 = 4;
 const SUPERRES_NUM: u32 = crate::frame_header::SUPERRES_NUM;
@@ -295,7 +295,7 @@ fn num_4x4_blocks_high(b_size: usize) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cdf::{PartitionWalker, TileGeometry, BLOCK_64X64};
+    use crate::cdf::{BLOCK_64X64, PartitionWalker, TileGeometry};
     use crate::symbol_decoder::SymbolDecoder;
 
     fn rt_geometry(mi_rows: u32, mi_cols: u32) -> TileGeometry {
@@ -345,7 +345,7 @@ mod tests {
         .unwrap();
         let bytes = writer.finish();
 
-        let mut walker = PartitionWalker::<i32>::new(16, 16, rt_geometry(16, 16)).unwrap();
+        let mut walker = PartitionWalker::new(16, 16, rt_geometry(16, 16)).unwrap();
         let mut dcdfs = TileCdfContext::new_from_defaults();
         let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
         let got = walker
@@ -384,7 +384,7 @@ mod tests {
         .unwrap();
         let bytes = writer.finish();
 
-        let mut walker = PartitionWalker::<i32>::new(16, 16, rt_geometry(16, 16)).unwrap();
+        let mut walker = PartitionWalker::new(16, 16, rt_geometry(16, 16)).unwrap();
         let mut dcdfs = TileCdfContext::new_from_defaults();
         let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
         let got = walker
@@ -417,7 +417,7 @@ mod tests {
         .unwrap();
         let bytes = writer.finish();
 
-        let mut walker = PartitionWalker::<i32>::new(16, 16, rt_geometry(16, 16)).unwrap();
+        let mut walker = PartitionWalker::new(16, 16, rt_geometry(16, 16)).unwrap();
         let mut dcdfs = TileCdfContext::new_from_defaults();
         let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
         let got = walker
@@ -454,7 +454,7 @@ mod tests {
         .unwrap();
         let bytes = writer.finish();
 
-        let mut walker = PartitionWalker::<i32>::new(16, 16, rt_geometry(16, 16)).unwrap();
+        let mut walker = PartitionWalker::new(16, 16, rt_geometry(16, 16)).unwrap();
         let mut dcdfs = TileCdfContext::new_from_defaults();
         let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
         let got = walker
@@ -496,7 +496,7 @@ mod tests {
         .unwrap();
         let bytes = writer.finish();
 
-        let mut walker = PartitionWalker::<i32>::new(16, 16, rt_geometry(16, 16)).unwrap();
+        let mut walker = PartitionWalker::new(16, 16, rt_geometry(16, 16)).unwrap();
         let mut dcdfs = TileCdfContext::new_from_defaults();
         let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
         // frame 64x64, unit 64 => exactly one unit row and col.
@@ -549,7 +549,7 @@ mod tests {
         .unwrap();
         let bytes = writer.finish();
 
-        let mut walker = PartitionWalker::<i32>::new(16, 16, rt_geometry(16, 16)).unwrap();
+        let mut walker = PartitionWalker::new(16, 16, rt_geometry(16, 16)).unwrap();
         let mut dcdfs = TileCdfContext::new_from_defaults();
         let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
         let got = walker
@@ -581,7 +581,7 @@ mod tests {
         )
         .unwrap();
         let bytes = writer.finish();
-        let mut walker = PartitionWalker::<i32>::new(16, 16, rt_geometry(16, 16)).unwrap();
+        let mut walker = PartitionWalker::new(16, 16, rt_geometry(16, 16)).unwrap();
         let mut dcdfs = TileCdfContext::new_from_defaults();
         let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
         walker
@@ -621,7 +621,7 @@ mod tests {
         let bytes = writer.finish();
         // exit_symbol pads to a minimal byte-aligned tail; the body must
         // carry no real symbols. The decode walker returns an empty set.
-        let mut walker = PartitionWalker::<i32>::new(16, 16, rt_geometry(16, 16)).unwrap();
+        let mut walker = PartitionWalker::new(16, 16, rt_geometry(16, 16)).unwrap();
         let mut dcdfs = TileCdfContext::new_from_defaults();
         let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
         let got = walker
@@ -688,7 +688,7 @@ mod tests {
         .unwrap();
         let bytes = writer.finish();
 
-        let mut walker = PartitionWalker::<i32>::new(16, 16, rt_geometry(16, 16)).unwrap();
+        let mut walker = PartitionWalker::new(16, 16, rt_geometry(16, 16)).unwrap();
         let mut dcdfs = TileCdfContext::new_from_defaults();
         let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
         walker
@@ -739,7 +739,7 @@ mod tests {
     /// any unit walk, so the distinct pre-CDEF `curr` value never leaks.
     #[test]
     fn bridge_restore_none_keeps_cdef_copy() {
-        let walker = PartitionWalker::<i32>::new(16, 16, rt_geometry(16, 16)).unwrap();
+        let walker = PartitionWalker::new(16, 16, rt_geometry(16, 16)).unwrap();
         let mut curr = vec![50i32; 32 * 32];
         let mut cdef = vec![175i32; 32 * 32];
         let mut lr = vec![0i32; 32 * 32];
@@ -812,7 +812,7 @@ mod tests {
         .unwrap();
         let bytes = writer.finish();
 
-        let mut walker = PartitionWalker::<i32>::new(16, 16, rt_geometry(16, 16)).unwrap();
+        let mut walker = PartitionWalker::new(16, 16, rt_geometry(16, 16)).unwrap();
         let mut dcdfs = TileCdfContext::new_from_defaults();
         let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
         walker
@@ -866,7 +866,7 @@ mod tests {
         let mut cdef_b = mk_grad();
         let mut lr_b = vec![0i32; 64 * 64];
         {
-            use crate::loop_restoration::{loop_restoration_frame, LoopRestorationFrameContext};
+            use crate::loop_restoration::{LoopRestorationFrameContext, loop_restoration_frame};
             let curr_buf = PlaneBuffer {
                 rows: 64,
                 cols: 64,

@@ -12,10 +12,11 @@
 
 use oxideav_av1::decoder::Frame;
 use oxideav_av1::encoder::{
-    encode_spatial_layered_gop_yuv420_with_q, encode_spatial_layered_gop_yuv420_with_q_inter_layer,
-    encode_spatial_temporal_layered_gop_yuv420_with_q, SpatialLayeredGop, Yuv420Frame,
+    SpatialLayeredGop, Yuv420Frame, encode_spatial_layered_gop_yuv420_with_q,
+    encode_spatial_layered_gop_yuv420_with_q_inter_layer,
+    encode_spatial_temporal_layered_gop_yuv420_with_q,
 };
-use oxideav_av1::frame_header::{parse_frame_header_with_refs, FrameType, RefInfo};
+use oxideav_av1::frame_header::{FrameType, RefInfo, parse_frame_header_with_refs};
 use oxideav_av1::obu::{ObuIter, ObuType};
 use oxideav_av1::sequence_header::parse_sequence_header;
 
@@ -114,9 +115,9 @@ fn pyramid_layers(n: usize, count: usize) -> Vec<Vec<Yuv420Frame>> {
 fn pyramid_layers_of(
     n: usize,
     count: usize,
-    gen: fn(u32, u32, usize) -> Yuv420Frame,
+    r#gen: fn(u32, u32, usize) -> Yuv420Frame,
 ) -> Vec<Vec<Yuv420Frame>> {
-    let top: Vec<Yuv420Frame> = (0..n).map(|t| gen(128, 128, t)).collect();
+    let top: Vec<Yuv420Frame> = (0..n).map(|t| r#gen(128, 128, t)).collect();
     let mut layers: Vec<Vec<Yuv420Frame>> = vec![top];
     for _ in 1..count {
         let lower: Vec<Yuv420Frame> = layers[0].iter().map(half).collect();
@@ -137,8 +138,8 @@ fn assert_every_operating_point(enc: &SpatialLayeredGop, n: usize) {
         let out = oxideav_av1::decode_av1_at_operating_point(&enc.ivf_bytes, p as u8)
             .unwrap_or_else(|e| panic!("op {p} ({sc}x{tc}) decode: {e:?}"));
         let mut expected: Vec<(usize, usize)> = Vec::new();
-        for i in 0..n {
-            if enc.temporal_ids[i] < tc {
+        for (i, &tid) in enc.temporal_ids.iter().enumerate().take(n) {
+            if tid < tc {
                 for s in 0..usize::from(sc) {
                     expected.push((i, s));
                 }
@@ -235,8 +236,8 @@ fn dump(enc: &SpatialLayeredGop, name: &str) {
             let mut yuv = Vec::new();
             for (i, &tid) in enc.temporal_ids.iter().enumerate() {
                 if tid < tc {
-                    for s in 0..usize::from(sc) {
-                        let rc = &enc.layer_recons[s][i];
+                    for layer in enc.layer_recons.iter().take(usize::from(sc)) {
+                        let rc = &layer[i];
                         yuv.extend_from_slice(&rc.y);
                         yuv.extend_from_slice(&rc.u);
                         yuv.extend_from_slice(&rc.v);

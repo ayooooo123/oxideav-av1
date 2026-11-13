@@ -31,10 +31,14 @@
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod frame_driver;
+mod inloop_pipeline;
+pub(crate) mod ref_planes;
 
-pub use frame_driver::{decode_av1_spec, decode_av1_spec_at_operating_point, SpecFrame};
 #[doc(hidden)]
-pub use frame_driver::{decode_frame_spec, SpecDecodeSession, MAX_PICTURE_SIZE};
+pub use frame_driver::{
+    DecodeStageTimings, MAX_PICTURE_SIZE, PendingSpecFrame, SpecDecodeSession, decode_frame_spec,
+};
+pub use frame_driver::{SpecFrame, decode_av1_spec, decode_av1_spec_at_operating_point};
 
 use crate::Error;
 

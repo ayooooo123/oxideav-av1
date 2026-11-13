@@ -1,319 +1,218 @@
-//! Clean-room §7.11 convolution, combination, and sample representation lanes.
+//! §7.11.3 prediction rows in explicit NEON lanes: the horizontal pass of
+//! the §7.11.3.4 convolution, and the §7.11.3.1 `Clip1` of one prediction
+//! and of the rounded average of two.
+//!
+//! Every kernel computes the integers the specification's process does:
+//! the convolution accumulates modulo 2^32 from widening 16-bit products
+//! (sums of at most eight products of a 16-bit sample and a 16-bit tap
+//! magnitude wrap exactly as the portable `i32` sums do, and no
+//! `Subpel_Filters` row can make either wrap), and the average halves
+//! before it rounds, so no input reaches a lane limit.
+//!
+//! The entry points are safe and report whether they ran: they check for
+//! NEON at run time (a constant on the AArch64 targets, where NEON is part
+//! of the baseline) and leave their outputs untouched when it is missing
+//! or the row is not one they handle, so the caller's portable code is
+//! the fallback.
 use core::arch::aarch64::*;
-use crate::loop_filter::Pixel;
 
-pub(super) fn horizontal<R: Pixel>(src: &[R], coeff: &[i32; 8], shift: u32, dst: &mut [i32], w: usize) {
-    assert!(src.len() >= w + 7 && dst.len() >= w);
-    assert!((1..32).contains(&shift));
-    let wide_end = if core::mem::size_of::<R>() <= 2 { w / 16 * 16 } else { 0 };
-    let end = w / 8 * 8;
-    let end4 = w / 4 * 4;
-    // SAFETY: each load covers only its output group and seven checked taps.
-    unsafe {
-        let offset = vdupq_n_s32(1 << (shift - 1));
-        let shifts = vdupq_n_s32(-(shift as i32));
-        for x in (0..wide_end).step_by(16) {
-            let (mut a0, mut a1, mut b0, mut b1) = (offset, offset, offset, offset);
-            for (k, &c) in coeff.iter().enumerate() {
-                if c == 0 { continue; }
-                let p = src.as_ptr().add(x + k);
-                let (a, b) = if core::mem::size_of::<R>() == 1 {
-                    let bytes = vld1q_u8(p.cast());
-                    (vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(bytes))), vreinterpretq_s16_u16(vmovl_high_u8(bytes)))
-                } else {
-                    (vreinterpretq_s16_u16(vld1q_u16(p.cast())), vreinterpretq_s16_u16(vld1q_u16(p.add(8).cast())))
-                };
-                a0 = vmlal_n_s16(a0, vget_low_s16(a), c as i16);
-                a1 = vmlal_high_n_s16(a1, a, c as i16);
-                b0 = vmlal_n_s16(b0, vget_low_s16(b), c as i16);
-                b1 = vmlal_high_n_s16(b1, b, c as i16);
-            }
-            vst1q_s32(dst.as_mut_ptr().add(x), vshlq_s32(a0, shifts));
-            vst1q_s32(dst.as_mut_ptr().add(x + 4), vshlq_s32(a1, shifts));
-            vst1q_s32(dst.as_mut_ptr().add(x + 8), vshlq_s32(b0, shifts));
-            vst1q_s32(dst.as_mut_ptr().add(x + 12), vshlq_s32(b1, shifts));
-        }
-        for x in (wide_end..end).step_by(8) {
-            let (mut lo, mut hi) = (offset, offset);
-            for (k, &c) in coeff.iter().enumerate() {
-                if c == 0 { continue; }
-                let p = src.as_ptr().add(x + k);
-                let s = if core::mem::size_of::<R>() == 1 {
-                    vreinterpretq_s16_u16(vmovl_u8(vld1_u8(p.cast())))
-                } else if core::mem::size_of::<R>() == 2 {
-                    vreinterpretq_s16_u16(vld1q_u16(p.cast()))
-                } else {
-                    vcombine_s16(vmovn_s32(vld1q_s32(p.cast())), vmovn_s32(vld1q_s32(p.add(4).cast())))
-                };
-                lo = vmlal_n_s16(lo, vget_low_s16(s), c as i16);
-                hi = vmlal_high_n_s16(hi, s, c as i16);
-            }
-            vst1q_s32(dst.as_mut_ptr().add(x), vshlq_s32(lo, shifts));
-            vst1q_s32(dst.as_mut_ptr().add(x + 4), vshlq_s32(hi, shifts));
-        }
-        for x in (end..end4).step_by(4) {
-            let mut sum = offset;
-            for (k, &c) in coeff.iter().enumerate() {
-                if c == 0 { continue; }
-                sum = vmlal_n_s16(sum, samples4(src.as_ptr().add(x + k)), c as i16);
-            }
-            vst1q_s32(dst.as_mut_ptr().add(x), vshlq_s32(sum, shifts));
-        }
+#[inline(always)]
+fn available() -> bool {
+    std::arch::is_aarch64_feature_detected!("neon")
+}
+
+/// One §7.11.3.4 tap as the widening multiply takes it: magnitude, and
+/// whether its products are subtracted.
+type Tap = (u16, bool);
+
+/// One output row of the §7.11.3.4 horizontal pass, `out[ c ] = Round2(
+/// sum_t k[ t ] * src[ c + t ], shift )` for `c in 0..out.len()`.
+///
+/// Runs for rows of a whole number of eight-sample groups (every block
+/// width from 8 up) whose taps fit 16 bits in magnitude (every
+/// `Subpel_Filters` tap does).
+#[inline]
+pub(super) fn convolve_row(k: &[i32; 8], src: &[u16], out: &mut [i32], shift: u32) -> bool {
+    let w = out.len();
+    if !available() || w == 0 || !w.is_multiple_of(8) || !(1..32).contains(&shift) {
+        return false;
     }
-    for x in end4..w {
-        let sum: i32 = (0..8).map(|k| coeff[k] * src[x + k].to_i32()).sum();
-        dst[x] = (sum + (1 << (shift - 1))) >> shift;
+    let mut taps: [Tap; 8] = [(0, false); 8];
+    for (tap, &c) in taps.iter_mut().zip(k) {
+        let Ok(magnitude) = u16::try_from(c.unsigned_abs()) else {
+            return false;
+        };
+        *tap = (magnitude, c < 0);
+    }
+    assert!(src.len() >= w + 7);
+    // SAFETY: NEON was detected above, `out` is a whole number of
+    // eight-sample groups and `src` holds the `w + 7` samples their taps read.
+    unsafe { convolve_row_neon(&taps, src, out, shift) };
+    true
+}
+
+/// `acc + tap * samples` in the low (`HIGH == false`) or high four lanes
+/// of `samples`, modulo 2^32.
+#[inline]
+#[target_feature(enable = "neon")]
+fn accumulate<const HIGH: bool>(acc: uint32x4_t, samples: uint16x8_t, tap: Tap) -> uint32x4_t {
+    match (HIGH, tap.1) {
+        (false, false) => vmlal_n_u16(acc, vget_low_u16(samples), tap.0),
+        (false, true) => vmlsl_n_u16(acc, vget_low_u16(samples), tap.0),
+        (true, false) => vmlal_high_n_u16(acc, samples, tap.0),
+        (true, true) => vmlsl_high_n_u16(acc, samples, tap.0),
     }
 }
 
-#[inline(always)]
-unsafe fn samples4<P: Pixel>(p: *const P) -> int16x4_t {
-    // SAFETY: callers prove four readable samples; AV1 samples fit signed i16.
-    unsafe {
-        if core::mem::size_of::<P>() == 1 {
-            vreinterpret_s16_u16(vget_low_u16(vmovl_u8(vcreate_u8(core::ptr::read_unaligned(p.cast::<u32>()) as u64))))
-        } else if core::mem::size_of::<P>() == 2 {
-            vreinterpret_s16_u16(vld1_u16(p.cast()))
+/// # Safety
+///
+/// `out.len()` must be a multiple of eight and `src.len() >= out.len() + 7`
+/// ([`convolve_row`] checks both).
+#[target_feature(enable = "neon")]
+unsafe fn convolve_row_neon(taps: &[Tap; 8], src: &[u16], out: &mut [i32], shift: u32) {
+    let w = out.len();
+    let (src, dst) = (src.as_ptr(), out.as_mut_ptr());
+    let bias = vdupq_n_u32(1 << (shift - 1));
+    let shifts = vdupq_n_s32(-(shift as i32));
+    let finish = |acc: uint32x4_t| vshlq_s32(vreinterpretq_s32_u32(acc), shifts);
+    let mut x = 0;
+    while x + 16 <= w {
+        let mut acc = [bias; 4];
+        for (t, &tap) in taps.iter().enumerate() {
+            // The six- and four-tap filter sets carry zero outer taps.
+            if tap.0 == 0 {
+                continue;
+            }
+            // SAFETY: the sixteen samples at `x + t` end at most at
+            // `x + 7 + 16 <= w + 7 <= src.len()`.
+            let (a, b) = unsafe { (vld1q_u16(src.add(x + t)), vld1q_u16(src.add(x + t + 8))) };
+            acc[0] = accumulate::<false>(acc[0], a, tap);
+            acc[1] = accumulate::<true>(acc[1], a, tap);
+            acc[2] = accumulate::<false>(acc[2], b, tap);
+            acc[3] = accumulate::<true>(acc[3], b, tap);
+        }
+        for (i, lanes) in acc.into_iter().enumerate() {
+            // SAFETY: `x + 16 <= w` outputs are writable.
+            unsafe { vst1q_s32(dst.add(x + 4 * i), finish(lanes)) };
+        }
+        x += 16;
+    }
+    if x + 8 <= w {
+        let mut acc = [bias; 2];
+        for (t, &tap) in taps.iter().enumerate() {
+            if tap.0 == 0 {
+                continue;
+            }
+            // SAFETY: the eight samples at `x + t` end at most at
+            // `x + 7 + 8 <= w + 7 <= src.len()`.
+            let a = unsafe { vld1q_u16(src.add(x + t)) };
+            acc[0] = accumulate::<false>(acc[0], a, tap);
+            acc[1] = accumulate::<true>(acc[1], a, tap);
+        }
+        for (i, lanes) in acc.into_iter().enumerate() {
+            // SAFETY: `x + 8 <= w` outputs are writable.
+            unsafe { vst1q_s32(dst.add(x + 4 * i), finish(lanes)) };
+        }
+    }
+}
+
+/// §7.11.3.1 `Clip1` of a single prediction: `out[ i ] = Clip3( 0, max,
+/// pred[ i ] )` for every `i` of `pred`, for a `max` a sample can hold.
+#[inline]
+pub(super) fn clip(max: i32, pred: &[i32], out: &mut [u16]) -> bool {
+    let Ok(max) = u16::try_from(max) else {
+        return false;
+    };
+    if !available() || out.len() < pred.len() {
+        return false;
+    }
+    // SAFETY: NEON was detected above.
+    unsafe { clip_neon(max, pred, &mut out[..pred.len()]) };
+    true
+}
+
+/// `Clip3( 0, max, v )` of eight 32-bit lanes: the narrowing saturates to
+/// `0 ..= 65535`, the minimum brings it under `max`.
+#[inline]
+#[target_feature(enable = "neon")]
+fn clip8(lo: int32x4_t, hi: int32x4_t, max: uint16x8_t) -> uint16x8_t {
+    vminq_u16(vcombine_u16(vqmovun_s32(lo), vqmovun_s32(hi)), max)
+}
+
+/// # Safety
+///
+/// Needs NEON only; `out` is as long as `pred` ([`clip`] slices it).
+#[target_feature(enable = "neon")]
+unsafe fn clip_neon(max: u16, pred: &[i32], out: &mut [u16]) {
+    let high = vdupq_n_u16(max);
+    let mut groups = pred.chunks_exact(8);
+    let mut outputs = out.chunks_exact_mut(8);
+    for (p, o) in groups.by_ref().zip(outputs.by_ref()) {
+        // SAFETY: each chunk holds exactly eight elements.
+        unsafe {
+            let p = p.as_ptr();
+            vst1q_u16(
+                o.as_mut_ptr(),
+                clip8(vld1q_s32(p), vld1q_s32(p.add(4)), high),
+            );
+        }
+    }
+    for (o, &p) in outputs.into_remainder().iter_mut().zip(groups.remainder()) {
+        *o = p.clamp(0, i32::from(max)) as u16;
+    }
+}
+
+/// §7.11.3.1 average of two predictions: `out[ i ] = Clip3( 0, max,
+/// Round2( a[ i ] + b[ i ], shift ) )` for every `i` of `a`, for a `max`
+/// a sample can hold.
+#[inline]
+pub(super) fn average(max: i32, shift: u32, a: &[i32], b: &[i32], out: &mut [u16]) -> bool {
+    let n = a.len();
+    let Ok(max) = u16::try_from(max) else {
+        return false;
+    };
+    if !available() || b.len() < n || out.len() < n || !(1..32).contains(&shift) {
+        return false;
+    }
+    // SAFETY: NEON was detected above.
+    unsafe { average_neon(max, shift, a, &b[..n], &mut out[..n]) };
+    true
+}
+
+/// # Safety
+///
+/// Needs NEON only; the three slices are equally long and `1 <= shift <
+/// 32` ([`average`] checks both).
+#[target_feature(enable = "neon")]
+unsafe fn average_neon(max: u16, shift: u32, a: &[i32], b: &[i32], out: &mut [u16]) {
+    let high = vdupq_n_u16(max);
+    // `Round2( a + b, shift )` without forming the 33-bit sum: the halving
+    // add is `floor( ( a + b ) / 2 )` (rounded up for `shift == 1`, which
+    // is the whole `Round2`), and rounding that by the remaining
+    // `shift - 1` bits equals rounding the sum by `shift`.
+    let rest = vdupq_n_s32(1 - shift as i32);
+    let round = |a: int32x4_t, b: int32x4_t| {
+        if shift == 1 {
+            vrhaddq_s32(a, b)
         } else {
-            vmovn_s32(vld1q_s32(p.cast()))
+            vrshlq_s32(vhaddq_s32(a, b), rest)
+        }
+    };
+    let mut lefts = a.chunks_exact(8);
+    let mut rights = b.chunks_exact(8);
+    let mut outputs = out.chunks_exact_mut(8);
+    for ((a, b), o) in lefts.by_ref().zip(rights.by_ref()).zip(outputs.by_ref()) {
+        // SAFETY: each chunk holds exactly eight elements.
+        unsafe {
+            let (a, b) = (a.as_ptr(), b.as_ptr());
+            let lo = round(vld1q_s32(a), vld1q_s32(b));
+            let hi = round(vld1q_s32(a.add(4)), vld1q_s32(b.add(4)));
+            vst1q_u16(o.as_mut_ptr(), clip8(lo, hi, high));
         }
     }
-}
-
-pub(super) fn vertical(src: &[i32], w: usize, r: usize, coeff: &[i32; 8], shift: u32, dst: &mut [i32]) {
-    assert!(src.len() >= (r + 8) * w && dst.len() >= w);
-    assert!((1..32).contains(&shift));
-    let end = w / 4 * 4;
-    // SAFETY: every vector stays within the eight checked rows and output row.
-    unsafe {
-        let offset = vdupq_n_s32(1 << (shift - 1));
-        let shifts = vdupq_n_s32(-(shift as i32));
-        for x in (0..end).step_by(4) {
-            let mut sum = offset;
-            for (k, &c) in coeff.iter().enumerate() {
-                if c == 0 { continue; }
-                sum = vmlaq_n_s32(sum, vld1q_s32(src.as_ptr().add((r + k) * w + x)), c);
-            }
-            vst1q_s32(dst.as_mut_ptr().add(x), vshlq_s32(sum, shifts));
-        }
+    let tail = lefts.remainder().iter().zip(rights.remainder());
+    for (o, (&a, &b)) in outputs.into_remainder().iter_mut().zip(tail) {
+        let sum = i64::from(a) + i64::from(b);
+        *o = ((sum + (1 << (shift - 1))) >> shift).clamp(0, i64::from(max)) as u16;
     }
-    for x in end..w {
-        let sum: i32 = (0..8).map(|k| coeff[k] * src[(r + k) * w + x]).sum();
-        dst[x] = (sum + (1 << (shift - 1))) >> shift;
-    }
-}
-
-#[inline(always)]
-unsafe fn store_samples<P: Pixel>(dst: *mut P, values: uint16x8_t) {
-    // SAFETY: callers prove eight writable samples. Pixel is sealed to
-    // u8/u16/i32; narrowing matches from_i32 and widening is exact.
-    unsafe {
-        if core::mem::size_of::<P>() == 1 {
-            vst1_u8(dst.cast(), vmovn_u16(values));
-        } else if core::mem::size_of::<P>() == 2 {
-            vst1q_u16(dst.cast(), values);
-        } else {
-            let dst = dst.cast::<i32>();
-            vst1q_s32(dst, vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(values))));
-            vst1q_s32(dst.add(4), vreinterpretq_s32_u32(vmovl_high_u16(values)));
-        }
-    }
-}
-
-pub(super) fn clip<P: Pixel>(depth: u8, src: &[i32], dst: &mut [P]) {
-    assert!(dst.len() >= src.len());
-    let end = src.len() / 8 * 8;
-    let max = (1 << depth) - 1;
-    // SAFETY: the destination covers the complete source; each iteration
-    // loads/stores exactly eight elements. Saturation is exactly Clip1.
-    unsafe {
-        let high = vdupq_n_s32(max);
-        for x in (0..end).step_by(8) {
-            let lo = vqmovun_s32(vminq_s32(high, vld1q_s32(src.as_ptr().add(x))));
-            let hi = vqmovun_s32(vminq_s32(high, vld1q_s32(src.as_ptr().add(x + 4))));
-            store_samples(dst.as_mut_ptr().add(x), vcombine_u16(lo, hi));
-        }
-    }
-    for x in end..src.len() { dst[x] = P::from_i32(src[x].clamp(0, max)); }
-}
-
-pub(super) fn average<P: Pixel>(depth: u8, shift: u32, a: &[i32], b: &[i32], dst: &mut [P]) {
-    assert!(a.len() <= b.len() && a.len() <= dst.len());
-    assert!((1..32).contains(&shift));
-    let end = a.len() / 8 * 8;
-    let max = (1 << depth) - 1;
-    // SAFETY: slices cover all eight lanes. Halving add avoids overflow
-    // even for full-range i32 inputs; for shift > 1, dropping the sum's
-    // low bit before the remaining rounded shift is algebraically exact.
-    unsafe {
-        let high = vdupq_n_s32(max);
-        let shifts = vdupq_n_s32(1 - shift as i32);
-        for x in (0..end).step_by(8) {
-            let mut v = [vdup_n_u16(0); 2];
-            for (half, value) in v.iter_mut().enumerate() {
-                let index = x + half * 4;
-                let av = vld1q_s32(a.as_ptr().add(index));
-                let bv = vld1q_s32(b.as_ptr().add(index));
-                let rounded = if shift == 1 { vrhaddq_s32(av, bv) }
-                    else { vrshlq_s32(vhaddq_s32(av, bv), shifts) };
-                *value = vqmovun_s32(vminq_s32(rounded, high));
-            }
-            store_samples(dst.as_mut_ptr().add(x), vcombine_u16(v[0], v[1]));
-        }
-    }
-    for x in end..a.len() {
-        dst[x] = P::from_i32((((i64::from(a[x]) + i64::from(b[x]) + (1i64 << (shift - 1))) >> shift) as i32).clamp(0, max));
-    }
-}
-
-#[inline(always)]
-pub(super) fn project_destinations(mv: [i32; 2], multipliers: &[i32; 8]) -> [[i16; 2]; 8] {
-    let mut out = [[0; 2]; 8];
-    // SAFETY: each multiplier load covers four of the eight entries; each
-    // interleaved store covers four two-component outputs. Wrapping products,
-    // signed rounding and the 15-bit clamp match the scalar projection.
-    unsafe {
-        for first in [0, 4] {
-            let multiplier = vld1q_s32(multipliers.as_ptr().add(first));
-            let components = mv.map(|value| {
-                let product = vmulq_n_s32(multiplier, value);
-                let magnitude = vshrq_n_s32::<14>(vaddq_s32(vabsq_s32(product), vdupq_n_s32(8192)));
-                let signed = vbslq_s32(vcltq_s32(product, vdupq_n_s32(0)), vnegq_s32(magnitude), magnitude);
-                vmovn_s32(vminq_s32(vdupq_n_s32(16383), vmaxq_s32(vdupq_n_s32(-16383), signed)))
-            });
-            let pairs = vzip_s16(components[0], components[1]);
-            vst1q_s16(out.as_mut_ptr().add(first).cast(), vcombine_s16(pairs.0, pairs.1));
-        }
-    }
-    out
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::inter_pred::{filter_8tap_h_scalar, filter_8tap_v_scalar, SUBPEL_FILTERS};
-    fn next(s: &mut u32) -> u32 { *s ^= *s << 13; *s ^= *s >> 17; *s ^= *s << 5; *s }
-    #[test]
-    fn destination_projection_matches_scalar_wrapping_and_rounding() {
-        let mut state = 0x71a49a31;
-        for case in 0..4096 {
-            let mv = if case < 7 {
-                let value = [-32768, -4095, -1, 0, 1, 4095, 32767][case];
-                [value, -value]
-            } else { [next(&mut state) as i16 as i32, next(&mut state) as i16 as i32] };
-            let multipliers = core::array::from_fn(|_| next(&mut state) as i32);
-            let actual = project_destinations(mv, &multipliers);
-            for (dst, &multiplier) in multipliers.iter().enumerate() {
-                let expected = mv.map(|value| {
-                    let product = value.wrapping_mul(multiplier);
-                    let magnitude = product.wrapping_abs().wrapping_add(8192) >> 14;
-                    let signed = if product < 0 { magnitude.wrapping_neg() } else { magnitude };
-                    signed.clamp(-16383, 16383) as i16
-                });
-                assert_eq!(actual[dst], expected, "case={case} dst={dst}");
-            }
-        }
-    }
-    #[test]
-    fn filters_match_scalar_all_phases_depths_and_widths() {
-        let mut state = 0x9e3ac5b1;
-        for depth in [8, 10, 12] {
-            let max = (1 << depth) - 1;
-            let round0 = if depth == 12 { 5 } else { 3 };
-            for w in 1..=129 {
-                for coeff in SUBPEL_FILTERS.iter().flatten() {
-                    for case in 0..5 {
-                        let src: Vec<u16> = (0..(w + 7) * 8).map(|i| match case {
-                            0 => 0, 1 => max, 2 => if i & 1 == 0 { 0 } else { max },
-                            _ => (next(&mut state) & u32::from(max)) as u16 }).collect();
-                        let mut expected = vec![0; w * 8];
-                        let mut actual = expected.clone();
-                        for r in 0..8 {
-                            filter_8tap_h_scalar(&src[r * (w + 7)..], coeff, round0, &mut expected[r * w..], w);
-                            horizontal(&src[r * (w + 7)..], coeff, round0, &mut actual[r * w..], w);
-                        }
-                        assert_eq!(actual, expected, "horizontal depth={depth} w={w}");
-                        if depth == 8 {
-                            let native: Vec<u8> = src.iter().map(|&v| v as u8).collect();
-                            let mut native_actual = vec![0; w * 8];
-                            for r in 0..8 {
-                                horizontal(&native[r * (w + 7)..], coeff, round0, &mut native_actual[r * w..], w);
-                            }
-                            assert_eq!(native_actual, expected, "native u8 horizontal w={w}");
-                        }
-                        for shift in [7, 9, 11] {
-                            let mut a = vec![0; w]; let mut b = a.clone();
-                            filter_8tap_v_scalar(&expected, w, 0, coeff, shift, &mut a);
-                            vertical(&actual, w, 0, coeff, shift, &mut b);
-                            assert_eq!(a, b, "vertical depth={depth} w={w} shift={shift}");
-                        }
-                    }
-                }
-            }
-        }
-    }
-    #[test]
-    fn combinations_match_full_range_scalar() {
-        let mut state = 0xa197c489;
-        for n in 0..=513 {
-            let a: Vec<i32> = (0..n).map(|i| match i % 8 { 0 => i32::MIN, 1 => i32::MAX,
-                2 => -1, 3 => 4095, _ => next(&mut state) as i32 }).collect();
-            let b: Vec<i32> = (0..n).map(|_| next(&mut state) as i32).collect();
-            for depth in [8, 10, 12] {
-                let max = (1 << depth) - 1;
-                let mut dst = vec![0; n]; clip(depth, &a, &mut dst);
-                assert_eq!(dst, a.iter().map(|&v| v.clamp(0, max) as u16).collect::<Vec<_>>());
-                let mut wide = vec![0i32; n];
-                clip(depth, &a, &mut wide);
-                assert_eq!(wide, dst.iter().map(|&v| i32::from(v)).collect::<Vec<_>>());
-                let mut native8 = vec![0u8; n];
-                if depth == 8 {
-                    clip(depth, &a, &mut native8);
-                    assert_eq!(native8, dst.iter().map(|&v| v as u8).collect::<Vec<_>>());
-                }
-                for shift in 1..=8 {
-                    average(depth, shift, &a, &b, &mut dst);
-                    let expected: Vec<u16> = a.iter().zip(&b).map(|(&a, &b)|
-                        (((i64::from(a) + i64::from(b) + (1 << (shift - 1))) >> shift) as i32).clamp(0, max) as u16).collect();
-                    assert_eq!(dst, expected);
-                    average(depth, shift, &a, &b, &mut wide);
-                    assert_eq!(wide, expected.iter().map(|&v| i32::from(v)).collect::<Vec<_>>());
-                    if depth == 8 {
-                        average(depth, shift, &a, &b, &mut native8);
-                        assert_eq!(native8, expected.iter().map(|&v| v as u8).collect::<Vec<_>>());
-                    }
-                }
-            }
-        }
-    }
-}
-
-pub(super) fn copy_round<R: Pixel>(src: &[R], dst: &mut [i32], shift: u32) {
-    assert!(src.len() >= dst.len() && (1..32).contains(&shift));
-    let end = dst.len() / 4 * 4;
-    // SAFETY: complete four-sample groups are checked before widening.
-    unsafe {
-        let offset = vdupq_n_s32(1 << (shift - 1));
-        let shifts = vdupq_n_s32(-(shift as i32));
-        for x in (0..end).step_by(4) {
-            let v = vshlq_n_s32::<7>(vmovl_s16(samples4(src.as_ptr().add(x))));
-            vst1q_s32(dst.as_mut_ptr().add(x), vshlq_s32(vaddq_s32(v, offset), shifts));
-        }
-    }
-    for x in end..dst.len() { dst[x] = (128 * src[x].to_i32() + (1 << (shift - 1))) >> shift; }
-}
-
-pub(super) fn finish(row: &mut [i32], shift: u32) {
-    assert!((1..32).contains(&shift));
-    let end = row.len() / 4 * 4;
-    // SAFETY: each in-place load/store covers four complete intermediates.
-    unsafe {
-        let offset = vdupq_n_s32(1 << (shift - 1));
-        let shifts = vdupq_n_s32(-(shift as i32));
-        for x in (0..end).step_by(4) {
-            let p = row.as_mut_ptr().add(x);
-            vst1q_s32(p, vshlq_s32(vaddq_s32(vshlq_n_s32::<7>(vld1q_s32(p)), offset), shifts));
-        }
-    }
-    for v in &mut row[end..] { *v = (128 * *v + (1 << (shift - 1))) >> shift; }
 }

@@ -13,8 +13,11 @@
 //! * Any §6.4.1 (bit depth, chroma format) pairing ([`YuvFrame`] —
 //!   8 / 10 / 12-bit × 4:2:0 / 4:2:2 / 4:4:4 / monochrome; the
 //!   historical [`Yuv420Frame`] entries widen into the same core),
-//!   dimensions per the KEY-frame rules (multiples of 8 in
-//!   `[8, KEY_FRAME_MAX_DIM]`). Under 4:2:2 the §5.11.38
+//!   any extent in `[1, KEY_FRAME_MAX_DIM]` per axis (r487: a picture
+//!   off the 8-sample grid is padded to the §5.9.5 mi grid, coded
+//!   under its true `frame_size`, and every reference plane is
+//!   replicated out from its true extent — the §7.11.3.3 fetch
+//!   clamp). Under 4:2:2 the §5.11.38
 //!   admissibility rule bars the tall partition shapes from the RD
 //!   ladder.
 //! * P-frame header: `error_resilient_mode = 1` (forcing
@@ -64,51 +67,52 @@
 //! syntax), §7.10.2 (MV prediction), §7.11.3 (inter prediction),
 //! §7.20 (reference frame update).
 
+use crate::Error;
 use crate::cdf::{
-    get_tx_size, inter_tx_type_set, tx_size_sqr_index, FindMvStackResult, PartitionWalker,
-    QuantizerParams, TileCdfContext, TileGeometry, BLOCK_4X4, BLOCK_64X64, BLOCK_8X8, DCT_DCT,
-    EIGHTTAP, GM_TYPE_IDENTITY, MAX_TX_SIZE_RECT, MAX_VARTX_DEPTH, MODE_GLOBALMV,
-    MODE_GLOBAL_GLOBALMV, MODE_NEARESTMV, MODE_NEAREST_NEARESTMV, MODE_NEARMV, MODE_NEAR_NEARMV,
-    MODE_NEWMV, MODE_NEW_NEWMV, MOTION_MODE_OBMC, MOTION_MODE_SIMPLE, MOTION_MODE_WARPED_CAUSAL,
-    NUM_4X4_BLOCKS_HIGH, NUM_4X4_BLOCKS_WIDE, PARTITION_HORZ, PARTITION_VERT, SPLIT_TX_SIZE,
-    SWITCHABLE, TX_4X4, TX_HEIGHT, TX_SIZE_SQR_UP, TX_WIDTH,
+    BLOCK_4X4, BLOCK_8X8, BLOCK_64X64, DCT_DCT, EIGHTTAP, FindMvStackResult, GM_TYPE_IDENTITY,
+    MAX_TX_SIZE_RECT, MAX_VARTX_DEPTH, MODE_GLOBAL_GLOBALMV, MODE_GLOBALMV, MODE_NEAR_NEARMV,
+    MODE_NEAREST_NEARESTMV, MODE_NEARESTMV, MODE_NEARMV, MODE_NEW_NEWMV, MODE_NEWMV,
+    MOTION_MODE_OBMC, MOTION_MODE_SIMPLE, MOTION_MODE_WARPED_CAUSAL, NUM_4X4_BLOCKS_HIGH,
+    NUM_4X4_BLOCKS_WIDE, PARTITION_HORZ, PARTITION_VERT, PartitionWalker, QuantizerParams,
+    SPLIT_TX_SIZE, SWITCHABLE, TX_4X4, TX_HEIGHT, TX_SIZE_SQR_UP, TX_WIDTH, TileCdfContext,
+    TileGeometry, get_tx_size, inter_tx_type_set, tx_size_sqr_index,
 };
 use crate::encoder::block_mode_info::assign_mv_pred_mv;
-use crate::encoder::ivf::{IvfWriter, FOURCC_AV01};
+use crate::encoder::ivf::{FOURCC_AV01, IvfWriter};
 use crate::encoder::key_frame::{
-    encode_leaf_sq, lambda_for, leaf_rate, region_distortion, region_distortion_wh, residual_tx,
-    restore_region, save_region, save_region_wh, tu_bd_stamp, BlockDecodedMirror, ReconState,
-    RegionSnapshot,
+    BlockDecodedMirror, ReconState, RegionSnapshot, encode_leaf_sq, lambda_for, leaf_rate,
+    region_distortion, region_distortion_wh, residual_tx, restore_region, save_region,
+    save_region_wh, tu_bd_stamp,
 };
-use crate::encoder::obu::{build_temporal_unit, ObuFrame};
+use crate::encoder::obu::{ObuFrame, build_temporal_unit};
 use crate::encoder::partition_tree::{
-    write_partition_tree_syntax, PartitionSyntaxWriter, SyntaxBlock, SyntaxFrameParams,
-    SyntaxInterBlock, SyntaxInterFrameParams, SyntaxNode, VarTxSyntaxTree,
+    PartitionSyntaxWriter, SyntaxBlock, SyntaxFrameParams, SyntaxInterBlock,
+    SyntaxInterFrameParams, SyntaxNode, VarTxSyntaxTree, write_partition_tree_syntax,
 };
-use crate::encoder::rate_twin::{score256, RateModel, RateTwin, TuCtx, TuFork};
+use crate::encoder::rate_twin::{RateModel, RateTwin, TuCtx, TuFork, score256};
 use crate::encoder::symbol_writer::SymbolWriter;
-use crate::encoder::tile_group_obu::{write_tile_group_obu, TileGroupObu, TilePayload};
+use crate::encoder::tile_group_obu::{TileGroupObu, TilePayload, write_tile_group_obu};
 use crate::encoder::yuv_frame::YuvFrame;
 use crate::encoder::yuv_frame::{
-    build_intra_only_yuv420_8bit_fh_with_q, sb_grid_origins, Yuv420Frame,
+    Yuv420Frame, build_intra_only_yuv420_8bit_fh_with_q, sb_grid_origins,
 };
 use crate::frame_header::{
-    FrameHeader, FrameType, InterFrameRefs, ALL_FRAMES_PUB, PRIMARY_REF_NONE,
+    ALL_FRAMES_PUB, FrameHeader, FrameType, InterFrameRefs, PRIMARY_REF_NONE,
 };
 use crate::inter_pred::{
-    reconstruct_inter_leaf_at, InterModeInfoGrid, PlaneReconContext, RefFrameStoreEntry,
+    InterModeInfoGrid, PlaneReconContext, RefFrameStoreEntry, reconstruct_inter_leaf_at,
 };
 use crate::obu::ObuType;
 use crate::sequence_header::SequenceHeader;
 use crate::uncompressed_header_tail::{
-    FilmGrainParams, InterpolationFilter, TxMode, REFS_PER_FRAME, TOTAL_REFS_PER_FRAME,
+    FilmGrainParams, InterpolationFilter, REFS_PER_FRAME, TOTAL_REFS_PER_FRAME, TxMode,
 };
 use crate::uncompressed_header_tail::{GOLDEN_FRAME, LAST_FRAME};
-use crate::Error;
 
 /// One frame's reconstructed planes (row-major; U/V at
 /// `(width/2) × (height/2)`).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct GopFrameRecon {
     /// Luma plane.
     pub y: Vec<u8>,
@@ -122,6 +126,7 @@ pub struct GopFrameRecon {
 /// at the stream's bit depth, chroma at the subsampled extent (empty
 /// on the monochrome arm).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct GopFrameReconYuv {
     /// Luma plane.
     pub y: Vec<u16>,
@@ -134,6 +139,7 @@ pub struct GopFrameReconYuv {
 /// r427 — result of [`encode_gop_yuv_with_q`]: the general-format
 /// sibling of [`EncodedGop`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct EncodedGopYuv {
     /// Complete IVF v0 file (header + one record per frame).
     pub ivf_bytes: Vec<u8>,
@@ -189,6 +195,7 @@ pub struct TunedGopYuv {
 
 /// Result of [`encode_gop_yuv420_with_q`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct EncodedGop {
     /// Complete IVF v0 file (header + one record per frame).
     pub ivf_bytes: Vec<u8>,
@@ -1848,13 +1855,13 @@ fn encode_gop_yuv_core_fg(
         let p_index = (k + 1) as u32;
         // r447 — the §5.9.2 SWITCH-frame cadence (see
         // [`GopTuning::s_frame_period`]).
-        let is_s = tuning.s_frame_period > 0 && p_index % tuning.s_frame_period == 0;
+        let is_s = tuning.s_frame_period > 0 && p_index.is_multiple_of(tuning.s_frame_period);
         // r450 — the CODED error-resilient cadence (see
         // [`GopTuning::error_resilient_period`]); an S-frame position
         // keeps the SWITCH shape (the flag is inferred there).
         let is_er = !is_s
             && tuning.error_resilient_period > 0
-            && p_index % tuning.error_resilient_period == 0;
+            && p_index.is_multiple_of(tuning.error_resilient_period);
         let prev = recon.last().expect("at least the KEY recon");
         // GOLDEN's slot holds frame `max(floor, p_index - 2)` (the
         // rotation refresher, unless the floor frame overwrote every
@@ -2112,6 +2119,7 @@ fn gop_order_hints(p_index: u32, order_hint_bits: u8) -> crate::cdf::FrameInterO
 /// generic frame encoder ([`encode_inter_frame_generic`]): the §5.9.2
 /// header fields that vary per pyramid role, the §7.20 slot state,
 /// and the RD ladder.
+#[derive(Clone)]
 pub(crate) struct InterFrameConfig<'a> {
     /// §5.9.2 `order_hint` — the frame's DISPLAY position.
     pub order_hint: u32,
@@ -2341,6 +2349,15 @@ pub(crate) struct InterFrameConfig<'a> {
     /// reference at the frame's extent (or the superres upscaled
     /// extent). Each reference must satisfy the §6.8.2 bounds.
     pub ref_dims: Vec<(u32, u32)>,
+    /// r487 — the CODED picture extent when `input` (and every
+    /// reference plane) is the §5.9.5 mi-grid-padded copy of a
+    /// picture whose extent is not a multiple of 8: the §5.9.5
+    /// `frame_size`, the §7.11.3.3 scale factors, the §6.8.2
+    /// reference bounds and the §7.17 restoration geometry carry THIS
+    /// extent while every plane buffer / RD walk runs at the padded
+    /// one. Set by [`encode_inter_frame_generic_gm`]; callers leave
+    /// it `None`.
+    pub coded_size: Option<(u32, u32)>,
 }
 
 /// r415 generic §5.9.2 INTER frame header — every pyramid role
@@ -2571,7 +2588,7 @@ pub(crate) fn segmentation_params_for_plan(
     extras: &SegExtras,
 ) -> crate::uncompressed_header_tail::SegmentationParams {
     use crate::uncompressed_header_tail::{
-        SegmentationParams, SEG_LVL_ALT_Q, SEG_LVL_GLOBALMV, SEG_LVL_REF_FRAME, SEG_LVL_SKIP,
+        SEG_LVL_ALT_Q, SEG_LVL_GLOBALMV, SEG_LVL_REF_FRAME, SEG_LVL_SKIP, SegmentationParams,
     };
     let mut sp = SegmentationParams::disabled();
     sp.enabled = true;
@@ -2735,6 +2752,7 @@ fn p_frame_config_primary<'a>(
         superres: None,
         superres_source: None,
         ref_dims: Vec::new(),
+        coded_size: None,
     }
 }
 
@@ -3019,7 +3037,122 @@ pub(crate) fn encode_inter_frame_generic_gm(
     ),
     Error,
 > {
+    let off_grid = |w: u32, h: u32| !w.is_multiple_of(8) || !h.is_multiple_of(8);
+    if cfg.coded_size.is_some()
+        || (!off_grid(input.width, input.height)
+            && !cfg.ref_dims.iter().any(|&(w, h)| off_grid(w, h)))
+    {
+        return encode_inter_frame_aligned(
+            input,
+            seq,
+            base_q_idx,
+            cfg,
+            alt_q,
+            mf_store,
+            model,
+            global_motion,
+        );
+    }
+    // r487 — ANY extent. §5.9.5 codes the true `FrameWidth` /
+    // `FrameHeight` and derives the mi grid by rounding up to 8
+    // samples; the decoder reconstructs every mi block in full, and
+    // §7.11.3.3 clamps every reference fetch to the reference's TRUE
+    // last column / row. So: the source is replicated out to the mi
+    // grid, every reference plane is replicated out from its true
+    // extent (replication IS that clamp, for any reader that clamps
+    // at the padded edge instead), the frame is coded under the true
+    // extent ([`InterFrameConfig::coded_size`]) and the returned
+    // reconstruction is cropped back. The §5.9.8 superres and
+    // exactness-demand arms keep the aligned contract.
+    input.validate_any_extent()?;
+    if cfg.superres.is_some() || cfg.superres_source.is_some() || cfg.exact_mask.is_some() {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    let ref_dims: Vec<(u32, u32)> = if cfg.ref_dims.is_empty() {
+        vec![(input.width, input.height); cfg.refs.len()]
+    } else {
+        cfg.ref_dims.clone()
+    };
+    if ref_dims.len() != cfg.refs.len() {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    let mut padded_refs: Vec<GopFrameReconYuv> = Vec::with_capacity(cfg.refs.len());
+    for (r, &(rw, rh)) in cfg.refs.iter().zip(&ref_dims) {
+        let view = YuvFrame {
+            width: rw,
+            height: rh,
+            bit_depth: input.bit_depth,
+            format: input.format,
+            y: r.y.clone(),
+            u: r.u.clone(),
+            v: r.v.clone(),
+        };
+        view.validate_any_extent()?;
+        let p = view.padded_to_mi_grid();
+        padded_refs.push(GopFrameReconYuv {
+            y: p.y,
+            u: p.u,
+            v: p.v,
+        });
+    }
+    let padded = input.padded_to_mi_grid();
+    let mut pcfg = cfg.clone();
+    pcfg.refs = padded_refs.iter().collect();
+    pcfg.ref_dims = ref_dims;
+    pcfg.coded_size = Some((input.width, input.height));
+    let (obus, mut rc, mf, carry, aux) = encode_inter_frame_aligned(
+        &padded,
+        seq,
+        base_q_idx,
+        &pcfg,
+        alt_q,
+        mf_store,
+        model,
+        global_motion,
+    )?;
+    let crop = |src: &[u16], sw: u32, w: u32, h: u32| -> Vec<u16> {
+        let (sw, w, h) = (sw as usize, w as usize, h as usize);
+        let mut out = Vec::with_capacity(w * h);
+        for y in 0..h {
+            out.extend_from_slice(&src[y * sw..y * sw + w]);
+        }
+        out
+    };
+    rc.y = crop(&rc.y, padded.width, input.width, input.height);
+    if input.format != crate::encoder::yuv_frame::ChromaFormat::Monochrome {
+        let (cw, ch) = (input.chroma_width(), input.chroma_height());
+        rc.u = crop(&rc.u, padded.chroma_width(), cw, ch);
+        rc.v = crop(&rc.v, padded.chroma_width(), cw, ch);
+    }
+    Ok((obus, rc, mf, carry, aux))
+}
+
+/// The mi-grid-aligned core behind [`encode_inter_frame_generic_gm`]:
+/// `input` and every reference plane sit at a multiple of 8 per axis
+/// (padded copies under [`InterFrameConfig::coded_size`]).
+#[allow(clippy::too_many_arguments)]
+fn encode_inter_frame_aligned(
+    input: &YuvFrame,
+    seq: &SequenceHeader,
+    base_q_idx: u8,
+    cfg: &InterFrameConfig<'_>,
+    alt_q: &[i16],
+    mf_store: &[SavedMotionField; 8],
+    model: RateModel,
+    global_motion: bool,
+) -> Result<
+    (
+        Vec<ObuFrame>,
+        GopFrameReconYuv,
+        SavedMotionField,
+        RefSlotCarry,
+        InterFrameAux,
+    ),
+    Error,
+> {
     input.validate()?;
+    // r487 — the coded (true) extent vs the padded plane extent.
+    let (coded_w, coded_h) = cfg.coded_size.unwrap_or((input.width, input.height));
     // r423 — a primary-reference election requires the §7.20 carry of
     // the elected slot and a valid ordinal (`0..7`).
     if cfg.primary_ref_frame != PRIMARY_REF_NONE
@@ -3102,25 +3235,29 @@ pub(crate) fn encode_inter_frame_generic_gm(
     }
     for (reference, &(rw, rh)) in cfg.refs.iter().zip(&ref_dims) {
         let (rw, rh) = (rw as usize, rh as usize);
+        // r487 — the plane buffers span the reference's mi grid (its
+        // extent rounded up to 8 samples).
+        let (pw, ph) = ((rw + 7) & !7, (rh + 7) & !7);
         // Monochrome references carry EMPTY chroma planes (the frame's
         // own `chroma_width()` / `chroma_height()` are 0 there).
         let (rcw, rch) = if mono {
             (0, 0)
         } else {
             (
-                (rw + usize::from(ssx)) >> ssx,
-                (rh + usize::from(ssy)) >> ssy,
+                (pw + usize::from(ssx)) >> ssx,
+                (ph + usize::from(ssy)) >> ssy,
             )
         };
+        let (cw, ch) = (coded_w as usize, coded_h as usize);
         if rw == 0
             || rh == 0
-            || reference.y.len() != rw * rh
+            || reference.y.len() != pw * ph
             || reference.u.len() != rcw * rch
             || reference.v.len() != rcw * rch
-            || 2 * width < rw
-            || 2 * height < rh
-            || width > 16 * rw
-            || height > 16 * rh
+            || 2 * cw < rw
+            || 2 * ch < rh
+            || cw > 16 * rw
+            || ch > 16 * rh
         {
             return Err(Error::PartitionWalkOutOfRange);
         }
@@ -3130,11 +3267,11 @@ pub(crate) fn encode_inter_frame_generic_gm(
     let mut scaled_per_ref = [false; 7];
     for (r, flag) in scaled_per_ref.iter_mut().enumerate() {
         let (rw, rh) = ref_dims[cfg.slot_to_plane[cfg.ref_frame_idx[r] as usize]];
-        *flag = crate::encoder::superres_elect::is_scaled(rw, rh, width as u32, height as u32);
+        *flag = crate::encoder::superres_elect::is_scaled(rw, rh, coded_w, coded_h);
     }
     let any_scaled = scaled_per_ref.iter().any(|&f| f);
 
-    let mut fh = build_inter_frame_fh(seq, input.width, input.height, base_q_idx, cfg, alt_q);
+    let mut fh = build_inter_frame_fh(seq, coded_w, coded_h, base_q_idx, cfg, alt_q);
     // r427 — the §5.11.46 palette election inside inter frames stays
     // 8-bit-4:2:0-scoped, like the KEY driver.
     fh.allow_screen_content_tools = fh.allow_screen_content_tools
@@ -3394,7 +3531,7 @@ pub(crate) fn encode_inter_frame_generic_gm(
     ip.use_ref_frame_mvs =
         seq.enable_order_hint && seq.enable_ref_frame_mvs && !fh.error_resilient_mode;
     if ip.use_ref_frame_mvs {
-        use crate::inter_pred::{motion_field_estimation_core, MotionFieldSlot};
+        use crate::inter_pred::{MotionFieldSlot, motion_field_estimation_core};
         let ref_frame_idx = cfg.ref_frame_idx;
         let mut order_hints = [0i32; 8];
         order_hints.copy_from_slice(&ip.order_hints.order_hints_by_ref);
@@ -3647,6 +3784,7 @@ pub(crate) fn encode_inter_frame_generic_gm(
                 mi_cols,
                 width,
                 height,
+                (coded_w, coded_h),
                 &ref_dims,
                 ip.clone(),
                 base_q_idx,
@@ -3784,12 +3922,11 @@ pub(crate) fn encode_inter_frame_generic_gm(
                     // delta on the wire), so the decoder's running index
                     // never moves — mirror that for the next superblock's
                     // step.
-                    if plan.is_some() {
-                        if let SyntaxNode::Leaf(b) = &tree {
-                            if b.skip == 1 {
-                                recon.qp.current_q_index = prev_q;
-                            }
-                        }
+                    if plan.is_some()
+                        && let SyntaxNode::Leaf(b) = &tree
+                        && b.skip == 1
+                    {
+                        recon.qp.current_q_index = prev_q;
                     }
                     trees.push(tree);
                 }
@@ -3906,12 +4043,12 @@ pub(crate) fn encode_inter_frame_generic_gm(
         for &lvl in &qm_arm_levels {
             let mut qp_m = qp;
             qp_m.using_qmatrix = true;
-            for plane in 0..3 {
-                for (seg, &ll) in seg_ll.iter().enumerate() {
+            for plane_levels in qp_m.seg_qm_level.iter_mut() {
+                for (level, &ll) in plane_levels.iter_mut().zip(seg_ll.iter()) {
                     // §5.9.2: a lossless segment's `SegQMLevel` is the
                     // no-QM sentinel 15; every other segment carries
                     // the coded `qm_y` / `qm_u` / `qm_v`.
-                    qp_m.seg_qm_level[plane][seg] = if ll { 15 } else { lvl };
+                    *level = if ll { 15 } else { lvl };
                 }
             }
             let mut params_m = params.clone();
@@ -4378,35 +4515,34 @@ pub(crate) fn encode_inter_frame_generic_gm(
             .and_then(|(_, c)| *c)
     };
     let mut donor_elected: Option<u32> = None;
-    if cfg.elect_donor {
-        if let Some(pc) = donor_src {
-            if pc.donor_cdfs.len() > 1 {
-                // Replay under the ELECTED params (hp updated
-                // `params.inter` in place; the temporal-seg arm
-                // swapped the tile without touching `params`, so
-                // mirror its flag here — same doctrine as the CDEF
-                // re-emission below).
-                let mut d_params = params.clone();
-                if let Some(ip) = d_params.inter.as_mut() {
-                    ip.segmentation_temporal_update = seg_temporal_elected;
-                }
-                for (tid, cand) in pc.donor_cdfs.iter().enumerate().skip(1) {
-                    let cand_start = || -> Box<TileCdfContext> {
-                        let mut loaded = cand.clone();
-                        loaded.zero_counts();
-                        loaded
-                    };
-                    let (cand_payloads, cand_all, cand_state) =
-                        emit_tiles(&trees, &d_params, &cand_start, None)?;
-                    let cand_body = assemble(&cand_payloads)?;
-                    if cand_body.len() < tile_bytes.len() {
-                        donor_elected = Some(tid as u32);
-                        tile_payloads = cand_payloads;
-                        tile_bytes = cand_body;
-                        all_cdfs = cand_all;
-                        state = cand_state;
-                    }
-                }
+    if cfg.elect_donor
+        && let Some(pc) = donor_src
+        && pc.donor_cdfs.len() > 1
+    {
+        // Replay under the ELECTED params (hp updated
+        // `params.inter` in place; the temporal-seg arm
+        // swapped the tile without touching `params`, so
+        // mirror its flag here — same doctrine as the CDEF
+        // re-emission below).
+        let mut d_params = params.clone();
+        if let Some(ip) = d_params.inter.as_mut() {
+            ip.segmentation_temporal_update = seg_temporal_elected;
+        }
+        for (tid, cand) in pc.donor_cdfs.iter().enumerate().skip(1) {
+            let cand_start = || -> Box<TileCdfContext> {
+                let mut loaded = cand.clone();
+                loaded.zero_counts();
+                loaded
+            };
+            let (cand_payloads, cand_all, cand_state) =
+                emit_tiles(&trees, &d_params, &cand_start, None)?;
+            let cand_body = assemble(&cand_payloads)?;
+            if cand_body.len() < tile_bytes.len() {
+                donor_elected = Some(tid as u32);
+                tile_payloads = cand_payloads;
+                tile_bytes = cand_body;
+                all_cdfs = cand_all;
+                state = cand_state;
             }
         }
     }
@@ -4491,8 +4627,12 @@ pub(crate) fn encode_inter_frame_generic_gm(
         lr_armed.then(|| (recon.y.clone(), recon.u.clone(), recon.v.clone()));
     let mut committed_cdef_bits: u32 = 0;
     let mut cdef_elected = false;
-    if cfg.cdef && !lossless && seq.enable_cdef && cfg.exact_mask.is_none() && !cfg.auto_lossless {
-        if let Some(election) =
+    if cfg.cdef
+        && !lossless
+        && seq.enable_cdef
+        && cfg.exact_mask.is_none()
+        && !cfg.auto_lossless
+        && let Some(election) =
             crate::encoder::cdef_elect::elect_cdef(&crate::encoder::cdef_elect::CdefElectInput {
                 mirror: state.mirror(),
                 input,
@@ -4512,115 +4652,114 @@ pub(crate) fn encode_inter_frame_generic_gm(
                 fast: None,
                 threads: 1,
             })
-        {
-            let lambda = crate::encoder::key_frame::lambda_for(&recon.qp);
-            let cdef_header_len = |cdef_params: &crate::uncompressed_header_tail::CdefParams| {
-                let mut fh_c = fh.clone();
-                fh_c.cdef_params = Some(*cdef_params);
-                let mut bw = crate::encoder::bitwriter::BitWriter::new();
-                crate::encoder::frame_obu::encode_uncompressed_header_with_prev_gm(
-                    &mut bw,
-                    &fh_c,
-                    seq,
-                    prev_gm_for_header.as_ref(),
-                );
-                bw.byte_align();
-                bw.finish().len()
-            };
-            let adopted: Option<crate::encoder::cdef_elect::CdefPlan>;
-            if election.best.params.cdef_bits > 0 {
-                let plan = &election.best;
-                let elected_ord = fh.primary_ref_frame;
-                // The elected params: hp updated `params.inter` in
-                // place; the temporal-seg arm swapped the tile without
-                // touching `params`, so mirror its flag here.
-                let mut re_params = params.clone();
-                if let Some(ip) = re_params.inter.as_mut() {
-                    ip.segmentation_temporal_update = seg_temporal_elected;
-                }
-                re_params.cdef_bits = u32::from(plan.params.cdef_bits);
-                // r431 — `plan.unit_idx` is frame-raster per 64×64
-                // unit; the trees ride tile-scan order — map through
-                // each tree's superblock origin.
-                let sb_cols_frame = mi_cols.div_ceil(16);
-                for (tree, &(sb_r, sb_c)) in trees.iter_mut().zip(flat_sb.iter()) {
-                    let k = ((sb_r / 16) * sb_cols_frame + (sb_c / 16)) as usize;
-                    tree.stamp_cdef_idx(plan.unit_idx[k].max(0));
-                }
-                let (re_payloads, re_cdfs, re_state) =
-                    emit_tiles(&trees, &re_params, &|| start_cdfs_for(elected_ord), None)?;
-                let re_body = assemble(&re_payloads)?;
-                // Exact-bytes settlement: per-unit vs the fallback arm
-                // (frame-level when it beats unfiltered, else the
-                // unfiltered default header) on the SAME `D + λ·R`
-                // scale the leaf ladders use.
-                let unit_score = plan.d * 256
-                    + lambda * 8 * 256 * ((cdef_header_len(&plan.params) + re_body.len()) as u64);
-                let (fb_d, fb_hdr) = match &election.frame_level {
-                    Some(p) => (p.d, cdef_header_len(&p.params)),
-                    None => (
-                        election.base_d,
-                        cdef_header_len(
-                            fh.cdef_params
-                                .as_ref()
-                                .expect("lossy inter header carries cdef params"),
-                        ),
+    {
+        let lambda = crate::encoder::key_frame::lambda_for(&recon.qp);
+        let cdef_header_len = |cdef_params: &crate::uncompressed_header_tail::CdefParams| {
+            let mut fh_c = fh.clone();
+            fh_c.cdef_params = Some(*cdef_params);
+            let mut bw = crate::encoder::bitwriter::BitWriter::new();
+            crate::encoder::frame_obu::encode_uncompressed_header_with_prev_gm(
+                &mut bw,
+                &fh_c,
+                seq,
+                prev_gm_for_header.as_ref(),
+            );
+            bw.byte_align();
+            bw.finish().len()
+        };
+        let adopted: Option<crate::encoder::cdef_elect::CdefPlan>;
+        if election.best.params.cdef_bits > 0 {
+            let plan = &election.best;
+            let elected_ord = fh.primary_ref_frame;
+            // The elected params: hp updated `params.inter` in
+            // place; the temporal-seg arm swapped the tile without
+            // touching `params`, so mirror its flag here.
+            let mut re_params = params.clone();
+            if let Some(ip) = re_params.inter.as_mut() {
+                ip.segmentation_temporal_update = seg_temporal_elected;
+            }
+            re_params.cdef_bits = u32::from(plan.params.cdef_bits);
+            // r431 — `plan.unit_idx` is frame-raster per 64×64
+            // unit; the trees ride tile-scan order — map through
+            // each tree's superblock origin.
+            let sb_cols_frame = mi_cols.div_ceil(16);
+            for (tree, &(sb_r, sb_c)) in trees.iter_mut().zip(flat_sb.iter()) {
+                let k = ((sb_r / 16) * sb_cols_frame + (sb_c / 16)) as usize;
+                tree.stamp_cdef_idx(plan.unit_idx[k].max(0));
+            }
+            let (re_payloads, re_cdfs, re_state) =
+                emit_tiles(&trees, &re_params, &|| start_cdfs_for(elected_ord), None)?;
+            let re_body = assemble(&re_payloads)?;
+            // Exact-bytes settlement: per-unit vs the fallback arm
+            // (frame-level when it beats unfiltered, else the
+            // unfiltered default header) on the SAME `D + λ·R`
+            // scale the leaf ladders use.
+            let unit_score = plan.d * 256
+                + lambda * 8 * 256 * ((cdef_header_len(&plan.params) + re_body.len()) as u64);
+            let (fb_d, fb_hdr) = match &election.frame_level {
+                Some(p) => (p.d, cdef_header_len(&p.params)),
+                None => (
+                    election.base_d,
+                    cdef_header_len(
+                        fh.cdef_params
+                            .as_ref()
+                            .expect("lossy inter header carries cdef params"),
                     ),
-                };
-                let fb_score = fb_d * 256 + lambda * 8 * 256 * ((fb_hdr + tile_bytes.len()) as u64);
-                if unit_score < fb_score {
-                    tile_payloads = re_payloads;
-                    tile_bytes = re_body;
-                    all_cdfs = re_cdfs;
-                    state = re_state;
-                    committed_cdef_bits = u32::from(plan.params.cdef_bits);
-                    debug_assert!(
-                        {
-                            let grid = state.mirror().cdef_idx();
-                            let sb_cols_dbg = mi_cols.div_ceil(16);
-                            plan.unit_idx.iter().enumerate().all(|(k, &idx)| {
-                                let (ur, uc) = (k as u32 / sb_cols_dbg, k as u32 % sb_cols_dbg);
-                                grid[((ur * 16) * mi_cols + uc * 16) as usize] == idx
-                            })
-                        },
-                        "re-emitted cdef_idx grid diverged from the elected plan"
-                    );
-                    adopted = Some(election.best);
-                } else {
-                    // The per-unit arm lost the settlement: the
-                    // original tile stands. Re-stamp the trees to id
-                    // 0 — a later re-emission (the LR election)
-                    // replays them at `cdef_bits = 0`, whose §5.11.56
-                    // range check rejects any stamped id > 0.
-                    for tree in trees.iter_mut() {
-                        tree.stamp_cdef_idx(0);
-                    }
-                    adopted = election.frame_level;
-                }
-            } else {
-                adopted = Some(election.best);
-            }
-            if let Some(plan) = adopted {
-                crate::encoder::cdef_elect::apply_cdef_plan(
-                    state.mirror(),
-                    &plan,
-                    input,
-                    &mut recon.y,
-                    &mut recon.u,
-                    &mut recon.v,
-                    width,
-                    height,
-                    chroma_w,
-                    chroma_h,
-                    bit_depth,
-                    ssx,
-                    ssy,
-                    num_planes,
-                    1,
+                ),
+            };
+            let fb_score = fb_d * 256 + lambda * 8 * 256 * ((fb_hdr + tile_bytes.len()) as u64);
+            if unit_score < fb_score {
+                tile_payloads = re_payloads;
+                tile_bytes = re_body;
+                all_cdfs = re_cdfs;
+                state = re_state;
+                committed_cdef_bits = u32::from(plan.params.cdef_bits);
+                debug_assert!(
+                    {
+                        let grid = state.mirror().cdef_idx();
+                        let sb_cols_dbg = mi_cols.div_ceil(16);
+                        plan.unit_idx.iter().enumerate().all(|(k, &idx)| {
+                            let (ur, uc) = (k as u32 / sb_cols_dbg, k as u32 % sb_cols_dbg);
+                            grid[((ur * 16) * mi_cols + uc * 16) as usize] == idx
+                        })
+                    },
+                    "re-emitted cdef_idx grid diverged from the elected plan"
                 );
-                fh.cdef_params = Some(plan.params);
-                cdef_elected = true;
+                adopted = Some(election.best);
+            } else {
+                // The per-unit arm lost the settlement: the
+                // original tile stands. Re-stamp the trees to id
+                // 0 — a later re-emission (the LR election)
+                // replays them at `cdef_bits = 0`, whose §5.11.56
+                // range check rejects any stamped id > 0.
+                for tree in trees.iter_mut() {
+                    tree.stamp_cdef_idx(0);
+                }
+                adopted = election.frame_level;
             }
+        } else {
+            adopted = Some(election.best);
+        }
+        if let Some(plan) = adopted {
+            crate::encoder::cdef_elect::apply_cdef_plan(
+                state.mirror(),
+                &plan,
+                input,
+                &mut recon.y,
+                &mut recon.u,
+                &mut recon.v,
+                width,
+                height,
+                chroma_w,
+                chroma_h,
+                bit_depth,
+                ssx,
+                ssy,
+                num_planes,
+                1,
+            );
+            fh.cdef_params = Some(plan.params);
+            cdef_elected = true;
         }
     }
 
@@ -4675,6 +4814,13 @@ pub(crate) fn encode_inter_frame_generic_gm(
         } else {
             (width, chroma_w, input)
         };
+    // r487 — the §7.17 geometry runs on the coded extent (the
+    // upscaled one on the superres arm, which is always on the grid).
+    let lr_frame_w = if cfg.superres.is_some() {
+        lr_w
+    } else {
+        coded_w as usize
+    };
     let mut lr_elected = false;
     if let Some((pcy, pcu, pcv)) = pre_cdef.as_ref() {
         let price_cdfs = start_cdfs_for(fh.primary_ref_frame);
@@ -4735,8 +4881,8 @@ pub(crate) fn encode_inter_frame_generic_gm(
                     lambda,
                     price_cdfs: &price_cdfs,
                     disable_cdf_update: fh.disable_cdf_update,
-                    frame_width: lr_w,
-                    frame_height: height,
+                    frame_width: lr_frame_w,
+                    frame_height: coded_h as usize,
                     sgr_step: 1,
                     unit_shift,
                     use_superres: cfg.superres.is_some(),
@@ -4770,7 +4916,7 @@ pub(crate) fn encode_inter_frame_generic_gm(
             let off = *off_score.get_or_insert(
                 plan.d_pre * 256 + lambda * 8 * 256 * ((off_hdr + tile_bytes.len()) as u64),
             );
-            if on_score < off && best_lr.as_ref().map_or(true, |b| on_score < b.5) {
+            if on_score < off && best_lr.as_ref().is_none_or(|b| on_score < b.5) {
                 best_lr = Some((plan, re_payloads, re_body, re_cdfs, re_state, on_score));
             }
         }
@@ -4798,8 +4944,8 @@ pub(crate) fn encode_inter_frame_generic_gm(
                 num_planes,
                 mi_rows,
                 mi_cols,
-                lr_w,
-                height,
+                lr_frame_w,
+                coded_h as usize,
             );
             debug_assert_eq!(
                 applied_d, plan.d,
@@ -5059,7 +5205,10 @@ struct PSearchCtx {
     mi_rows: u32,
     mi_cols: u32,
     luma_w: u32,
-    luma_h: u32,
+    /// r487 — the §5.9.5 coded `FrameWidth` / `FrameHeight` (equal to
+    /// the plane extent unless the picture is off the 8-sample grid).
+    coded_w: u32,
+    coded_h: u32,
     /// r456 — per-[`Self::ref_planes`] LUMA extents
     /// (`RefUpscaledWidth` / `RefFrameHeight` per §7.11.3.3); equal to
     /// `(luma_w, luma_h)` off the scaled arms (superres inter frames,
@@ -5242,6 +5391,7 @@ impl PSearchCtx {
             mi_cols,
             width,
             height,
+            (width as u32, height as u32),
             &[(width as u32, height as u32); 2],
             ip,
             base_q_idx,
@@ -5269,6 +5419,7 @@ impl PSearchCtx {
         mi_cols: u32,
         width: usize,
         height: usize,
+        coded: (u32, u32),
         ref_dims: &[(u32, u32)],
         ip: SyntaxInterFrameParams,
         base_q_idx: u8,
@@ -5303,21 +5454,23 @@ impl PSearchCtx {
             ref_frames[cell * 2] = 0; // INTRA_FRAME pre-fill
             ref_frames[cell * 2 + 1] = -1; // NONE
         }
-        let mirror = PartitionWalker::<i32>::new(mi_rows,
-        mi_cols,
-        TileGeometry {
-            mi_row_start: 0,
-            mi_row_end: mi_rows,
-            mi_col_start: 0,
-            mi_col_end: mi_cols,
-        },)
+        let mirror = PartitionWalker::new(
+            mi_rows,
+            mi_cols,
+            TileGeometry {
+                mi_row_start: 0,
+                mi_row_end: mi_rows,
+                mi_col_start: 0,
+                mi_col_end: mi_cols,
+            },
+        )
         .ok_or(Error::PartitionWalkOutOfRange)?;
         if ref_dims.len() != refs.len() {
             return Err(Error::PartitionWalkOutOfRange);
         }
         let scaled_of = |plane: usize| -> bool {
             let (rw, rh) = ref_dims[plane];
-            crate::encoder::superres_elect::is_scaled(rw, rh, width as u32, height as u32)
+            crate::encoder::superres_elect::is_scaled(rw, rh, coded.0, coded.1)
         };
         let search_planes: Vec<Option<Vec<u16>>> = refs
             .iter()
@@ -5325,13 +5478,32 @@ impl PSearchCtx {
             .map(|(plane, r)| {
                 scaled_of(plane).then(|| {
                     let (rw, rh) = ref_dims[plane];
-                    crate::encoder::superres_elect::resample_plane_bilinear(
-                        &r.y,
-                        rw as usize,
-                        rh as usize,
-                        width,
-                        height,
-                    )
+                    let (rw, rh) = (rw as usize, rh as usize);
+                    let (cw, ch) = (coded.0 as usize, coded.1 as usize);
+                    let stride = (rw + 7) & !7;
+                    if stride == rw && cw == width && ch == height {
+                        return crate::encoder::superres_elect::resample_plane_bilinear(
+                            &r.y, rw, rh, width, height,
+                        );
+                    }
+                    // r487 — off-grid extents: resample the TRUE
+                    // reference extent onto the TRUE coded extent,
+                    // then replicate out to the padded search plane.
+                    let mut tight = Vec::with_capacity(rw * rh);
+                    for y in 0..rh {
+                        tight.extend_from_slice(&r.y[y * stride..y * stride + rw]);
+                    }
+                    let rs = crate::encoder::superres_elect::resample_plane_bilinear(
+                        &tight, rw, rh, cw, ch,
+                    );
+                    let mut out = vec![0u16; width * height];
+                    for y in 0..height {
+                        let sy = y.min(ch - 1);
+                        for x in 0..width {
+                            out[y * width + x] = rs[sy * cw + x.min(cw - 1)];
+                        }
+                    }
+                    out
                 })
             })
             .collect();
@@ -5343,7 +5515,8 @@ impl PSearchCtx {
             mi_rows,
             mi_cols,
             luma_w: width as u32,
-            luma_h: height as u32,
+            coded_w: coded.0,
+            coded_h: coded.1,
             ref_dims: ref_dims.to_vec(),
             search_planes,
             bit_depth,
@@ -5650,11 +5823,7 @@ impl PSearchCtx {
         let prev_l = if avail_l { at(r, c - 1) } else { -1 };
         #[allow(clippy::if_same_then_else)]
         let pred: i32 = if prev_u == -1 {
-            if prev_l == -1 {
-                0
-            } else {
-                prev_l
-            }
+            if prev_l == -1 { 0 } else { prev_l }
         } else if prev_l == -1 {
             prev_u
         } else if prev_ul == prev_u {
@@ -6196,31 +6365,34 @@ impl PSearchCtx {
                 // the neutral pair matches the decode walker's output
                 // sample-for-sample regardless of the sequence's
                 // `enable_intra_edge_filter`.
-                PartitionWalker::<i32>::predict_intra_into_u16_plane(&read,
-                out,
-                pw,
-                (pw - 1) as u32,
-                (ph - 1) as u32,
-                base_x as u32,
-                base_y as u32,
-                tx_sz,
-                mode,
-                /* angle_delta = */ 0,
-                self.bit_depth,
-                avail_u,
-                avail_l,
-                have_ar,
-                have_bl,
-                /* enable_intra_edge_filter = */ false,
-                /* filter_type = */ 0,
-                /* filter_intra_mode = */ None,);
+                PartitionWalker::predict_intra_into_u16_plane(
+                    &read,
+                    out,
+                    pw,
+                    (pw - 1) as u32,
+                    (ph - 1) as u32,
+                    base_x as u32,
+                    base_y as u32,
+                    tx_sz,
+                    mode,
+                    /* angle_delta = */ 0,
+                    self.bit_depth,
+                    avail_u,
+                    avail_l,
+                    have_ar,
+                    have_bl,
+                    /* enable_intra_edge_filter = */ false,
+                    /* filter_type = */ 0,
+                    /* filter_intra_mode = */ None,
+                );
             }
         }
 
         // Field-split borrows: the grid views borrow the mode-info
         // vectors immutably while the plane contexts borrow the
         // scratch planes mutably.
-        let (luma_w, luma_h) = (self.luma_w, self.luma_h);
+        let luma_w = self.luma_w;
+        let (coded_w, coded_h) = (self.coded_w, self.coded_h);
         let (mi_rows, mi_cols) = (self.mi_rows, self.mi_cols);
         let slot_to_plane = self.slot_to_plane;
         let ref_frame_idx = self.ref_frame_idx;
@@ -6322,8 +6494,8 @@ impl PSearchCtx {
                 subsampling_x: 0,
                 subsampling_y: 0,
                 frame_store: &store_y,
-                frame_width: luma_w,
-                frame_height: luma_h,
+                frame_width: coded_w,
+                frame_height: coded_h,
                 curr: s0,
                 curr_stride: luma_w as usize,
             },
@@ -6332,8 +6504,8 @@ impl PSearchCtx {
                 subsampling_x: ssx,
                 subsampling_y: ssy,
                 frame_store: &store_u,
-                frame_width: luma_w,
-                frame_height: luma_h,
+                frame_width: coded_w,
+                frame_height: coded_h,
                 curr: s1,
                 curr_stride: (luma_w as usize) >> ssx,
             },
@@ -6342,8 +6514,8 @@ impl PSearchCtx {
                 subsampling_x: ssx,
                 subsampling_y: ssy,
                 frame_store: &store_v,
-                frame_width: luma_w,
-                frame_height: luma_h,
+                frame_width: coded_w,
+                frame_height: coded_h,
                 curr: s2,
                 curr_stride: (luma_w as usize) >> ssx,
             },
@@ -6377,7 +6549,8 @@ fn make_store<'a>(
             plane: &ref_planes[idx][plane],
             // r456 — the reference's OWN plane stride and extents
             // (§7.11.3.3 `RefUpscaledWidth` / `RefFrameHeight`).
-            stride: ((rw + u32::from(ssx)) >> ssx) as usize,
+            // r487 — plane buffers span the reference's mi grid.
+            stride: ((((rw + 7) & !7) + u32::from(ssx)) >> ssx) as usize,
             upscaled_width: rw,
             width: rw,
             height: rh,
@@ -6630,7 +6803,14 @@ fn encode_inter_leaf_base(
             None => Ok(p_leaf_rate(blk) * 256),
         }
     };
-    let d_normal = region_distortion_wh(recon, input, mi_r, mi_c, bw4, bh4);
+    let d_normal = region_distortion_wh(
+        recon,
+        &crate::encoder::key_frame::SourceView::whole(input),
+        mi_r,
+        mi_c,
+        bw4,
+        bh4,
+    );
     let score_normal = score256(d_normal, lambda, rate_of(&leaf)?);
     let after_normal = save_region_wh(recon, mi_r, mi_c, bw4, bh4);
 
@@ -6707,7 +6887,14 @@ fn encode_inter_leaf_base(
         // §5.11.27 line 1: skip-mode forces SIMPLE with no bits.
         motion_mode: MOTION_MODE_SIMPLE,
     });
-    let d_sm = region_distortion_wh(recon, input, mi_r, mi_c, bw4, bh4);
+    let d_sm = region_distortion_wh(
+        recon,
+        &crate::encoder::key_frame::SourceView::whole(input),
+        mi_r,
+        mi_c,
+        bw4,
+        bh4,
+    );
     let score_sm = score256(d_sm, lambda, rate_of(&sm_leaf)?);
     // On a lossless-segment leaf a skip-mode block (which can never
     // code a residual) is only admissible when its bare prediction is
@@ -6865,7 +7052,14 @@ fn seg_extras_trials(
             None => Ok(p_leaf_rate(blk) * 256),
         }
     };
-    let d_now = region_distortion_wh(recon, input, mi_r, mi_c, bw4, bh4);
+    let d_now = region_distortion_wh(
+        recon,
+        &crate::encoder::key_frame::SourceView::whole(input),
+        mi_r,
+        mi_c,
+        bw4,
+        bh4,
+    );
     let mut score_best = score256(d_now, lambda, rate_of(&best)?);
 
     // Arm 1 — SEG_LVL_REF_FRAME re-labelling (no pixel change).
@@ -7014,7 +7208,14 @@ fn seg_extras_trials(
                     &seg_qp,
                     pricing,
                 )?;
-                let d = region_distortion_wh(recon, input, mi_r, mi_c, bw4, bh4);
+                let d = region_distortion_wh(
+                    recon,
+                    &crate::encoder::key_frame::SourceView::whole(input),
+                    mi_r,
+                    mi_c,
+                    bw4,
+                    bh4,
+                );
                 let sc = score256(d, lambda, rate_of(&cand)?);
                 if inner.as_ref().map(|(_, _, s0)| sc < *s0).unwrap_or(true) {
                     inner = Some((cand, save_region_wh(recon, mi_r, mi_c, bw4, bh4), sc));
@@ -7025,7 +7226,14 @@ fn seg_extras_trials(
             restore_region(recon, mi_r, mi_c, &after_cand);
             cand
         };
-        let d = region_distortion_wh(recon, input, mi_r, mi_c, bw4, bh4);
+        let d = region_distortion_wh(
+            recon,
+            &crate::encoder::key_frame::SourceView::whole(input),
+            mi_r,
+            mi_c,
+            bw4,
+            bh4,
+        );
         let sc = score256(d, lambda, rate_of(&trial)?);
         if sc < score_best {
             score_best = sc;
@@ -7215,7 +7423,7 @@ fn encode_inter_leaf_modes(
                 let rate = 5 + ref_bias + u64::from(idx) + diff_bits(mv_new, pred);
                 let exact = price_mode([rf, -1], MODE_NEWMV, [mv_new, [0, 0]], idx, &stack)?;
                 let key = exact.unwrap_or(rate);
-                if best.map_or(true, |(k, _, _, _)| key < k) {
+                if best.is_none_or(|(k, _, _, _)| key < k) {
                     best = Some((key, idx, rate, exact));
                 }
             }
@@ -7329,7 +7537,7 @@ fn encode_inter_leaf_modes(
                     + diff_bits(pair_mv[1], pred1);
                 let exact = price_mode(crf, MODE_NEW_NEWMV, pair_mv, idx, &stack)?;
                 let key = exact.unwrap_or(rate);
-                if best.map_or(true, |(k, _, _, _)| key < k) {
+                if best.is_none_or(|(k, _, _, _)| key < k) {
                     best = Some((key, idx, rate, exact));
                 }
             }
@@ -7387,13 +7595,13 @@ fn encode_inter_leaf_modes(
             Some(b) => score256(ssd, lambda, b),
             None => ssd + lambda * cand.rate,
         };
-        if best.map_or(true, |(s, _)| score < s) {
+        if best.is_none_or(|(s, _)| score < s) {
             best = Some((score, ci));
         }
-        if cand.ref_frame[1] > 0 && best_compound.map_or(true, |(s, _)| score < s) {
+        if cand.ref_frame[1] > 0 && best_compound.is_none_or(|(s, _)| score < s) {
             best_compound = Some((score, ci));
         }
-        if cand.ref_frame[1] < 0 && best_single.map_or(true, |(s, _)| score < s) {
+        if cand.ref_frame[1] < 0 && best_single.is_none_or(|(s, _)| score < s) {
             best_single = Some((score, ci));
         }
     }
@@ -7406,93 +7614,41 @@ fn encode_inter_leaf_modes(
     // blend and scored `D + λ·(rate + side-data bits)` against the
     // running best (which keeps COMPOUND_AVERAGE when the masks lose).
     let mut comp = CompoundSel::AVERAGE;
-    if ictx.ip.enable_masked_compound {
-        if let Some((_, cci)) = best_compound {
-            let (c_ref, c_mode, c_mv, c_rate, c_bits256) = {
-                let c = &cands[cci];
-                (c.ref_frame, c.y_mode, c.mv, c.rate, c.bits256)
-            };
-            let mut trials: Vec<(CompoundSel, u64)> = Vec::new();
-            if crate::cdf::wedge_bits(b_size) > 0 {
-                for wi in 0..16u8 {
-                    for ws in 0..=1u8 {
-                        trials.push((
-                            CompoundSel {
-                                ctype: crate::inter_pred::COMPOUND_WEDGE,
-                                wedge_index: wi,
-                                wedge_sign: ws,
-                                mask_type: 0,
-                            },
-                            /* comp_group_idx + wedge_index S() + sign L(1) */ 6,
-                        ));
-                    }
-                }
-            }
-            for mt in 0..=1u8 {
-                trials.push((
-                    CompoundSel {
-                        ctype: crate::inter_pred::COMPOUND_DIFFWTD,
-                        wedge_index: 0,
-                        wedge_sign: 0,
-                        mask_type: mt,
-                    },
-                    /* comp_group_idx (+ compound_type S()) + mask L(1) */ 3,
-                ));
-            }
-            for (sel, extra) in trials {
-                ictx.predict_leaf(
-                    mi_r,
-                    mi_c,
-                    b_size,
-                    c_ref,
-                    c_mode,
-                    c_mv,
-                    EIGHTTAP,
-                    sel,
-                    None,
-                    MotionSel::Simple,
-                )?;
-                let mut ssd = 0u64;
-                for i in 0..bh {
-                    for j in 0..bw {
-                        let d = i64::from(input.y[(row0 + i) * width + col0 + j])
-                            - i64::from(ictx.scratch[0][(row0 + i) * width + col0 + j]);
-                        ssd += (d * d) as u64;
-                    }
-                }
-                // r422 — twin scale: the exact mode-prefix bits plus
-                // the side-symbol proxy promoted to 1/256 units.
-                let score = match c_bits256 {
-                    Some(b) => score256(ssd, lambda, b + extra * 256),
-                    None => ssd + lambda * (c_rate + extra),
-                };
-                if score < best_score {
-                    best_score = score;
-                    best_ci = cci;
-                    comp = sel;
+    if ictx.ip.enable_masked_compound
+        && let Some((_, cci)) = best_compound
+    {
+        let (c_ref, c_mode, c_mv, c_rate, c_bits256) = {
+            let c = &cands[cci];
+            (c.ref_frame, c.y_mode, c.mv, c.rate, c.bits256)
+        };
+        let mut trials: Vec<(CompoundSel, u64)> = Vec::new();
+        if crate::cdf::wedge_bits(b_size) > 0 {
+            for wi in 0..16u8 {
+                for ws in 0..=1u8 {
+                    trials.push((
+                        CompoundSel {
+                            ctype: crate::inter_pred::COMPOUND_WEDGE,
+                            wedge_index: wi,
+                            wedge_sign: ws,
+                            mask_type: 0,
+                        },
+                        /* comp_group_idx + wedge_index S() + sign L(1) */ 6,
+                    ));
                 }
             }
         }
-    }
-
-    // r416 — §5.11.29 jnt-comp trial on the best compound candidate:
-    // the COMPOUND_DISTANCE leaf (`comp_group_idx = 0`,
-    // `compound_idx = 0`) predicted through the decoder's own
-    // §7.11.3.15 distance-weighted blend. Rate-neutral against the
-    // coded AVERAGE arm (both code the same two §5.11.29 symbols), so
-    // luma distortion alone decides; ties keep the running best.
-    if ictx.ip.enable_jnt_comp {
-        if let Some((_, cci)) = best_compound {
-            let (c_ref, c_mode, c_mv, c_rate, c_bits256) = {
-                let c = &cands[cci];
-                (c.ref_frame, c.y_mode, c.mv, c.rate, c.bits256)
-            };
-            let sel = CompoundSel {
-                ctype: crate::inter_pred::COMPOUND_DISTANCE,
-                wedge_index: 0,
-                wedge_sign: 0,
-                mask_type: 0,
-            };
+        for mt in 0..=1u8 {
+            trials.push((
+                CompoundSel {
+                    ctype: crate::inter_pred::COMPOUND_DIFFWTD,
+                    wedge_index: 0,
+                    wedge_sign: 0,
+                    mask_type: mt,
+                },
+                /* comp_group_idx (+ compound_type S()) + mask L(1) */ 3,
+            ));
+        }
+        for (sel, extra) in trials {
             ictx.predict_leaf(
                 mi_r,
                 mi_c,
@@ -7513,15 +7669,67 @@ fn encode_inter_leaf_modes(
                     ssd += (d * d) as u64;
                 }
             }
+            // r422 — twin scale: the exact mode-prefix bits plus
+            // the side-symbol proxy promoted to 1/256 units.
             let score = match c_bits256 {
-                Some(b) => score256(ssd, lambda, b),
-                None => ssd + lambda * c_rate,
+                Some(b) => score256(ssd, lambda, b + extra * 256),
+                None => ssd + lambda * (c_rate + extra),
             };
             if score < best_score {
                 best_score = score;
                 best_ci = cci;
                 comp = sel;
             }
+        }
+    }
+
+    // r416 — §5.11.29 jnt-comp trial on the best compound candidate:
+    // the COMPOUND_DISTANCE leaf (`comp_group_idx = 0`,
+    // `compound_idx = 0`) predicted through the decoder's own
+    // §7.11.3.15 distance-weighted blend. Rate-neutral against the
+    // coded AVERAGE arm (both code the same two §5.11.29 symbols), so
+    // luma distortion alone decides; ties keep the running best.
+    if ictx.ip.enable_jnt_comp
+        && let Some((_, cci)) = best_compound
+    {
+        let (c_ref, c_mode, c_mv, c_rate, c_bits256) = {
+            let c = &cands[cci];
+            (c.ref_frame, c.y_mode, c.mv, c.rate, c.bits256)
+        };
+        let sel = CompoundSel {
+            ctype: crate::inter_pred::COMPOUND_DISTANCE,
+            wedge_index: 0,
+            wedge_sign: 0,
+            mask_type: 0,
+        };
+        ictx.predict_leaf(
+            mi_r,
+            mi_c,
+            b_size,
+            c_ref,
+            c_mode,
+            c_mv,
+            EIGHTTAP,
+            sel,
+            None,
+            MotionSel::Simple,
+        )?;
+        let mut ssd = 0u64;
+        for i in 0..bh {
+            for j in 0..bw {
+                let d = i64::from(input.y[(row0 + i) * width + col0 + j])
+                    - i64::from(ictx.scratch[0][(row0 + i) * width + col0 + j]);
+                ssd += (d * d) as u64;
+            }
+        }
+        let score = match c_bits256 {
+            Some(b) => score256(ssd, lambda, b),
+            None => ssd + lambda * c_rate,
+        };
+        if score < best_score {
+            best_score = score;
+            best_ci = cci;
+            comp = sel;
         }
     }
 
@@ -7537,28 +7745,64 @@ fn encode_inter_leaf_modes(
     let mut ii_sel: Option<(u8, Option<u8>)> = None;
     if ictx.ip.enable_interintra_compound
         && (crate::cdf::BLOCK_8X8..=crate::cdf::BLOCK_32X32).contains(&b_size)
+        && let Some((_, sci)) = best_single
     {
-        if let Some((_, sci)) = best_single {
-            let (s_ref, s_mode, s_mv, s_rate, s_bits256) = {
-                let c = &cands[sci];
-                (c.ref_frame, c.y_mode, c.mv, c.rate, c.bits256)
-            };
-            let leaf_ssd = |ictx: &PSearchCtx| -> u64 {
-                let mut ssd = 0u64;
-                for i in 0..bh {
-                    for j in 0..bw {
-                        let d = i64::from(input.y[(row0 + i) * width + col0 + j])
-                            - i64::from(ictx.scratch[0][(row0 + i) * width + col0 + j]);
-                        ssd += (d * d) as u64;
-                    }
+        let (s_ref, s_mode, s_mv, s_rate, s_bits256) = {
+            let c = &cands[sci];
+            (c.ref_frame, c.y_mode, c.mv, c.rate, c.bits256)
+        };
+        let leaf_ssd = |ictx: &PSearchCtx| -> u64 {
+            let mut ssd = 0u64;
+            for i in 0..bh {
+                for j in 0..bw {
+                    let d = i64::from(input.y[(row0 + i) * width + col0 + j])
+                        - i64::from(ictx.scratch[0][(row0 + i) * width + col0 + j]);
+                    ssd += (d * d) as u64;
                 }
-                ssd
+            }
+            ssd
+        };
+        // Stage 1 — the four smooth-mask II modes
+        // (`interintra` S() + `interintra_mode` S() +
+        // `wedge_interintra` S() ≈ 4 rate-proxy bits).
+        let mut stage: Option<(u64, u8)> = None;
+        for m in 0..crate::cdf::INTERINTRA_MODES as u8 {
+            ictx.predict_leaf(
+                mi_r,
+                mi_c,
+                b_size,
+                s_ref,
+                s_mode,
+                s_mv,
+                EIGHTTAP,
+                CompoundSel::AVERAGE,
+                Some(InterIntraTrial {
+                    mode: m,
+                    wedge: None,
+                    neigh: &*recon,
+                }),
+                MotionSel::Simple,
+            )?;
+            let ssd = leaf_ssd(ictx);
+            if stage.is_none_or(|(s, _)| ssd < s) {
+                stage = Some((ssd, m));
+            }
+            let score = match s_bits256 {
+                Some(b) => score256(ssd, lambda, b + 4 * 256),
+                None => ssd + lambda * (s_rate + 4),
             };
-            // Stage 1 — the four smooth-mask II modes
-            // (`interintra` S() + `interintra_mode` S() +
-            // `wedge_interintra` S() ≈ 4 rate-proxy bits).
-            let mut stage: Option<(u64, u8)> = None;
-            for m in 0..crate::cdf::INTERINTRA_MODES as u8 {
+            if score < best_score {
+                best_score = score;
+                best_ci = sci;
+                comp = CompoundSel::AVERAGE;
+                ii_sel = Some((m, None));
+            }
+        }
+        // Stage 2 — the 16 wedge masks at the stage-1 distortion
+        // winner (+ `wedge_index` S() ≈ 4 more bits).
+        if crate::cdf::wedge_bits(b_size) > 0 {
+            let (_, base_mode) = stage.expect("stage 1 ran");
+            for wi in 0..16u8 {
                 ictx.predict_leaf(
                     mi_r,
                     mi_c,
@@ -7569,58 +7813,21 @@ fn encode_inter_leaf_modes(
                     EIGHTTAP,
                     CompoundSel::AVERAGE,
                     Some(InterIntraTrial {
-                        mode: m,
-                        wedge: None,
+                        mode: base_mode,
+                        wedge: Some(wi),
                         neigh: &*recon,
                     }),
                     MotionSel::Simple,
                 )?;
-                let ssd = leaf_ssd(ictx);
-                if stage.map_or(true, |(s, _)| ssd < s) {
-                    stage = Some((ssd, m));
-                }
                 let score = match s_bits256 {
-                    Some(b) => score256(ssd, lambda, b + 4 * 256),
-                    None => ssd + lambda * (s_rate + 4),
+                    Some(b) => score256(leaf_ssd(ictx), lambda, b + 8 * 256),
+                    None => leaf_ssd(ictx) + lambda * (s_rate + 8),
                 };
                 if score < best_score {
                     best_score = score;
                     best_ci = sci;
                     comp = CompoundSel::AVERAGE;
-                    ii_sel = Some((m, None));
-                }
-            }
-            // Stage 2 — the 16 wedge masks at the stage-1 distortion
-            // winner (+ `wedge_index` S() ≈ 4 more bits).
-            if crate::cdf::wedge_bits(b_size) > 0 {
-                let (_, base_mode) = stage.expect("stage 1 ran");
-                for wi in 0..16u8 {
-                    ictx.predict_leaf(
-                        mi_r,
-                        mi_c,
-                        b_size,
-                        s_ref,
-                        s_mode,
-                        s_mv,
-                        EIGHTTAP,
-                        CompoundSel::AVERAGE,
-                        Some(InterIntraTrial {
-                            mode: base_mode,
-                            wedge: Some(wi),
-                            neigh: &*recon,
-                        }),
-                        MotionSel::Simple,
-                    )?;
-                    let score = match s_bits256 {
-                        Some(b) => score256(leaf_ssd(ictx), lambda, b + 8 * 256),
-                        None => leaf_ssd(ictx) + lambda * (s_rate + 8),
-                    };
-                    if score < best_score {
-                        best_score = score;
-                        best_ci = sci;
-                        comp = CompoundSel::AVERAGE;
-                        ii_sel = Some((base_mode, Some(wi)));
-                    }
+                    ii_sel = Some((base_mode, Some(wi)));
                 }
             }
         }
@@ -7818,37 +8025,36 @@ fn encode_inter_leaf_modes(
         if ictx.ip.allow_warped_motion
             && !ictx.ip.force_integer_mv
             && !ictx.ip.is_scaled_per_ref[(ref_frame[0] - 1) as usize]
+            && let Some(params) = ictx.warp_fit(mi_r, mi_c, b_size, ref_frame[0], mv)
         {
-            if let Some(params) = ictx.warp_fit(mi_r, mi_c, b_size, ref_frame[0], mv) {
-                ictx.predict_leaf(
-                    mi_r,
-                    mi_c,
-                    b_size,
-                    ref_frame,
-                    y_mode,
-                    mv,
-                    EIGHTTAP,
-                    comp,
-                    None,
-                    MotionSel::Warp(params),
-                )?;
-                let score = score256(
-                    leaf_luma_ssd(ictx),
-                    lambda,
-                    mm_bits(MOTION_MODE_WARPED_CAUSAL)?,
-                );
-                if score < best_score {
-                    motion = MotionSel::Warp(params);
-                    // `needs_interp_filter( ) == 0` on LOCALWARP —
-                    // the committed pair is the reader's bit-silent
-                    // derivation: EIGHTTAP on the SWITCHABLE arm, the
-                    // frame filter otherwise.
-                    filter = if ictx.ip.interpolation_filter != SWITCHABLE {
-                        ictx.ip.interpolation_filter
-                    } else {
-                        EIGHTTAP
-                    };
-                }
+            ictx.predict_leaf(
+                mi_r,
+                mi_c,
+                b_size,
+                ref_frame,
+                y_mode,
+                mv,
+                EIGHTTAP,
+                comp,
+                None,
+                MotionSel::Warp(params),
+            )?;
+            let score = score256(
+                leaf_luma_ssd(ictx),
+                lambda,
+                mm_bits(MOTION_MODE_WARPED_CAUSAL)?,
+            );
+            if score < best_score {
+                motion = MotionSel::Warp(params);
+                // `needs_interp_filter( ) == 0` on LOCALWARP —
+                // the committed pair is the reader's bit-silent
+                // derivation: EIGHTTAP on the SWITCHABLE arm, the
+                // frame filter otherwise.
+                filter = if ictx.ip.interpolation_filter != SWITCHABLE {
+                    ictx.ip.interpolation_filter
+                } else {
+                    EIGHTTAP
+                };
             }
         }
     }
@@ -7956,7 +8162,14 @@ fn encode_inter_leaf_modes(
             &seg_qp,
             pricing,
         )?;
-        let d = region_distortion_wh(recon, input, sr, sc, sw4, sh4);
+        let d = region_distortion_wh(
+            recon,
+            &crate::encoder::key_frame::SourceView::whole(input),
+            sr,
+            sc,
+            sw4,
+            sh4,
+        );
         // r421 — exact twin bits (the §5.11.17 depth symbols are part
         // of the block syntax, so no depth surcharge) or the pre-r421
         // proxy, one scale per call.
@@ -7981,44 +8194,52 @@ fn encode_inter_leaf_modes(
     // `D + λ·R` scale (twin bits when priced). The lossless arm wins
     // exactly when the ladder's distortion outprices the WHT chain's
     // rate premium.
-    if ictx.auto_lossless && ictx.synthetic_leaf(input, mi_r, mi_c, b_size) {
-        if let Some(ll_seg) = ictx.lossless_seg {
-            let ll_qp = ictx.seg_qp(&recon.qp, ll_seg);
-            let leaf = encode_inter_leaf_residual(
-                mi_r,
-                mi_c,
-                b_size,
-                input,
-                recon,
-                ictx,
-                ref_frame,
-                y_mode,
-                mv,
-                ref_mv_idx,
-                filter,
-                comp,
-                ii_sel,
-                motion.ordinal(),
-                0,
-                ll_seg,
-                &ll_qp,
-                pricing,
-            )?;
-            let d = region_distortion_wh(recon, input, sr, sc, sw4, sh4);
-            let rate256 = match pricing {
-                Some((twin, params)) => twin.price_block(&leaf, mi_r, mi_c, b_size, params)?,
-                None => p_leaf_rate(&leaf) * 256,
-            };
-            let score = score256(d, lambda, rate256);
-            let improves = match best.as_ref() {
-                Some((_, _, s)) => score < *s,
-                None => true,
-            };
-            if improves {
-                best = Some((leaf, save_region_wh(recon, sr, sc, sw4, sh4), score));
-            }
-            restore_region(recon, sr, sc, &before);
+    if ictx.auto_lossless
+        && ictx.synthetic_leaf(input, mi_r, mi_c, b_size)
+        && let Some(ll_seg) = ictx.lossless_seg
+    {
+        let ll_qp = ictx.seg_qp(&recon.qp, ll_seg);
+        let leaf = encode_inter_leaf_residual(
+            mi_r,
+            mi_c,
+            b_size,
+            input,
+            recon,
+            ictx,
+            ref_frame,
+            y_mode,
+            mv,
+            ref_mv_idx,
+            filter,
+            comp,
+            ii_sel,
+            motion.ordinal(),
+            0,
+            ll_seg,
+            &ll_qp,
+            pricing,
+        )?;
+        let d = region_distortion_wh(
+            recon,
+            &crate::encoder::key_frame::SourceView::whole(input),
+            sr,
+            sc,
+            sw4,
+            sh4,
+        );
+        let rate256 = match pricing {
+            Some((twin, params)) => twin.price_block(&leaf, mi_r, mi_c, b_size, params)?,
+            None => p_leaf_rate(&leaf) * 256,
+        };
+        let score = score256(d, lambda, rate256);
+        let improves = match best.as_ref() {
+            Some((_, _, s)) => score < *s,
+            None => true,
+        };
+        if improves {
+            best = Some((leaf, save_region_wh(recon, sr, sc, sw4, sh4), score));
         }
+        restore_region(recon, sr, sc, &before);
     }
     let (leaf, after, _) = best.expect("at least depth 0");
     restore_region(recon, sr, sc, &after);
@@ -8069,7 +8290,7 @@ fn transform_tree_tu_order(
 /// heuristic and the `RateModel::Heuristic` baseline).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn residual_tx_search_luma_inter(
-    input_plane: &[u16],
+    src: crate::encoder::key_frame::SrcPlane<'_>,
     recon_plane: &mut [u16],
     pw: usize,
     row0: usize,
@@ -8079,7 +8300,7 @@ pub(crate) fn residual_tx_search_luma_inter(
     qp: &QuantizerParams,
     fork: Option<(&mut TuFork, &TuCtx<'_>)>,
 ) -> Result<(Vec<i32>, u8), Error> {
-    use crate::cdf::{dequantize_step1, is_tx_type_in_set, tx_size_sqr_index, TX_SIZE_SQR_UP};
+    use crate::cdf::{TX_SIZE_SQR_UP, dequantize_step1, is_tx_type_in_set, tx_size_sqr_index};
     use crate::encoder::forward_quantize::forward_quantize;
     use crate::encoder::forward_transform_2d::forward_transform_2d;
     use crate::encoder::key_frame::repack_compact;
@@ -8092,7 +8313,7 @@ pub(crate) fn residual_tx_search_luma_inter(
     for i in 0..h {
         for j in 0..w {
             residual[i * w + j] =
-                i64::from(input_plane[(row0 + i) * pw + (col0 + j)]) - i64::from(pred[i * w + j]);
+                i64::from(src.at(row0 + i, col0 + j)) - i64::from(pred[i * w + j]);
         }
     }
     let set = inter_tx_type_set(
@@ -8132,7 +8353,7 @@ pub(crate) fn residual_tx_search_luma_inter(
             for j in 0..w {
                 let xx = if flip_lr { w - 1 - j } else { j };
                 let rec = (i64::from(pred[yy * w + xx]) + res_back[i * w + j]).clamp(0, max_val);
-                let diff = i64::from(input_plane[(row0 + yy) * pw + (col0 + xx)]) - rec;
+                let diff = i64::from(src.at(row0 + yy, col0 + xx)) - rec;
                 d += (diff * diff) as u64;
             }
         }
@@ -8319,7 +8540,7 @@ fn encode_inter_leaf_residual(
         let (q, tt) = if lossless {
             (
                 residual_tx(
-                    &input.y,
+                    crate::encoder::key_frame::SrcPlane::whole(&input.y, width),
                     &mut recon.y,
                     width,
                     tr,
@@ -8338,7 +8559,7 @@ fn encode_inter_leaf_residual(
             // the §5.11.48 INTER set for this TX size (r424: exact
             // chain pricing through the running fork when priced).
             residual_tx_search_luma_inter(
-                &input.y,
+                crate::encoder::key_frame::SrcPlane::whole(&input.y, width),
                 &mut recon.y,
                 width,
                 tr,
@@ -8399,6 +8620,9 @@ fn encode_inter_leaf_residual(
         2 + u32::from(recon.subsampling_x),
         2 + u32::from(recon.subsampling_y),
     );
+    // `plane` is the spec's plane subscript: it selects the scratch
+    // prediction, the reconstruction plane and the coefficient contexts.
+    #[allow(clippy::needless_range_loop)]
     for plane in 1..usize::from(recon.num_planes) {
         if !has_chroma {
             break;
@@ -8440,7 +8664,10 @@ fn encode_inter_leaf_residual(
                     &mut recon.v
                 };
                 let q = residual_tx(
-                    if plane == 1 { &input.u } else { &input.v },
+                    crate::encoder::key_frame::SrcPlane::whole(
+                        if plane == 1 { &input.u } else { &input.v },
+                        cw,
+                    ),
                     plane_buf,
                     cw,
                     tr,
@@ -8620,7 +8847,14 @@ fn encode_intra_candidate(
     pricing: Option<(&RateTwin, &SyntaxFrameParams)>,
 ) -> Result<SyntaxBlock, Error> {
     if !ictx.demands_exact(r, c, b_size) {
-        let mut leaf = encode_leaf_sq(r, c, b_size, input, recon, pricing)?;
+        let mut leaf = encode_leaf_sq(
+            r,
+            c,
+            b_size,
+            &crate::encoder::key_frame::SourceView::whole(input),
+            recon,
+            pricing,
+        )?;
         // r413 — a skip intra leaf inherits the §5.11.20 `pred`
         // (bit-silent); a coded intra leaf keeps segment 0 (its
         // residual ran at the frame quantiser — `alt_q[ 0 ] == 0`).
@@ -8653,7 +8887,7 @@ fn encode_intra_candidate(
         r,
         c,
         b_size,
-        input,
+        &crate::encoder::key_frame::SourceView::whole(input),
         recon,
         pricing,
         Some(ll_seg),
@@ -8731,7 +8965,14 @@ fn build_p_search_tree(
             b_size,
             ictx.seg_lossless(inter_leaf.segment_id),
         );
-        let d_inter = region_distortion_wh(recon, input, sr, sc, 2, 2);
+        let d_inter = region_distortion_wh(
+            recon,
+            &crate::encoder::key_frame::SourceView::whole(input),
+            sr,
+            sc,
+            2,
+            2,
+        );
         let h_rate_inter = p_leaf_rate(&inter_leaf);
         let node_inter = SyntaxNode::Leaf(Box::new(inter_leaf));
         let mut twin_inter = twin.clone();
@@ -8763,7 +9004,14 @@ fn build_p_search_tree(
             b_size,
             ictx.seg_lossless(intra_leaf.segment_id),
         );
-        let d_intra = region_distortion_wh(recon, input, sr, sc, 2, 2);
+        let d_intra = region_distortion_wh(
+            recon,
+            &crate::encoder::key_frame::SourceView::whole(input),
+            sr,
+            sc,
+            2,
+            2,
+        );
         let h_rate_intra = p_leaf_rate(&intra_leaf);
         let node_intra = SyntaxNode::Leaf(Box::new(intra_leaf));
         let mut twin_intra = twin.clone();
@@ -8877,7 +9125,13 @@ fn build_p_search_tree(
         b_size,
         ictx.seg_lossless(inter_leaf.segment_id),
     );
-    let d_inter = region_distortion(recon, input, r, c, n4 as usize);
+    let d_inter = region_distortion(
+        recon,
+        &crate::encoder::key_frame::SourceView::whole(input),
+        r,
+        c,
+        n4 as usize,
+    );
     let h_rate_inter = p_leaf_rate(&inter_leaf);
     let node_inter = SyntaxNode::Leaf(Box::new(inter_leaf));
     let mut twin_inter = twin.clone();
@@ -8914,7 +9168,13 @@ fn build_p_search_tree(
     // `RefFrames[ .. ][ 0 ] == INTRA_FRAME` on a committed intra
     // region, exactly as the decoder will.
     ictx.stamp_intra_leaf_grids(r, c, b_size, intra_leaf.y_mode);
-    let d_intra = region_distortion(recon, input, r, c, n4 as usize);
+    let d_intra = region_distortion(
+        recon,
+        &crate::encoder::key_frame::SourceView::whole(input),
+        r,
+        c,
+        n4 as usize,
+    );
     let h_rate_intra = p_leaf_rate(&intra_leaf);
     let node_intra = SyntaxNode::Leaf(Box::new(intra_leaf));
     let mut twin_intra = twin.clone();
@@ -9052,7 +9312,13 @@ fn build_p_search_tree(
             cost_shape += twin_shape.commit_block(&blk, rr, cc, sz, params)?;
             blocks.push(blk);
         }
-        let d = region_distortion(recon, input, r, c, n4 as usize);
+        let d = region_distortion(
+            recon,
+            &crate::encoder::key_frame::SourceView::whole(input),
+            r,
+            c,
+            n4 as usize,
+        );
         let bx = |b: SyntaxBlock| Box::new(b);
         let node = match part {
             PARTITION_HORZ | PARTITION_VERT => {
@@ -9177,7 +9443,13 @@ fn build_p_search_tree(
     )?;
     cost_split += c0 + c1 + c2 + c3;
     let children = [Box::new(nw), Box::new(ne), Box::new(sw), Box::new(se)];
-    let d_split = region_distortion(recon, input, r, c, n4 as usize);
+    let d_split = region_distortion(
+        recon,
+        &crate::encoder::key_frame::SourceView::whole(input),
+        r,
+        c,
+        n4 as usize,
+    );
     let h_rate_split = children.iter().map(|ch| p_tree_rate(ch)).sum::<u64>() + 4;
     let score_split = score_of(d_split, cost_split, h_rate_split);
 
@@ -10227,7 +10499,7 @@ mod tests {
         // Frame k: top 64x32 band shifts by (0, 2k); bottom-left
         // 32x32 by (2k, 0); bottom-right 32x32 by (2k, 2k) — the
         // HORZ_B geometry at BLOCK_64X64.
-        let gen = |k: usize| -> YuvFrame {
+        let r#gen = |k: usize| -> YuvFrame {
             let mut f = YuvFrame::filled(64, 64, 8, ChromaFormat::Yuv420, 0);
             let tex = |i: usize, j: usize| ((i * 7 + j * 13 + (i / 8) * (j / 8)) % 256) as u16;
             for i in 0..64usize {
@@ -10250,7 +10522,7 @@ mod tests {
             }
             f
         };
-        let frames: Vec<YuvFrame> = (0..3).map(gen).collect();
+        let frames: Vec<YuvFrame> = (0..3).map(r#gen).collect();
         let base_q_idx = 60u8;
         let pre = encode_gop_yuv_with_q(&frames[..1], base_q_idx).unwrap();
         let key_recon = GopFrameReconYuv {
@@ -10416,7 +10688,7 @@ mod tests {
             "P1 must store §7.19 motion-field candidates on moving content"
         );
 
-        use crate::inter_pred::{motion_field_estimation_core, MotionFieldSlot};
+        use crate::inter_pred::{MotionFieldSlot, motion_field_estimation_core};
         let mut slots: [Option<MotionFieldSlot<'_>>; 8] = [None; 8];
         let intra = SavedMotionField::intra(mi_rows, mi_cols);
         for (i, s) in slots.iter_mut().enumerate() {
@@ -10699,9 +10971,7 @@ mod tests {
             current_order_hint: 1,
             order_hints_by_ref: [0, 0, 0, 0, 0, 2, 2, 2],
         };
-        for r in 5..=7usize {
-            ip.ref_frame_sign_bias[r] = 1;
-        }
+        ip.ref_frame_sign_bias[5..=7].fill(1);
         ip.skip_mode_present = skip_mode;
         ip.skip_mode_frame = [1, 5];
         let mut slot_to_plane = [0usize; 8];
@@ -10720,6 +10990,7 @@ mod tests {
             mi_cols,
             (mi_cols * 4) as usize,
             (mi_rows * 4) as usize,
+            (mi_cols * 4, mi_rows * 4),
             &[(mi_cols * 4, mi_rows * 4); 2],
             ip,
             base_q_idx,
@@ -11701,9 +11972,9 @@ mod tests {
     /// BLOCK_4X4 leaves, and four-strip (HORZ_4 / VERT_4) nodes.
     fn count_sub8(node: &SyntaxNode, b_size: usize, n_sub8: &mut u32, n_4x4: &mut u32) {
         use crate::cdf::{
-            block_height, block_width, partition_subsize, BLOCK_4X4, PARTITION_HORZ,
-            PARTITION_HORZ_4, PARTITION_HORZ_A, PARTITION_HORZ_B, PARTITION_SPLIT, PARTITION_VERT,
-            PARTITION_VERT_4, PARTITION_VERT_A, PARTITION_VERT_B,
+            BLOCK_4X4, PARTITION_HORZ, PARTITION_HORZ_4, PARTITION_HORZ_A, PARTITION_HORZ_B,
+            PARTITION_SPLIT, PARTITION_VERT, PARTITION_VERT_4, PARTITION_VERT_A, PARTITION_VERT_B,
+            block_height, block_width, partition_subsize,
         };
         let leaf_hit = |sz: usize, n_sub8: &mut u32, n_4x4: &mut u32| {
             if block_width(sz) < 8 || block_height(sz) < 8 {

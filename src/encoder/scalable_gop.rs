@@ -57,14 +57,15 @@
 //! Spec provenance: `docs/video/av1/av1-spec.txt` §5.3.3, §5.5.1,
 //! §6.7.5, §7.5.
 
+use crate::Error;
 use crate::encoder::inter_frame::{
-    encode_inter_frame_generic, narrow_gop_8bit, EncodedGop, EncodedGopYuv, GopFrameReconYuv,
-    InterFrameConfig, RefSlotCarry, SavedMotionField,
+    EncodedGop, EncodedGopYuv, GopFrameReconYuv, InterFrameConfig, RefSlotCarry, SavedMotionField,
+    encode_inter_frame_generic, narrow_gop_8bit,
 };
-use crate::encoder::ivf::{IvfWriter, FOURCC_AV01};
+use crate::encoder::ivf::{FOURCC_AV01, IvfWriter};
 use crate::encoder::key_frame::encode_key_frame_yuv_seg_carry_tiles;
 use crate::encoder::obu::{
-    build_temporal_unit, write_obu_with_size, ObuExtensionHeader, ObuHeader,
+    ObuExtensionHeader, ObuHeader, build_temporal_unit, write_obu_with_size,
 };
 use crate::encoder::pyramid_gop::validate_gop_input;
 use crate::encoder::rate_twin::RateModel;
@@ -73,13 +74,13 @@ use crate::encoder::yuv_frame::{Yuv420Frame, YuvFrame};
 use crate::frame_header::PRIMARY_REF_NONE;
 use crate::obu::{ObuIter, ObuType};
 use crate::sequence_header::OperatingPoint;
-use crate::Error;
 use std::rc::Rc;
 
 /// [`EncodedGopYuv`] plus the per-display-frame `temporal_id` ladder
 /// the stream signals (index = display position; `temporal_ids[0] ==
 /// 0` — the KEY frame anchors the base layer).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct TemporalLayeredGopYuv {
     /// The encoded stream (IVF wrap + bare §7.5 temporal units +
     /// per-frame reconstructions + the emitted sequence header, which
@@ -91,6 +92,7 @@ pub struct TemporalLayeredGopYuv {
 
 /// 8-bit 4:2:0 sibling of [`TemporalLayeredGopYuv`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct TemporalLayeredGop {
     /// The encoded stream (see [`TemporalLayeredGopYuv::gop`]).
     pub gop: EncodedGop,
@@ -365,6 +367,7 @@ pub fn encode_temporal_layered_gop_yuv_with_q_tiles(
             superres: None,
             superres_source: None,
             ref_dims: Vec::new(),
+            coded_size: None,
         };
         let (mut obus, recon, saved, carry, aux) =
             encode_inter_frame_generic(&frames[i], &seq, q, &cfg, &[], &mf_store, RateModel::Twin)?;
@@ -460,6 +463,7 @@ pub fn encode_temporal_layered_gop_yuv_with_q_tiles(
 /// r431 — an encoded spatially scalable stream (see
 /// [`encode_spatial_layered_gop_yuv_with_q`]).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct SpatialLayeredGopYuv {
     /// Complete IVF v0 file (one record per §7.5 temporal unit).
     pub ivf_bytes: Vec<u8>,
@@ -488,6 +492,7 @@ pub struct SpatialLayeredGopYuv {
 
 /// 8-bit 4:2:0 sibling of [`SpatialLayeredGopYuv`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct SpatialLayeredGop {
     pub ivf_bytes: Vec<u8>,
     pub temporal_units: Vec<Vec<u8>>,
@@ -739,7 +744,9 @@ fn encode_spatial_layered_core(
             if f.width != w || f.height != h || f.bit_depth != bit_depth || f.format != format {
                 return Err(Error::PartitionWalkOutOfRange);
             }
-            f.validate()?;
+            // r487 — any extent: the per-frame drivers pad to the
+            // §5.9.5 mi grid and code the true extent.
+            f.validate_any_extent()?;
         }
     }
     let (top_w, top_h) = (layers[s_count - 1][0].width, layers[s_count - 1][0].height);
@@ -792,10 +799,10 @@ fn encode_spatial_layered_core(
                     ..Default::default()
                 },
             )?;
-            if let Some(fs) = pre.fh.frame_size.as_ref() {
-                if fs.use_superres {
-                    layer_sr[s] = Some((fs.upscaled_width, fs.superres_denom));
-                }
+            if let Some(fs) = pre.fh.frame_size.as_ref()
+                && fs.use_superres
+            {
+                layer_sr[s] = Some((fs.upscaled_width, fs.superres_denom));
             }
         }
     }
@@ -1094,6 +1101,7 @@ fn encode_spatial_layered_core(
                 superres: None,
                 superres_source: None,
                 ref_dims: il_ref_dims,
+                coded_size: None,
             };
             // r456 — per-temporal-layer quantiser offset (anchors
             // finest, leaves coarsest; inert on the pure spatial
@@ -1141,10 +1149,10 @@ fn encode_spatial_layered_core(
                     ctx_update_span: None,
                 });
                 for slot in carry_store.iter_mut() {
-                    if let Some(c) = slot {
-                        if Rc::ptr_eq(c, &last_carry) {
-                            *slot = Some(fixed.clone());
-                        }
+                    if let Some(c) = slot
+                        && Rc::ptr_eq(c, &last_carry)
+                    {
+                        *slot = Some(fixed.clone());
                     }
                 }
             }

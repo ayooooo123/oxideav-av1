@@ -96,25 +96,25 @@
 
 use std::rc::Rc;
 
+use crate::Error;
 use crate::cdf::QuantizerParams;
 use crate::encoder::film_grain_elect::grain_seed_for;
 use crate::encoder::frame_obu::write_frame_header_obu;
 use crate::encoder::inter_frame::{
-    elect_film_grain, encode_inter_frame_generic, narrow_gop_8bit, EncodedGop, EncodedGopYuv,
-    GopFrameReconYuv, InterFrameConfig, RefSlotCarry, SavedMotionField, GOP_MAX_FRAMES,
+    EncodedGop, EncodedGopYuv, GOP_MAX_FRAMES, GopFrameReconYuv, InterFrameConfig, RefSlotCarry,
+    SavedMotionField, elect_film_grain, encode_inter_frame_generic, narrow_gop_8bit,
 };
-use crate::encoder::ivf::{IvfWriter, FOURCC_AV01};
-use crate::encoder::key_frame::lambda_for;
+use crate::encoder::ivf::{FOURCC_AV01, IvfWriter};
 use crate::encoder::key_frame::KeyExtras;
-use crate::encoder::obu::{build_temporal_unit, ObuFrame};
+use crate::encoder::key_frame::lambda_for;
+use crate::encoder::obu::{ObuFrame, build_temporal_unit};
 use crate::encoder::rate_twin::RateModel;
 use crate::encoder::yuv_frame::YuvFrame;
-use crate::encoder::yuv_frame::{build_intra_only_yuv420_8bit_fh_with_q, Yuv420Frame};
+use crate::encoder::yuv_frame::{Yuv420Frame, build_intra_only_yuv420_8bit_fh_with_q};
 use crate::frame_header::{FrameHeader, FrameType, PRIMARY_REF_NONE};
 use crate::obu::ObuType;
 use crate::sequence_header::SequenceHeader;
 use crate::uncompressed_header_tail::FilmGrainParams;
-use crate::Error;
 
 /// r424 — the B-pyramid encoder's tuning switches, kept public
 /// (hidden) so the measurement harnesses can A/B each feature against
@@ -839,6 +839,7 @@ impl PyramidSession {
                         superres: None,
                         superres_source: None,
                         ref_dims: Vec::new(),
+                        coded_size: None,
                     };
                     let q = self.role_q(&role);
                     let (obus, rc, saved, carry, aux) = encode_inter_frame_generic(
@@ -878,54 +879,54 @@ impl PyramidSession {
                     } else {
                         None
                     };
-                    if let Some(slot) = consumed_slot {
-                        if self.carry_store[slot].donor_cdfs.len() > 1 {
-                            let consumed = self.carry_store[slot].clone();
-                            let fixed_cdfs = match aux.donor_elected {
-                                Some(t) => {
-                                    let span = consumed
-                                        .ctx_update_span
-                                        .expect("donor election only fires on multi-tile frames");
-                                    match pending_slot_idx[slot] {
-                                        Some(idx) => {
-                                            // Pending `OBU_FRAME` /
-                                            // `OBU_FRAME_HEADER` bodies
-                                            // start with the header bits.
-                                            crate::encoder::inter_frame::patch_bits_at(
-                                                &mut pending[idx].body,
-                                                0,
-                                                span,
-                                                t,
-                                            );
-                                        }
-                                        None => {
-                                            let (tu, ord) = self.slot_wire[slot]
-                                                .expect("flushed frame located on the wire");
-                                            crate::encoder::inter_frame::patch_ctx_update_in_tu_frame(
-                                                &mut self.temporal_units[tu],
-                                                ord,
-                                                span,
-                                                t,
-                                            );
-                                        }
+                    if let Some(slot) = consumed_slot
+                        && self.carry_store[slot].donor_cdfs.len() > 1
+                    {
+                        let consumed = self.carry_store[slot].clone();
+                        let fixed_cdfs = match aux.donor_elected {
+                            Some(t) => {
+                                let span = consumed
+                                    .ctx_update_span
+                                    .expect("donor election only fires on multi-tile frames");
+                                match pending_slot_idx[slot] {
+                                    Some(idx) => {
+                                        // Pending `OBU_FRAME` /
+                                        // `OBU_FRAME_HEADER` bodies
+                                        // start with the header bits.
+                                        crate::encoder::inter_frame::patch_bits_at(
+                                            &mut pending[idx].body,
+                                            0,
+                                            span,
+                                            t,
+                                        );
                                     }
-                                    consumed.donor_cdfs[t as usize].clone()
+                                    None => {
+                                        let (tu, ord) = self.slot_wire[slot]
+                                            .expect("flushed frame located on the wire");
+                                        crate::encoder::inter_frame::patch_ctx_update_in_tu_frame(
+                                            &mut self.temporal_units[tu],
+                                            ord,
+                                            span,
+                                            t,
+                                        );
+                                    }
                                 }
-                                None => consumed.cdfs.clone(),
-                            };
-                            let fixed = Rc::new(RefSlotCarry {
-                                cdfs: fixed_cdfs,
-                                segment_ids: consumed.segment_ids.clone(),
-                                mi_rows: consumed.mi_rows,
-                                mi_cols: consumed.mi_cols,
-                                gm_params: consumed.gm_params,
-                                donor_cdfs: Vec::new(),
-                                ctx_update_span: None,
-                            });
-                            for s in self.carry_store.iter_mut() {
-                                if Rc::ptr_eq(s, &consumed) {
-                                    *s = fixed.clone();
-                                }
+                                consumed.donor_cdfs[t as usize].clone()
+                            }
+                            None => consumed.cdfs.clone(),
+                        };
+                        let fixed = Rc::new(RefSlotCarry {
+                            cdfs: fixed_cdfs,
+                            segment_ids: consumed.segment_ids.clone(),
+                            mi_rows: consumed.mi_rows,
+                            mi_cols: consumed.mi_cols,
+                            gm_params: consumed.gm_params,
+                            donor_cdfs: Vec::new(),
+                            ctx_update_span: None,
+                        });
+                        for s in self.carry_store.iter_mut() {
+                            if Rc::ptr_eq(s, &consumed) {
+                                *s = fixed.clone();
                             }
                         }
                     }
@@ -1330,13 +1331,14 @@ fn mc_mad(prev: &[u16], cur: &[u16], w: usize, h: usize) -> f64 {
     let mut best = f64::INFINITY;
     for dy in -3i32..=3 {
         for dx in -3i32..=3 {
-            let y0 = dy.max(0) as usize;
-            let y1 = (h as i32 + dy.min(0)) as usize;
-            let x0 = dx.max(0) as usize;
-            let x1 = (w as i32 + dx.min(0)) as usize;
+            // Signed bounds first: on a plane narrower than the shift
+            // the overlap is empty (a negative end must not wrap).
+            let (y0, y1) = (dy.max(0), h as i32 + dy.min(0));
+            let (x0, x1) = (dx.max(0), w as i32 + dx.min(0));
             if y1 <= y0 || x1 <= x0 {
                 continue;
             }
+            let (y0, y1, x0, x1) = (y0 as usize, y1 as usize, x0 as usize, x1 as usize);
             let mut sum = 0u64;
             for i in y0..y1 {
                 let pi = (i as i32 - dy) as usize;

@@ -17,7 +17,7 @@
 //! The fixture bytes are embedded as hex so the test runs in per-crate
 //! CI without the docs checkout.
 
-use oxideav_av1::decoder::{decode_av1_spec, Frame, SpecFrame};
+use oxideav_av1::decoder::{Frame, SpecFrame, decode_av1_spec};
 
 /// r409 public-API parity: every corpus stream the spec driver decodes
 /// must decode IDENTICALLY through the public [`oxideav_av1::decode_av1`]
@@ -25,6 +25,8 @@ use oxideav_av1::decoder::{decode_av1_spec, Frame, SpecFrame};
 /// streams are all external-encoder streams, so none may be claimed by
 /// the constrained encoder-mirror path).
 fn assert_public_api_parity(name: &str, ivf: &[u8], spec_frames: &[SpecFrame]) {
+    assert_frame_parallel_parity(name, ivf, spec_frames);
+    assert_registry_stream_params(name, ivf, spec_frames);
     let pub_frames = oxideav_av1::decode_av1(ivf)
         .unwrap_or_else(|e| panic!("{name}: public decode_av1 rejected the fixture: {e:?}"));
     assert_eq!(
@@ -46,8 +48,164 @@ fn assert_public_api_parity(name: &str, ivf: &[u8], spec_frames: &[SpecFrame]) {
     }
 }
 
+/// r481 — every corpus stream decodes BYTE-IDENTICALLY under a worker
+/// budget: one temporal unit at a time through the frame-parallel
+/// session (each referenced frame walks its syntax first, then
+/// reconstructs with its in-loop passes behind the walk while later
+/// frames motion-compensate from its published rows), for budgets that
+/// put several frames in flight at once.
+fn assert_frame_parallel_parity(name: &str, ivf: &[u8], spec_frames: &[SpecFrame]) {
+    use oxideav_av1::decoder::SpecDecodeSession;
+    use oxideav_av1::encoder::ivf::IvfReader;
+    let records = IvfReader::new(ivf)
+        .and_then(|r| r.read_all())
+        .unwrap_or_else(|e| panic!("{name}: IVF: {e:?}"));
+    for threads in [2usize, 3, 8] {
+        let mut session = SpecDecodeSession::new();
+        session.set_threads(threads);
+        let mut pending = Vec::new();
+        for rec in &records {
+            pending.extend(
+                session
+                    .decode_temporal_unit_pipelined(&rec.payload)
+                    .unwrap_or_else(|e| panic!("{name}: {threads} workers: {e:?}")),
+            );
+        }
+        let frames: Vec<SpecFrame> = pending
+            .into_iter()
+            .map(|p| {
+                p.into_frame()
+                    .unwrap_or_else(|e| panic!("{name}: {threads} workers: {e:?}"))
+            })
+            .collect();
+        assert_eq!(
+            frames.len(),
+            spec_frames.len(),
+            "{name}: {threads} workers: frame count"
+        );
+        for (i, (a, b)) in frames.iter().zip(spec_frames).enumerate() {
+            assert!(a == b, "{name}: {threads} workers: frame {i} differs");
+        }
+    }
+}
+
+/// The output shape of a decoded frame as the registry decoder states
+/// it: luma size, plane count and bit depth.
+fn frame_shape(f: &SpecFrame) -> ((u32, u32), usize, u8) {
+    (
+        f.plane_dims.first().copied().unwrap_or((f.width, f.height)),
+        f.planes.len(),
+        f.bit_depth,
+    )
+}
+
+/// r482 — the registry decoder announces every mid-stream shape change
+/// in band: one `Frame::StreamParams` event immediately before the
+/// first frame of each new shape (the frame-size changes of the
+/// conformance streams — §5.9.5 `frame_size_override_flag`, §5.9.7
+/// `frame_size_with_refs`, §5.9.8 superres, §7.21
+/// `show_existing_frame` of a slot holding another size — and new
+/// sequence headers), none for the first shape or a constant stream,
+/// payload equal to `output_params()` with the generation already
+/// moved — and the media frames stay byte-identical to the spec
+/// driver's. Fed one temporal unit per packet and drained after each
+/// (a player) and, at the widest budget, drained only after the flush
+/// (every frame in flight at once), for worker budgets 1 / 2 / 3 / 8.
+fn assert_registry_stream_params(name: &str, ivf: &[u8], spec_frames: &[SpecFrame]) {
+    use oxideav_av1::encoder::ivf::IvfReader;
+    use oxideav_core::{CodecParameters, Decoder, ExecutionContext, Packet, TimeBase};
+    let records = IvfReader::new(ivf)
+        .and_then(|r| r.read_all())
+        .unwrap_or_else(|e| panic!("{name}: IVF: {e:?}"));
+    let expected_events: Vec<usize> = (1..spec_frames.len())
+        .filter(|&i| frame_shape(&spec_frames[i]) != frame_shape(&spec_frames[i - 1]))
+        .collect();
+    for (threads, streaming) in [(1usize, true), (2, true), (3, true), (8, true), (8, false)] {
+        let ctx = format!("{name}: registry, {threads} workers, streaming={streaming}");
+        let mut dec = oxideav_av1::registry::make_decoder(&CodecParameters::video("av1".into()))
+            .unwrap_or_else(|e| panic!("{ctx}: {e}"));
+        dec.set_execution_context(&ExecutionContext::with_threads(threads));
+        let mut frames = 0usize;
+        let mut events = Vec::new();
+        let mut announced: Option<String> = None;
+        let mut generation = 0u64;
+        let mut drain = |dec: &mut Box<dyn Decoder>| loop {
+            match dec.receive_frame() {
+                Ok(oxideav_core::Frame::Video(v)) => {
+                    let sf = spec_frames
+                        .get(frames)
+                        .unwrap_or_else(|| panic!("{ctx}: extra frame {frames}"));
+                    assert!(
+                        v.planes.len() == sf.planes.len()
+                            && v.planes.iter().zip(&sf.planes).all(|(a, b)| &a.data == b),
+                        "{ctx}: frame {frames} differs from the spec driver"
+                    );
+                    let p = dec.output_params().expect("described after a frame");
+                    let (w, h) = sf.plane_dims[0];
+                    assert_eq!(
+                        (p.width, p.height),
+                        (Some(w), Some(h)),
+                        "{ctx}: frame {frames} size"
+                    );
+                    match announced.take() {
+                        Some(ev) => {
+                            assert_eq!(ev, format!("{p:?}"), "{ctx}: announced shape");
+                            events.push(frames);
+                        }
+                        None => assert_eq!(
+                            dec.output_params_generation(),
+                            generation,
+                            "{ctx}: frame {frames}: bump without an event"
+                        ),
+                    }
+                    frames += 1;
+                }
+                Ok(oxideav_core::Frame::StreamParams(ev)) => {
+                    assert!(frames > 0, "{ctx}: event before the first frame");
+                    assert!(announced.is_none(), "{ctx}: two events in a row");
+                    let now = dec.output_params().expect("described at an event");
+                    assert_eq!(format!("{ev:?}"), format!("{now:?}"), "{ctx}: payload");
+                    assert_eq!(
+                        dec.output_params_generation(),
+                        generation.wrapping_add(1),
+                        "{ctx}: one bump per event"
+                    );
+                    generation = generation.wrapping_add(1);
+                    announced = Some(format!("{now:?}"));
+                }
+                Ok(_) => panic!("{ctx}: unexpected frame kind"),
+                Err(oxideav_core::Error::NeedMore | oxideav_core::Error::Eof) => break,
+                Err(e) => panic!("{ctx}: receive_frame: {e}"),
+            }
+        };
+        for (i, rec) in records.iter().enumerate() {
+            dec.send_packet(
+                &Packet::new(0, TimeBase::new(1, 30), rec.payload.clone()).with_pts(i as i64),
+            )
+            .unwrap_or_else(|e| panic!("{ctx}: send_packet: {e}"));
+            if streaming {
+                drain(&mut dec);
+            }
+        }
+        dec.flush().expect("flush");
+        drain(&mut dec);
+        assert_eq!(frames, spec_frames.len(), "{ctx}: frame count");
+        assert!(announced.is_none(), "{ctx}: trailing event");
+        assert_eq!(events, expected_events, "{ctx}: event positions");
+        if std::env::var_os("OXIDEAV_AV1_EVENT_REPORT").is_some()
+            && threads == 1
+            && !events.is_empty()
+        {
+            eprintln!("EVENTS {name}: {} frames, events before {events:?}", frames);
+        }
+    }
+}
+
 fn unhex(s: &str) -> Vec<u8> {
-    assert!(s.len() % 2 == 0, "hex literal must have even length");
+    assert!(
+        s.len().is_multiple_of(2),
+        "hex literal must have even length"
+    );
     (0..s.len() / 2)
         .map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap())
         .collect()
@@ -155,12 +313,15 @@ fn spec_driver_rejects_truncated_input() {
 /// triples, each 6 hex chars — back to raw bytes. Used for the larger
 /// expected-plane payloads, which are long-run flat regions.
 fn unrle(s: &str) -> Vec<u8> {
-    assert!(s.len() % 6 == 0, "RLE literal must be (u8, u16) triples");
+    assert!(
+        s.len().is_multiple_of(6),
+        "RLE literal must be (u8, u16) triples"
+    );
     let mut out = Vec::new();
     for i in 0..s.len() / 6 {
         let v = u8::from_str_radix(&s[6 * i..6 * i + 2], 16).unwrap();
         let n = usize::from_str_radix(&s[6 * i + 2..6 * i + 6], 16).unwrap();
-        out.extend(std::iter::repeat(v).take(n));
+        out.extend(std::iter::repeat_n(v, n));
     }
     out
 }
@@ -748,9 +909,9 @@ fn sha256_hex(data: &[u8]) -> String {
         msg.push(0);
     }
     msg.extend_from_slice(&bit_len.to_be_bytes());
-    for chunk in msg.chunks_exact(64) {
+    for chunk in msg.as_chunks::<64>().0 {
         let mut w = [0u32; 64];
-        for (i, word) in chunk.chunks_exact(4).enumerate() {
+        for (i, word) in chunk.as_chunks::<4>().0.iter().enumerate() {
             w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
         }
         for i in 16..64 {

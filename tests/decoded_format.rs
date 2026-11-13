@@ -2,7 +2,9 @@
 //! last returned (oxideav-core `Decoder::output_video_dimensions` /
 //! `output_pixel_format`): odd sizes, 10-bit, monochrome and 4:4:4. A new
 //! size or layout is reported with the first frame that has it, not when
-//! its sequence header arrives.
+//! its sequence header arrives, and is announced in band by a
+//! `Frame::StreamParams` event carrying the same description just before
+//! that frame.
 //!
 //! `decoded_format/*.ivf` are two-frame libaom encodes of FFmpeg
 //! `testsrc`, decoded one after the other by one decoder.
@@ -110,6 +112,18 @@ fn receive_all(dec: &mut dyn Decoder, expected: &[Layout], seen: &mut usize) {
                 assert_eq!(report(dec), Some(want), "report after frame {seen}");
                 assert_geometry(&frame, want, *seen);
                 *seen += 1;
+            }
+            // The event ahead of the first frame of a new shape states that
+            // frame's description, and the reports already follow it.
+            Ok(Frame::StreamParams(params)) => {
+                let want = expected[*seen];
+                assert_ne!(*seen, 0, "no event before the first frame");
+                assert_eq!(
+                    (params.width, params.height, params.pixel_format),
+                    (Some(want.0), Some(want.1), Some(want.2)),
+                    "event before frame {seen}"
+                );
+                assert_eq!(report(dec), Some(want), "report after the event");
             }
             Ok(_) => panic!("non-video frame"),
             Err(Error::NeedMore | Error::Eof) => return,

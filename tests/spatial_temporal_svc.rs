@@ -11,8 +11,8 @@
 
 use oxideav_av1::decoder::Frame;
 use oxideav_av1::encoder::{
-    encode_spatial_layered_gop_yuv420_with_q, encode_spatial_temporal_layered_gop_yuv420_with_q,
-    temporal_layer_of, SpatialLayeredGop, Yuv420Frame,
+    SpatialLayeredGop, Yuv420Frame, encode_spatial_layered_gop_yuv420_with_q,
+    encode_spatial_temporal_layered_gop_yuv420_with_q, temporal_layer_of,
 };
 use oxideav_av1::obu::{ObuIter, ObuType};
 use oxideav_av1::sequence_header::parse_sequence_header;
@@ -72,8 +72,8 @@ fn assert_every_operating_point(enc: &SpatialLayeredGop, s_count: usize, t_count
         let out = oxideav_av1::decode_av1_at_operating_point(&enc.ivf_bytes, p as u8)
             .unwrap_or_else(|e| panic!("op {p} ({sc}x{tc}) decode: {e:?}"));
         let mut expected: Vec<(usize, usize)> = Vec::new();
-        for i in 0..n {
-            if enc.temporal_ids[i] < tc {
+        for (i, &tid) in enc.temporal_ids.iter().enumerate().take(n) {
+            if tid < tc {
                 for s in 0..usize::from(sc) {
                     expected.push((i, s));
                 }
@@ -145,8 +145,8 @@ fn dump(enc: &SpatialLayeredGop, name: &str) {
             let mut yuv = Vec::new();
             for (i, &tid) in enc.temporal_ids.iter().enumerate() {
                 if tid < tc {
-                    for s in 0..usize::from(sc) {
-                        let rc = &enc.layer_recons[s][i];
+                    for layer in enc.layer_recons.iter().take(usize::from(sc)) {
+                        let rc = &layer[i];
                         yuv.extend_from_slice(&rc.y);
                         yuv.extend_from_slice(&rc.u);
                         yuv.extend_from_slice(&rc.v);

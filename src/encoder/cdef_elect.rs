@@ -40,7 +40,7 @@
 //! engineering; every candidate is evaluated through the real §7.15
 //! kernels.
 
-use crate::cdef::{cdef_block_dir, cdef_direction, CdefFrameContext};
+use crate::cdef::{CdefFrameContext, cdef_block_dir, cdef_direction};
 use crate::cdf::PartitionWalker;
 use crate::encoder::yuv_frame::YuvFrame;
 use crate::loop_filter::PlaneBuffer;
@@ -383,10 +383,10 @@ impl<'a> UnitEngine<'a> {
     /// step chosen so the subsample keeps at least ~16 units (4 on
     /// small pictures) — one in 16 at 12 MP.
     fn subsample_step(&self) -> usize {
-        if let Some((step, _)) = self.inp.fast {
-            if step > 0 {
-                return usize::from(step);
-            }
+        if let Some((step, _)) = self.inp.fast
+            && step > 0
+        {
+            return usize::from(step);
         }
         let n = self.sb_rows * self.sb_cols;
         if n >= 256 {
@@ -420,7 +420,7 @@ impl<'a> UnitEngine<'a> {
         units: &[usize],
         f: impl Fn(&Self, usize, &mut Scratch) -> T + Sync,
     ) -> Vec<T> {
-        let threads = self.inp.threads.max(1).min(units.len().max(1));
+        let threads = crate::platform::clamp_threads(self.inp.threads).min(units.len().max(1));
         if threads <= 1 {
             let mut scratch = Scratch::default();
             return units.iter().map(|&k| f(self, k, &mut scratch)).collect();
@@ -1142,51 +1142,110 @@ pub(crate) fn apply_cdef_plan(
     num_planes: u8,
     threads: usize,
 ) {
-    let inp = CdefElectInput {
-        mirror,
-        input,
-        recon_y,
-        recon_u,
-        recon_v,
-        width,
-        height,
-        chroma_w,
-        chroma_h,
-        bit_depth,
-        subsampling_x,
-        subsampling_y,
-        num_planes,
-        lambda: 0,
-        max_bits: 0,
-        fast: None,
-        threads,
-    };
-    let n_units = mirror.mi_rows().div_ceil(16) as usize * mirror.mi_cols().div_ceil(16) as usize;
+    #[allow(clippy::too_many_arguments)]
+    fn make_input<'a>(
+        mirror: &'a PartitionWalker,
+        input: &'a YuvFrame,
+        y: &'a [u16],
+        u: &'a [u16],
+        v: &'a [u16],
+        dims: (usize, usize, usize, usize),
+        bit_depth: u8,
+        subsampling: (u8, u8),
+        num_planes: u8,
+        threads: usize,
+    ) -> CdefElectInput<'a> {
+        CdefElectInput {
+            mirror,
+            input,
+            recon_y: y,
+            recon_u: u,
+            recon_v: v,
+            width: dims.0,
+            height: dims.1,
+            chroma_w: dims.2,
+            chroma_h: dims.3,
+            bit_depth,
+            subsampling_x: subsampling.0,
+            subsampling_y: subsampling.1,
+            num_planes,
+            lambda: 0,
+            max_bits: 0,
+            fast: None,
+            threads,
+        }
+    }
+    let dims = (width, height, chroma_w, chroma_h);
+    let sub = (subsampling_x, subsampling_y);
+    let sb_rows = mirror.mi_rows().div_ceil(16) as usize;
+    let sb_cols = mirror.mi_cols().div_ceil(16) as usize;
+    let n_units = sb_rows * sb_cols;
     let coded: Vec<bool> = (0..n_units).map(|k| plan.unit_idx[k] >= 0).collect();
-    let engine = UnitEngine::new(&inp, &coded);
-    let units: Vec<usize> = (0..n_units)
-        .filter(|&k| coded[k] && !engine.blocks[k].is_empty())
-        .collect();
-    // Per unit: the filtered rectangles of every plane (window
-    // layout + the rectangle's plane-space origin).
-    let filtered: Vec<Vec<FilteredRect>> = engine.map_units(&units, |eng, k, _| {
-        eng.filter_unit(k, &plan.params, plan.unit_idx[k])
-    });
-    drop(engine);
-    let outs: [&mut [u16]; 3] = [recon_y, recon_u, recon_v];
-    let widths = [width, chroma_w, chroma_w];
-    for (ui, _) in units.iter().enumerate() {
-        for (p, (x0, y0, w, h, samples)) in filtered[ui].iter().enumerate() {
-            if p >= num_planes as usize {
-                break;
-            }
-            let pw = widths[p];
-            for yy in 0..*h {
-                let dst = &mut outs[p][(y0 + yy) * pw + x0..(y0 + yy) * pw + x0 + w];
-                for (d, &v) in dst.iter_mut().zip(&samples[yy * w..(yy + 1) * w]) {
-                    *d = v.max(0) as u16;
+    // §7.15.2 directions over the UNFILTERED picture, every unit.
+    let mut blocks: Vec<Vec<DirBlock>> = {
+        let inp = make_input(
+            mirror, input, recon_y, recon_u, recon_v, dims, bit_depth, sub, num_planes, threads,
+        );
+        UnitEngine::new(&inp, &coded).blocks
+    };
+    // r479 — one superblock row at a time: §7.15 reads the unfiltered
+    // samples up to 8 luma rows past a unit, so a row's filtered
+    // rectangles are written back only once the NEXT row's windows
+    // have been built (the pre-r479 apply held every unit's filtered
+    // rectangles — a frame-sized `i32` copy, 70 MiB at 12 MP — before
+    // writing any of them).
+    let write_back = |units: &[usize],
+                      filtered: &[Vec<FilteredRect>],
+                      recon_y: &mut [u16],
+                      recon_u: &mut [u16],
+                      recon_v: &mut [u16]| {
+        let outs: [&mut [u16]; 3] = [recon_y, recon_u, recon_v];
+        let widths = [width, chroma_w, chroma_w];
+        for (ui, _) in units.iter().enumerate() {
+            for (p, (x0, y0, w, h, samples)) in filtered[ui].iter().enumerate() {
+                if p >= num_planes as usize {
+                    break;
+                }
+                let pw = widths[p];
+                for yy in 0..*h {
+                    let dst = &mut outs[p][(y0 + yy) * pw + x0..(y0 + yy) * pw + x0 + w];
+                    for (d, &v) in dst.iter_mut().zip(&samples[yy * w..(yy + 1) * w]) {
+                        *d = v.max(0) as u16;
+                    }
                 }
             }
         }
+    };
+    let mut pending: Option<(Vec<usize>, Vec<Vec<FilteredRect>>)> = None;
+    for ur in 0..sb_rows {
+        let units: Vec<usize> = (ur * sb_cols..(ur + 1) * sb_cols)
+            .filter(|&k| coded[k] && !blocks[k].is_empty())
+            .collect();
+        // Per unit: the filtered rectangles of every plane (window
+        // layout + the rectangle's plane-space origin).
+        let filtered: Vec<Vec<FilteredRect>> = {
+            let inp = make_input(
+                mirror, input, recon_y, recon_u, recon_v, dims, bit_depth, sub, num_planes, threads,
+            );
+            let engine = UnitEngine {
+                inp: &inp,
+                sb_rows,
+                sb_cols,
+                coded: &coded,
+                blocks: std::mem::take(&mut blocks),
+            };
+            let f = engine.map_units(&units, |eng, k, _| {
+                eng.filter_unit(k, &plan.params, plan.unit_idx[k])
+            });
+            blocks = engine.blocks;
+            f
+        };
+        if let Some((pu, pf)) = pending.take() {
+            write_back(&pu, &pf, recon_y, recon_u, recon_v);
+        }
+        pending = Some((units, filtered));
+    }
+    if let Some((pu, pf)) = pending.take() {
+        write_back(&pu, &pf, recon_y, recon_u, recon_v);
     }
 }

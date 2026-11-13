@@ -1,11 +1,11 @@
 //! Feed complete decoded plane bytes to the Node hashing host, before any display conversion.
 use oxideav_av1::encoder::ivf::IvfReader;
-use oxideav_av1::registry::{make_decoder, CODEC_ID_STR};
+use oxideav_av1::registry::{CODEC_ID_STR, make_decoder};
 use oxideav_core::{CodecId, CodecParameters, Decoder, Error, Frame, Packet, TimeBase};
 
 #[cfg(target_arch = "wasm32")]
 #[link(wasm_import_module = "picture_hash")]
-extern "C" {
+unsafe extern "C" {
     fn plane(ptr: *const u8, len: usize);
     fn end_picture();
 }
@@ -47,7 +47,9 @@ fn main() {
     let params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
     let mut decoder = make_decoder(&params).unwrap();
     if let Some(threads) = std::env::args().nth(2) {
-        let threads = threads.parse::<usize>().expect("positive decoder thread count");
+        let threads = threads
+            .parse::<usize>()
+            .expect("positive decoder thread count");
         assert!(threads > 0, "decoder thread count must be positive");
         decoder.set_execution_context(&oxideav_core::ExecutionContext::with_threads(threads));
     }

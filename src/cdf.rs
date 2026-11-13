@@ -1435,11 +1435,7 @@ pub fn predict_intra_dc_pred(
 #[inline]
 fn clip1_bit_depth(x: u32, bit_depth: u8) -> u32 {
     let max = (1u32 << bit_depth) - 1;
-    if x > max {
-        max
-    } else {
-        x
-    }
+    if x > max { max } else { x }
 }
 
 // ---------------------------------------------------------------------
@@ -2592,11 +2588,7 @@ pub fn intra_edge_upsample_selection(w: usize, h: usize, filter_type: u8, delta:
     }
     let blk_wh = w + h;
     if filter_type == 0 {
-        if blk_wh <= 16 {
-            1
-        } else {
-            0
-        }
+        if blk_wh <= 16 { 1 } else { 0 }
     } else if blk_wh <= 8 {
         1
     } else {
@@ -2895,7 +2887,178 @@ pub fn predict_intra_directional(
     if pred.len() < h.saturating_mul(w) {
         return Err(crate::Error::PartitionWalkOutOfRange);
     }
-    if !(0..360).contains(&p_angle) || p_angle == 90 || p_angle == 180 {
+    // §7.11.2.4 defines the process for `0 < pAngle < 270` (the
+    // derivative table is indexed by `270 - pAngle` on the last arm).
+    if !(0..270).contains(&p_angle) || p_angle == 90 || p_angle == 180 {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+
+    // §7.11.2.4 step 5: `dx`.
+    let dx: i32 = if p_angle < 90 {
+        DR_INTRA_DERIVATIVE[p_angle as usize] as i32
+    } else if p_angle < 180 {
+        DR_INTRA_DERIVATIVE[(180 - p_angle) as usize] as i32
+    } else {
+        0 // undefined per spec; not read on the step-9 path.
+    };
+    // §7.11.2.4 step 6: `dy`.
+    let dy: i32 = if (90..180).contains(&p_angle) {
+        DR_INTRA_DERIVATIVE[(p_angle - 90) as usize] as i32
+    } else if p_angle > 180 {
+        DR_INTRA_DERIVATIVE[(270 - p_angle) as usize] as i32
+    } else {
+        0 // undefined per spec; not read on the step-7 path.
+    };
+
+    // r487 — the §7.11.2.4 per-sample formulas regrouped into runs.
+    // `base` advances by `1 << upsample` per sample along a row (zone
+    // 1, and the above-referencing part of zone 2) or along a column
+    // (zone 3), and `shift` is constant along it, so each row / column
+    // is one blend `Round2( a[ k ] * ( 32 - shift ) + a[ k + 1 ] *
+    // shift, 5 )` over a run of the edge, with no per-sample test.
+    // The edge arrays arrive with two leading cells (`AboveRow[ k ]`
+    // is `above_row[ k + 2 ]`); a read outside them is the same error
+    // the per-sample form reports.
+    let out_of_range = || crate::Error::PartitionWalkOutOfRange;
+    #[inline(always)]
+    fn blend(a0: u16, a1: u16, shift: u32) -> u16 {
+        ((u32::from(a0) * (32 - shift) + u32::from(a1) * shift + 16) >> 5) as u16
+    }
+    // One run along an edge: `out[ n ] = blend( edge[ start + n * step
+    // ], edge[ start + n * step + 1 ] )`; the caller has checked that
+    // `start + ( out.len() - 1 ) * step + 1` is inside `edge`.
+    #[inline(always)]
+    fn blend_run(edge: &[u16], start: usize, step: usize, shift: u32, out: &mut [u16]) {
+        if step == 1 {
+            let src = &edge[start..start + out.len() + 1];
+            for (n, o) in out.iter_mut().enumerate() {
+                *o = blend(src[n], src[n + 1], shift);
+            }
+        } else {
+            for (n, o) in out.iter_mut().enumerate() {
+                *o = blend(edge[start + n * step], edge[start + n * step + 1], shift);
+            }
+        }
+    }
+    // Zone 1 / zone 3 line `line` (a row / a column): `len` samples
+    // from `edge` under derivative `d`, the tail past `maxBase` taking
+    // `edge[ maxBase ]`.
+    let single_edge_line = |edge: &[u16],
+                            upsample: u8,
+                            d: i32,
+                            line: usize,
+                            out: &mut [u16]|
+     -> Result<(), crate::Error> {
+        let up = u32::from(upsample);
+        let step = 1usize << up;
+        let max_base = (w + h - 1) << up;
+        let idx = (line as i32 + 1) * d;
+        let base0 = (idx >> (6 - up)) as usize;
+        let shift = (((idx << up) >> 1) & 0x1F) as u32;
+        let len = out.len();
+        let blended = if base0 >= max_base {
+            0
+        } else {
+            (max_base - base0).div_ceil(step).min(len)
+        };
+        if blended > 0 {
+            if base0 + 2 + (blended - 1) * step + 1 >= edge.len() {
+                return Err(out_of_range());
+            }
+            blend_run(edge, base0 + 2, step, shift, &mut out[..blended]);
+        }
+        if blended < len {
+            let fill = *edge.get(max_base + 2).ok_or_else(out_of_range)?;
+            out[blended..].fill(fill);
+        }
+        Ok(())
+    };
+
+    if p_angle < 90 {
+        // §7.11.2.4 step 7: every row from the above edge.
+        for (i, row) in pred[..h * w].chunks_exact_mut(w).enumerate() {
+            single_edge_line(above_row, upsample_above, dx, i, row)?;
+        }
+    } else if p_angle < 180 {
+        // §7.11.2.4 step 8. Along row `i`, `idxX = ( j << 6 ) - ( i +
+        // 1 ) * dx`, so `baseX = ( j << upsampleAbove ) + c` with `c =
+        // ( -( i + 1 ) * dx ) >> ( 6 - upsampleAbove )` and a shift
+        // that does not depend on `j` (the `j` term is a multiple of
+        // 32 after the halving). `baseX >= -( 1 << upsampleAbove )`
+        // holds from some column `j0` on: those samples are one run of
+        // the above edge; the columns before it read the left edge.
+        let up_a = u32::from(upsample_above);
+        let up_l = u32::from(upsample_left);
+        let step_a = 1usize << up_a;
+        for (i, row) in pred[..h * w].chunks_exact_mut(w).enumerate() {
+            let t = (i as i32 + 1) * dx;
+            let c = (-t) >> (6 - up_a);
+            let shift_x = (((-(t << up_a)) >> 1) & 0x1F) as u32;
+            // Smallest `j` with `( j << up_a ) + c >= -( 1 << up_a )`.
+            let j0 = if up_a == 0 { -1 - c } else { (-1 - c) >> 1 };
+            let j0 = (j0.max(0) as usize).min(w);
+            if j0 < w {
+                // Non-negative by the choice of `j0`.
+                let start = ((j0 as i32) << up_a) + c + 2;
+                debug_assert!(start >= 0);
+                let start = start as usize;
+                if start + (w - 1 - j0) * step_a + 1 >= above_row.len() {
+                    return Err(out_of_range());
+                }
+                blend_run(above_row, start, step_a, shift_x, &mut row[j0..]);
+            }
+            for (j, o) in row[..j0].iter_mut().enumerate() {
+                let idx_y = ((i as i32) << 6) - (j as i32 + 1) * dy;
+                let base_y = idx_y >> (6 - up_l);
+                let shift_y = (((idx_y << up_l) >> 1) & 0x1F) as u32;
+                let at = usize::try_from(base_y + 2).map_err(|_| out_of_range())?;
+                let (Some(&l0), Some(&l1)) = (left_col.get(at), left_col.get(at + 1)) else {
+                    return Err(out_of_range());
+                };
+                *o = blend(l0, l1, shift_y);
+            }
+        }
+    } else {
+        // §7.11.2.4 step 9: every column from the left edge.
+        let mut column = [0u16; 64];
+        let column = &mut column[..h];
+        for j in 0..w {
+            single_edge_line(left_col, upsample_left, dy, j, column)?;
+            for (i, &v) in column.iter().enumerate() {
+                pred[i * w + j] = v;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The §7.11.2.4 directional process sample by sample (the spec's own
+/// loop nest) — the model [`predict_intra_directional`]'s run-wise
+/// form is tested against.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn predict_intra_directional_literal(
+    w: usize,
+    h: usize,
+    p_angle: i32,
+    upsample_above: u8,
+    upsample_left: u8,
+    above_row: &[u16],
+    left_col: &[u16],
+    pred: &mut [u16],
+) -> Result<(), crate::Error> {
+    if w == 0 || h == 0 || w > 64 || h > 64 {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    if upsample_above > 1 || upsample_left > 1 {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    if pred.len() < h.saturating_mul(w) {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    // §7.11.2.4 defines the process for `0 < pAngle < 270` (the
+    // derivative table is indexed by `270 - pAngle` on the last arm).
+    if !(0..270).contains(&p_angle) || p_angle == 90 || p_angle == 180 {
         return Err(crate::Error::PartitionWalkOutOfRange);
     }
 
@@ -10662,6 +10825,67 @@ impl TileCdfContext {
         }
     }
 
+    // -----------------------------------------------------------------
+    // r487 — the coefficient-syntax rows at their array type (the same
+    // rows and the same range checks as the slice selectors), for the
+    // compile-time-length symbol reads of the §5.11.39 walk.
+    // -----------------------------------------------------------------
+
+    #[inline]
+    pub(crate) fn eob_extra_row(
+        &mut self,
+        tx_sz_ctx: usize,
+        ptype: usize,
+        ctx: usize,
+    ) -> Option<&mut [u16; 3]> {
+        self.eob_extra
+            .get_mut(tx_sz_ctx)?
+            .get_mut(ptype)?
+            .get_mut(ctx)
+    }
+
+    #[inline]
+    pub(crate) fn dc_sign_row(&mut self, ptype: usize, ctx: usize) -> Option<&mut [u16; 3]> {
+        self.dc_sign.get_mut(ptype)?.get_mut(ctx)
+    }
+
+    #[inline]
+    pub(crate) fn coeff_base_eob_row(
+        &mut self,
+        tx_sz_ctx: usize,
+        ptype: usize,
+        ctx: usize,
+    ) -> Option<&mut [u16; 4]> {
+        self.coeff_base_eob
+            .get_mut(tx_sz_ctx)?
+            .get_mut(ptype)?
+            .get_mut(ctx)
+    }
+
+    #[inline]
+    pub(crate) fn coeff_base_row(
+        &mut self,
+        tx_sz_ctx: usize,
+        ptype: usize,
+        ctx: usize,
+    ) -> Option<&mut [u16; 5]> {
+        self.coeff_base
+            .get_mut(tx_sz_ctx)?
+            .get_mut(ptype)?
+            .get_mut(ctx)
+    }
+
+    /// `tx_sz_ctx` clamps at `TX_32X32` per the §8.3.2 selector.
+    #[inline]
+    pub(crate) fn coeff_br_row(
+        &mut self,
+        tx_sz_ctx: usize,
+        ptype: usize,
+        ctx: usize,
+    ) -> Option<&mut [u16; BR_CDF_SIZE + 1]> {
+        self.coeff_br[tx_sz_ctx.min(3)].get_mut(ptype)?.get_mut(ctx)
+    }
+
     /// §8.3.2 `dc_sign`: the cdf is `TileDcSignCdf[ ptype ][ ctx ]`, where
     /// `ctx` is the `dc_sign` context (`0..DC_SIGN_CONTEXTS`). Returns
     /// `None` for an out-of-range index.
@@ -11382,11 +11606,7 @@ pub fn neg_interleave(segment_id: u32, pred: u32, max: u32) -> u32 {
 /// [`MV_INTRABC_CONTEXT`] when `use_intrabc == 1` and `0` otherwise;
 /// the result is the first index into every `Mv*Cdf` selector above.
 pub fn mv_ctx(use_intrabc: bool) -> usize {
-    if use_intrabc {
-        MV_INTRABC_CONTEXT
-    } else {
-        0
-    }
+    if use_intrabc { MV_INTRABC_CONTEXT } else { 0 }
 }
 
 // ---------------------------------------------------------------------
@@ -11575,6 +11795,87 @@ pub fn palette_color_context_from_neighbors(
         return None;
     }
 
+    // r487 — every caller inside the tile walk hands in neighbour
+    // indices below `n`, and for those the §5.11.50 result does not
+    // depend on `n`: only the (at most three) scored colours move, to
+    // the front, and the hash sums their scores. So the process is
+    // resolved once per neighbour triple (`palette_neighbour_table`)
+    // and looked up here; a triple with an index at or above `n` takes
+    // the literal process.
+    let in_range = |nb: Option<u8>| nb.is_none_or(|c| usize::from(c) < n);
+    if in_range(left) && in_range(above_left) && in_range(above) {
+        let entry = &palette_neighbour_table()[palette_neighbour_key(left, above_left, above)];
+        return Some(PaletteColorContext {
+            color_order: entry.color_order,
+            color_context_hash: usize::from(entry.color_context_hash),
+        });
+    }
+    palette_color_context_literal(left, above_left, above, n)
+}
+
+/// One resolved §5.11.50 outcome (see [`palette_neighbour_table`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PaletteNeighbourEntry {
+    /// `ColorOrder[ ]`.
+    pub color_order: [u8; PALETTE_COLORS],
+    /// The inverse permutation: `rank[ ColorOrder[ i ] ] = i` — the
+    /// `palette_color_idx` symbol that selects a given colour.
+    pub rank: [u8; PALETTE_COLORS],
+    /// `ColorContextHash`.
+    pub color_context_hash: u8,
+    /// `Palette_Color_Context[ ColorContextHash ]`, `None` on the
+    /// spec's `-1` sentinels.
+    pub ctx: Option<u8>,
+}
+
+/// Index of a neighbour triple in [`palette_neighbour_table`]: each
+/// neighbour is one base-9 digit (0 = unavailable, `c + 1` = colour
+/// index `c`).
+#[inline]
+pub(crate) fn palette_neighbour_key(
+    left: Option<u8>,
+    above_left: Option<u8>,
+    above: Option<u8>,
+) -> usize {
+    let digit = |nb: Option<u8>| nb.map_or(0, |c| usize::from(c.min(7)) + 1);
+    (digit(left) * 9 + digit(above_left)) * 9 + digit(above)
+}
+
+/// The §5.11.50 process evaluated once for every neighbour triple
+/// with indices in `0..PALETTE_COLORS` (729 entries), by the literal
+/// process at `n = PALETTE_COLORS`.
+pub(crate) fn palette_neighbour_table() -> &'static [PaletteNeighbourEntry; 729] {
+    static TABLE: std::sync::OnceLock<[PaletteNeighbourEntry; 729]> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        let nb = |digit: usize| (digit > 0).then(|| (digit - 1) as u8);
+        core::array::from_fn(|key| {
+            let (l, al, a) = (nb(key / 81), nb(key / 9 % 9), nb(key % 9));
+            let pcc = palette_color_context_literal(l, al, a, PALETTE_COLORS)
+                .expect("in-range neighbours");
+            let mut rank = [0u8; PALETTE_COLORS];
+            for (i, &c) in pcc.color_order.iter().enumerate() {
+                rank[usize::from(c)] = i as u8;
+            }
+            PaletteNeighbourEntry {
+                color_order: pcc.color_order,
+                rank,
+                color_context_hash: pcc.color_context_hash as u8,
+                ctx: palette_color_ctx(pcc.color_context_hash).map(|c| c as u8),
+            }
+        })
+    })
+}
+
+/// The §5.11.50 process step for step (score array, partial selection
+/// sort): the general arm of [`palette_color_context_from_neighbors`]
+/// (a neighbour index at or above `n`) and the model its closed form
+/// is tested against.
+fn palette_color_context_literal(
+    left: Option<u8>,
+    above_left: Option<u8>,
+    above: Option<u8>,
+    n: usize,
+) -> Option<PaletteColorContext> {
     // §5.11.50: scores[i] = 0; ColorOrder[i] = i  for i in 0..PALETTE_COLORS.
     let mut scores = [0u32; PALETTE_COLORS];
     let mut color_order = [0u8; PALETTE_COLORS];
@@ -12451,17 +12752,9 @@ pub fn comp_ref_type_ctx(
         if !above_comp_inter && !left_comp_inter {
             1 + 2 * samedir
         } else if !above_comp_inter {
-            if !left_uni_comp {
-                1
-            } else {
-                3 + samedir
-            }
+            if !left_uni_comp { 1 } else { 3 + samedir }
         } else if !left_comp_inter {
-            if !above_uni_comp {
-                1
-            } else {
-                3 + samedir
-            }
+            if !above_uni_comp { 1 } else { 3 + samedir }
         } else if !above_uni_comp && !left_uni_comp {
             0
         } else if !above_uni_comp || !left_uni_comp {
@@ -13661,12 +13954,40 @@ pub fn dequantize_step1(
     seg_qm_level: u8,
     quant: &QuantizerParams,
 ) -> Vec<i64> {
+    let mut dequant = Vec::new();
+    dequantize_step1_into(
+        quant_levels,
+        tx_size,
+        plane,
+        segment_id,
+        plane_tx_type,
+        seg_qm_level,
+        quant,
+        &mut dequant,
+    );
+    dequant
+}
+
+/// r481 — [`dequantize_step1`] into a reused buffer; a zero level
+/// dequantizes to zero (`0 * q2 = 0`), so only the non-zero levels are
+/// evaluated.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dequantize_step1_into(
+    quant_levels: &[i32],
+    tx_size: usize,
+    plane: u8,
+    segment_id: u8,
+    plane_tx_type: usize,
+    seg_qm_level: u8,
+    quant: &QuantizerParams,
+    dequant: &mut Vec<i64>,
+) {
     debug_assert!(tx_size < TX_SIZES_ALL);
     let w = TX_WIDTH[tx_size];
     let h = TX_HEIGHT[tx_size];
     let tw = core::cmp::min(32, w);
     let th = core::cmp::min(32, h);
-    let dq_denom = dequant_denom(tx_size);
+    let dq_shift = dequant_denom(tx_size).trailing_zeros();
     let clip_min: i64 = -(1i64 << (7 + quant.bit_depth as u32));
     let clip_max: i64 = (1i64 << (7 + quant.bit_depth as u32)) - 1;
     let dc_q_val = get_dc_quant(quant, plane, segment_id) as i64;
@@ -13674,9 +13995,13 @@ pub fn dequantize_step1(
 
     let qm_active = quant.using_qmatrix && plane_tx_type < IDTX && seg_qm_level < 15;
 
-    let mut dequant = vec![0i64; w * h];
+    dequant.clear();
+    dequant.resize(w * h, 0);
     for i in 0..th {
         for j in 0..tw {
+            if quant_levels[i * tw + j] == 0 {
+                continue;
+            }
             let q = if i == 0 && j == 0 { dc_q_val } else { ac_q_val };
             // §7.12.3 step 1b: `q2 = q` on the no-QM arm; the
             // QM-active arm reads §9.5.3 Quantizer_Matrix.
@@ -13694,12 +14019,14 @@ pub fn dequantize_step1(
             // `w × h` array the §7.13.3 inverse transform consumes
             // (cells past 32 stay zero per its i/j < 32 gate).
             let dq = (quant_levels[i * tw + j] as i64) * q2;
-            let sign: i64 = if dq < 0 { -1 } else { 1 };
-            let dq2 = sign * ((dq.unsigned_abs() & 0xFF_FFFF) as i64) / dq_denom;
+            // `sign * ( ( |dq| & 0xFFFFFF ) / dqDenom )`: the divisor
+            // is 1, 2 or 4 and the dividend non-negative, so the
+            // truncating division is a right shift of the magnitude.
+            let magnitude = ((dq.unsigned_abs() & 0xFF_FFFF) as i64) >> dq_shift;
+            let dq2 = if dq < 0 { -magnitude } else { magnitude };
             dequant[i * w + j] = dq2.clamp(clip_min, clip_max);
         }
     }
-    dequant
 }
 
 // ---------------------------------------------------------------------
@@ -13945,7 +14272,7 @@ pub fn tx_size_sqr_index(tx_size: usize) -> usize {
     (side.trailing_zeros() as usize) - 2
 }
 
-impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker<P, R> {
+impl PartitionWalker {
     /// r464 — import the per-mi grids of a `h4 × w4` rect from
     /// `src` (at `src_row`, `src_col`) into this walker at `dst_row`,
     /// `dst_col`: every per-cell grid, the `TxTypes[]` / `cdef_idx[]`
@@ -13982,20 +14309,39 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         if !src.palette_colors.is_empty() {
             self.ensure_palette_colors();
         }
+        // r479 — the lazily-materialised grids: a source that carries
+        // them is copied (materialising the destination); a source
+        // without them lands its pre-fill value on a destination that
+        // has them, and nothing otherwise.
+        if src.inter_grids_present() {
+            self.ensure_inter_grids();
+        }
+        if !src.delta_lfs.is_empty() {
+            self.ensure_delta_lfs();
+        }
         for rr in 0..h4 {
             let sbase = ((src_row + rr) * src.mi_cols + src_col) as usize;
             let dbase = ((dst_row + rr) * self.mi_cols + dst_col) as usize;
             let n = w4 as usize;
             macro_rules! copy_cells {
-                ($field:ident, $mult:expr) => {
+                ($field:ident, $mult:expr_2021) => {
                     self.$field[dbase * $mult..(dbase + n) * $mult]
                         .copy_from_slice(&src.$field[sbase * $mult..(sbase + n) * $mult]);
+                };
+            }
+            macro_rules! copy_lazy {
+                ($field:ident, $mult:expr_2021, $default:expr_2021) => {
+                    if !src.$field.is_empty() {
+                        copy_cells!($field, $mult);
+                    } else if !self.$field.is_empty() {
+                        self.$field[dbase * $mult..(dbase + n) * $mult].fill($default);
+                    }
                 };
             }
             copy_cells!(mi_sizes, 1);
             copy_cells!(skips, 1);
             copy_cells!(skip_modes, 1);
-            copy_cells!(delta_lfs, FRAME_LF_COUNT);
+            copy_lazy!(delta_lfs, FRAME_LF_COUNT, 0);
             copy_cells!(cdef_idx, 1);
             copy_cells!(is_inters, 1);
             copy_cells!(segment_ids, 1);
@@ -14005,23 +14351,23 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
             copy_cells!(inter_tx_sizes, 1);
             copy_cells!(tx_types, 1);
             copy_cells!(ref_frames, 2);
-            copy_cells!(mvs, 4);
-            copy_cells!(comp_group_idxs, 1);
-            copy_cells!(compound_idxs, 1);
-            copy_cells!(interp_filters, 2);
-            copy_cells!(compound_types, 1);
-            copy_cells!(compound_wedge_indices, 1);
-            copy_cells!(compound_wedge_signs, 1);
-            copy_cells!(compound_mask_types, 1);
-            copy_cells!(interintra_modes, 1);
-            copy_cells!(wedge_interintras, 1);
-            copy_cells!(interintra_wedge_indices, 1);
-            copy_cells!(motion_modes, 1);
+            copy_lazy!(mvs, 4, 0);
+            copy_lazy!(comp_group_idxs, 1, 0);
+            copy_lazy!(compound_idxs, 1, 1);
+            copy_lazy!(interp_filters, 2, EIGHTTAP);
+            copy_lazy!(compound_types, 1, crate::inter_pred::COMPOUND_AVERAGE);
+            copy_lazy!(compound_wedge_indices, 1, 0);
+            copy_lazy!(compound_wedge_signs, 1, 0);
+            copy_lazy!(compound_mask_types, 1, 0);
+            copy_lazy!(interintra_modes, 1, 0);
+            copy_lazy!(wedge_interintras, 1, 0);
+            copy_lazy!(interintra_wedge_indices, 1, 0);
+            copy_lazy!(motion_modes, 1, MOTION_MODE_SIMPLE);
             if !src.local_warp_params.is_empty() {
                 self.ensure_local_warp_params();
                 copy_cells!(local_warp_params, 6);
             }
-            copy_cells!(local_warp_valid, 1);
+            copy_lazy!(local_warp_valid, 1, 0);
             for plane in 0..3usize {
                 let (sp, dp) = (plane * sa + sbase, plane * da + dbase);
                 self.palette_sizes[dp..dp + n].copy_from_slice(&src.palette_sizes[sp..sp + n]);
@@ -14084,74 +14430,9 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
             }
         }
     }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    pub(crate) fn set_lr_origin(&mut self, row: u32, col: u32) {
-        self.lr_origin = (row, col);
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    pub(crate) fn import_curr_frame_rect_from(
-        &mut self, src: &Self, row4: u32, col4: u32, sub_x: u8, sub_y: u8,
-    ) {
-        for plane in 0..3 {
-            let Some(source) = src.curr_frame[plane].as_ref() else { continue; };
-            let (sx, sy) = if plane == 0 { (0, 0) } else { (sub_x, sub_y) };
-            self.ensure_curr_frame_plane(plane, (self.mi_rows * MI_SIZE as u32) >> sy,
-                (self.mi_cols * MI_SIZE as u32) >> sx);
-            let destination = self.curr_frame[plane].as_mut().unwrap();
-            let y0 = ((row4 * MI_SIZE as u32) >> sy) as usize;
-            let x0 = ((col4 * MI_SIZE as u32) >> sx) as usize;
-            let width = (source.cols as usize).min(destination.cols as usize - x0);
-            let height = (source.rows as usize).min(destination.rows as usize - y0);
-            for y in 0..height {
-                let dst = (y0 + y) * destination.cols as usize + x0;
-                let src = y * source.cols as usize;
-                destination.samples[dst..dst + width].copy_from_slice(&source.samples[src..src + width]);
-            }
-        }
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    pub(crate) fn import_lr_units_from(
-        &mut self, src: &Self, row0: u32, row1: u32, col0: u32, col1: u32,
-        params: &LrParams,
-    ) {
-        for plane in 0..params.num_planes.min(3) {
-            if params.frame_restoration_type[plane] == RESTORE_NONE { continue; }
-            let Some(source) = src.lr_units[plane].as_ref() else { continue; };
-            let unit_size = params.loop_restoration_size[plane];
-            if unit_size == 0 { continue; }
-            if self.lr_units[plane].as_ref().map_or(true, |grid|
-                grid.unit_rows != source.unit_rows || grid.unit_cols != source.unit_cols)
-            {
-                self.lr_units[plane] = Some(LrUnitGrid {
-                    unit_rows: source.unit_rows, unit_cols: source.unit_cols,
-                    units: vec![LrUnit::NONE; source.unit_rows as usize * source.unit_cols as usize],
-                });
-            }
-            let sub_x = if plane == 0 { 0 } else { params.subsampling_x };
-            let sub_y = if plane == 0 { 0 } else { params.subsampling_y };
-            let row_step = (MI_SIZE as u32) >> sub_y;
-            let first_row = (row0 * row_step).div_ceil(unit_size);
-            let last_row = source.unit_rows.min((row1 * row_step).div_ceil(unit_size));
-            let col_step = (MI_SIZE as u32) >> sub_x;
-            let (numerator, denominator) = if params.use_superres {
-                (col_step * params.superres_denom, unit_size * SUPERRES_NUM)
-            } else { (col_step, unit_size) };
-            let first_col = (col0 * numerator).div_ceil(denominator);
-            let last_col = source.unit_cols.min((col1 * numerator).div_ceil(denominator));
-            let destination = self.lr_units[plane].as_mut().unwrap();
-            for row in first_row..last_row {
-                let start = (row * source.unit_cols + first_col) as usize;
-                let end = (row * source.unit_cols + last_col) as usize;
-                destination.units[start..end].copy_from_slice(&source.units[start..end]);
-            }
-        }
-    }
 }
 
-impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker<P, R> {
+impl PartitionWalker {
     /// r464 — diagnostic: the names of the fields on which `self` and
     /// `other` differ (empty when equal).
     #[doc(hidden)]
@@ -14175,6 +14456,16 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
                 short.is_empty() && long.iter().all(|&v| v == 0)
             }
         };
+        // r479 — the inter grids and `DeltaLFs[]` likewise: an empty
+        // grid equals one holding its pre-fill value everywhere.
+        fn lazy_eq<T: PartialEq + Copy>(a: &[T], b: &[T], default: T) -> bool {
+            if a.len() == b.len() {
+                a == b
+            } else {
+                let (short, long) = if a.is_empty() { (a, b) } else { (b, a) };
+                short.is_empty() && long.iter().all(|&v| v == default)
+            }
+        }
         if self.mi_rows != other.mi_rows {
             out.push("mi_rows");
         }
@@ -14193,10 +14484,13 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         if self.walk_avail_l != other.walk_avail_l {
             out.push("walk_avail_l");
         }
+        if self.inter_pred_scratch != other.inter_pred_scratch {
+            out.push("inter_pred_scratch");
+        }
         if !pal_eq_i32(&self.local_warp_params, &other.local_warp_params) {
             out.push("local_warp_params");
         }
-        if self.local_warp_valid != other.local_warp_valid {
+        if !lazy_eq(&self.local_warp_valid, &other.local_warp_valid, 0) {
             out.push("local_warp_valid");
         }
         if self.mi_sizes != other.mi_sizes {
@@ -14217,7 +14511,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         if self.current_delta_lf != other.current_delta_lf {
             out.push("current_delta_lf");
         }
-        if self.delta_lfs != other.delta_lfs {
+        if !lazy_eq(&self.delta_lfs, &other.delta_lfs, 0) {
             out.push("delta_lfs");
         }
         if self.cdef_idx != other.cdef_idx {
@@ -14271,40 +14565,52 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         if !pal_eq(&self.palette_colors, &other.palette_colors) {
             out.push("palette_colors");
         }
-        if self.mvs != other.mvs {
+        if !lazy_eq(&self.mvs, &other.mvs, 0) {
             out.push("mvs");
         }
-        if self.comp_group_idxs != other.comp_group_idxs {
+        if !lazy_eq(&self.comp_group_idxs, &other.comp_group_idxs, 0) {
             out.push("comp_group_idxs");
         }
-        if self.compound_idxs != other.compound_idxs {
+        if !lazy_eq(&self.compound_idxs, &other.compound_idxs, 1) {
             out.push("compound_idxs");
         }
-        if self.interp_filters != other.interp_filters {
+        if !lazy_eq(&self.interp_filters, &other.interp_filters, EIGHTTAP) {
             out.push("interp_filters");
         }
-        if self.compound_types != other.compound_types {
+        if !lazy_eq(
+            &self.compound_types,
+            &other.compound_types,
+            crate::inter_pred::COMPOUND_AVERAGE,
+        ) {
             out.push("compound_types");
         }
-        if self.compound_wedge_indices != other.compound_wedge_indices {
+        if !lazy_eq(
+            &self.compound_wedge_indices,
+            &other.compound_wedge_indices,
+            0,
+        ) {
             out.push("compound_wedge_indices");
         }
-        if self.compound_wedge_signs != other.compound_wedge_signs {
+        if !lazy_eq(&self.compound_wedge_signs, &other.compound_wedge_signs, 0) {
             out.push("compound_wedge_signs");
         }
-        if self.compound_mask_types != other.compound_mask_types {
+        if !lazy_eq(&self.compound_mask_types, &other.compound_mask_types, 0) {
             out.push("compound_mask_types");
         }
-        if self.interintra_modes != other.interintra_modes {
+        if !lazy_eq(&self.interintra_modes, &other.interintra_modes, 0) {
             out.push("interintra_modes");
         }
-        if self.wedge_interintras != other.wedge_interintras {
+        if !lazy_eq(&self.wedge_interintras, &other.wedge_interintras, 0) {
             out.push("wedge_interintras");
         }
-        if self.interintra_wedge_indices != other.interintra_wedge_indices {
+        if !lazy_eq(
+            &self.interintra_wedge_indices,
+            &other.interintra_wedge_indices,
+            0,
+        ) {
             out.push("interintra_wedge_indices");
         }
-        if self.motion_modes != other.motion_modes {
+        if !lazy_eq(&self.motion_modes, &other.motion_modes, MOTION_MODE_SIMPLE) {
             out.push("motion_modes");
         }
         if self.blocks != other.blocks {
@@ -14353,7 +14659,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
     }
 }
 
-impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker<P, R> {
+impl PartitionWalker {
     /// `transform_type( x4, y4, txSz )` per §5.11.47 (av1-spec p.99-100).
     /// Decodes the per-luma-TU `TxType` from the bitstream and emits
     /// the value the caller stamps into `TxTypes[ y4 + j ][ x4 + i ]`.
@@ -14721,11 +15027,110 @@ pub fn get_br_ctx(quant: &[i32], tx_size: usize, tx_class: usize, pos: usize) ->
             mag + 14
         }
     } else if tx_class == TX_CLASS_HORIZ {
-        if col == 0 {
+        if col == 0 { mag + 7 } else { mag + 14 }
+    } else if row == 0 {
+        mag + 7
+    } else {
+        mag + 14
+    }
+}
+
+/// Cells of one §7.11.2 edge buffer at the largest block: two guard
+/// cells plus `2 * ( w + h )` with `w = h = 64`.
+const INTRA_EDGE_CELLS: usize = 2 * (64 + 64) + 2;
+
+thread_local! {
+    /// r487 — per-thread §7.11.2 prediction block, reused across
+    /// blocks so intra prediction allocates nothing per call.
+    static INTRA_PRED_SCRATCH: std::cell::RefCell<Vec<u16>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The thread's prediction buffer on loan; handed back on drop (a
+/// nested loan simply starts from an empty buffer).
+struct IntraPredScratch(Vec<u16>);
+
+impl IntraPredScratch {
+    fn take() -> Self {
+        Self(INTRA_PRED_SCRATCH.take())
+    }
+}
+
+impl Drop for IntraPredScratch {
+    fn drop(&mut self) {
+        // `try_with`: a drop during thread teardown just frees it.
+        let buf = core::mem::take(&mut self.0);
+        let _ = INTRA_PRED_SCRATCH.try_with(|cell| cell.replace(buf));
+    }
+}
+
+/// r481 — padding (columns right of / rows below the transform block)
+/// of the coefficient-context level copy: the largest §8.3.2
+/// neighbour offset.
+pub(crate) const LEVELS_PAD: usize = 4;
+
+/// r481 — [`get_coeff_base_ctx`] (`isEob == 0`) over the padded level
+/// copy: `levels[ lpos ]` is position `pos` (row `pos >> bwl`), rows
+/// `stride` apart. Same value for every input.
+#[inline(always)]
+pub(crate) fn coeff_base_ctx_from_levels(
+    levels: &[u8],
+    stride: usize,
+    lpos: usize,
+    tx_size: usize,
+    tx_class: usize,
+    pos: usize,
+    bwl: usize,
+) -> usize {
+    let l = |off: usize| u32::from(levels[lpos + off].min(3));
+    let mag = match tx_class {
+        TX_CLASS_2D => l(1) + l(stride) + l(stride + 1) + l(2) + l(2 * stride),
+        TX_CLASS_HORIZ => l(1) + l(stride) + l(2) + l(3) + l(4),
+        _ => l(1) + l(stride) + l(2 * stride) + l(3 * stride) + l(4 * stride),
+    };
+    let ctx = ((mag + 1) >> 1).min(4) as usize;
+    let row = pos >> bwl;
+    let col = pos - (row << bwl);
+    if tx_class == TX_CLASS_2D {
+        if row == 0 && col == 0 {
+            return 0;
+        }
+        return ctx + COEFF_BASE_CTX_OFFSET[tx_size][row.min(4)][col.min(4)];
+    }
+    let idx = if tx_class == TX_CLASS_VERT { row } else { col };
+    ctx + COEFF_BASE_POS_CTX_OFFSET[idx.min(2)]
+}
+
+/// r481 — [`get_br_ctx`] over the padded level copy (levels stored
+/// clamped to `COEFF_BASE_RANGE + NUM_BASE_LEVELS + 1 = 15`).
+#[inline(always)]
+pub(crate) fn br_ctx_from_levels(
+    levels: &[u8],
+    stride: usize,
+    lpos: usize,
+    tx_class: usize,
+    pos: usize,
+    bwl: usize,
+) -> usize {
+    let l = |off: usize| u32::from(levels[lpos + off]);
+    let mag = match tx_class {
+        TX_CLASS_2D => l(1) + l(stride) + l(stride + 1),
+        TX_CLASS_HORIZ => l(1) + l(stride) + l(2),
+        _ => l(1) + l(stride) + l(2 * stride),
+    };
+    let mag = ((mag + 1) >> 1).min(6) as usize;
+    let row = pos >> bwl;
+    let col = pos - (row << bwl);
+    if pos == 0 {
+        mag
+    } else if tx_class == TX_CLASS_2D {
+        if row < 2 && col < 2 {
             mag + 7
         } else {
             mag + 14
         }
+    } else if tx_class == TX_CLASS_HORIZ {
+        if col == 0 { mag + 7 } else { mag + 14 }
     } else if row == 0 {
         mag + 7
     } else {
@@ -14828,11 +15233,7 @@ pub fn interintra_ctx(mi_size: usize) -> Option<usize> {
         return None;
     }
     let g = SIZE_GROUP[mi_size];
-    if g == 0 {
-        None
-    } else {
-        Some(g - 1)
-    }
+    if g == 0 { None } else { Some(g - 1) }
 }
 
 /// §8.3.2 `comp_group_idx` context selection (av1-spec p.384). The
@@ -14893,11 +15294,7 @@ pub fn comp_group_idx_ctx(
             ctx += 3;
         }
     }
-    if ctx > 5 {
-        5
-    } else {
-        ctx
-    }
+    if ctx > 5 { 5 } else { ctx }
 }
 
 /// §8.3.2 `compound_idx` context selection (av1-spec p.384). The spec
@@ -15496,11 +15893,7 @@ pub const fn partition_subsize(partition: usize, b_size: usize) -> Option<usize>
         return None;
     }
     let v = PARTITION_SUBSIZE[partition][b_size];
-    if v == BLOCK_INVALID {
-        None
-    } else {
-        Some(v)
-    }
+    if v == BLOCK_INVALID { None } else { Some(v) }
 }
 
 // ===================================================================
@@ -15793,11 +16186,51 @@ impl FrameInterOrderHints {
 const MAX_SB4: usize = 32;
 const BD_STRIDE: usize = MAX_SB4 + 2;
 
+/// r481 — `grid[ ( r * mi_cols + c ) * K .. + K ] = val` over the
+/// `h × w` mi block at `( r0, c0 )`, clipped to the `mi_rows × mi_cols`
+/// grid (the §5.11.5 grid-fill of a block straddling the bottom / right
+/// edge writes only its in-grid part), one row slice at a time.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn stamp_rect<T: Copy, const K: usize>(
+    grid: &mut [T],
+    mi_rows: u32,
+    mi_cols: u32,
+    r0: u32,
+    c0: u32,
+    h: u32,
+    w: u32,
+    val: [T; K],
+) {
+    if c0 >= mi_cols {
+        return;
+    }
+    let c1 = (c0 + w).min(mi_cols) as usize;
+    let cols = mi_cols as usize;
+    for r in r0..(r0 + h).min(mi_rows) {
+        let row = r as usize * cols;
+        let cells = &mut grid[(row + c0 as usize) * K..(row + c1) * K];
+        if K == 1 {
+            cells.fill(val[0]);
+        } else {
+            for cell in cells.as_chunks_mut::<K>().0 {
+                *cell = val;
+            }
+        }
+    }
+}
+
+/// r481 — the still-decoding §7.20 slots a frame-parallel walk reads
+/// (by slot index; `None` = final, read through the frame store).
+#[derive(Debug, Default)]
+pub(crate) struct RefRowSources {
+    pub(crate) slots: [Option<std::sync::Arc<crate::decoder::ref_planes::RefPlanes>>; 8],
+}
+
 // r421: `Clone` so the encoder's search-side rate twin can price
 // candidate symbol sequences on a snapshot of the write-side mirror.
 #[derive(Debug, Clone)]
-pub struct PartitionWalker<P: crate::loop_filter::Pixel = i32, R: crate::loop_filter::Pixel = u16> {
-    reference_sample: core::marker::PhantomData<R>,
+pub struct PartitionWalker {
     mi_rows: u32,
     mi_cols: u32,
     geometry: TileGeometry,
@@ -15810,6 +16243,31 @@ pub struct PartitionWalker<P: crate::loop_filter::Pixel = i32, R: crate::loop_fi
     /// (the unfiltered/un-upsampled path) on a freshly constructed
     /// walker.
     enable_intra_edge_filter: bool,
+    /// r481 — syntax-only walk: every symbol is read and every
+    /// mode-info / context grid stamped exactly as in the full walk
+    /// (AV1 parsing never reads a reconstructed sample), but no sample
+    /// is predicted or reconstructed. The frame-parallel decoder runs
+    /// it ahead of the full walk so that a later frame's walk (which
+    /// needs this frame's §7.20 CDFs, §7.19 motion field and segment
+    /// ids) can start before this frame's samples exist.
+    parse_only: bool,
+    /// r481 — the §7.20 slots whose planes are still being decoded by
+    /// an earlier frame (frame-parallel decode), by slot index: before
+    /// motion-compensating a leaf the walker waits until each slot it
+    /// reads has published the rows the leaf's motion vectors reach,
+    /// and predicts from that published prefix.
+    ref_rows: Option<std::sync::Arc<RefRowSources>>,
+    /// r481 — the §8.3.2 coefficient-context level copy (see
+    /// [`Self::coefficients_gate_open`]), reused across blocks.
+    coeff_levels: Vec<u8>,
+    /// r481 — reused transform-block buffers (coefficients, dequantized
+    /// coefficients, residual).
+    tx_quant_scratch: Vec<i32>,
+    tx_dequant_scratch: Vec<i64>,
+    tx_residual_scratch: Vec<i64>,
+    /// Whether `residual()` readouts carry each transform block's
+    /// residual (the API's default); the frame decoder turns it off.
+    keep_residual_readouts: bool,
     /// §5.11.18 per-cell `AvailU` (`is_inside( MiRow - 1, MiCol )`,
     /// av1-spec line 3915) for the current tile geometry — rebuilt at
     /// [`Self::begin_tile`] (and at construction) and consumed by the
@@ -15820,6 +16278,13 @@ pub struct PartitionWalker<P: crate::loop_filter::Pixel = i32, R: crate::loop_fi
     /// §5.11.18 per-cell `AvailL` (`is_inside( MiRow, MiCol - 1 )`,
     /// av1-spec line 3916) — sibling of [`Self::walk_avail_u`].
     walk_avail_l: Vec<u8>,
+    /// In-walk §5.11.33 `predict_inter` scratch — per-plane `u16`
+    /// mirrors of `CurrFrame[ plane ]` (the §7.11.3 drivers operate
+    /// on `u16` planes; the walker's buffers are post-`Clip1` `i32`,
+    /// so both directions of the mirror are lossless). Lazily sized
+    /// on first use; only the leaf's plane rect is synced per
+    /// prediction, so stale samples outside the rect are never read.
+    inter_pred_scratch: [Vec<u16>; 3],
     /// §7.11.3.8 `LocalWarpParams[ 0..6 ]` per cell — stamped at a
     /// `WARPED_CAUSAL` leaf's origin by the §5.11.5 inter arm (the
     /// §7.10.4 sample list + §7.11.3.8 least-squares fit run at the
@@ -16209,7 +16674,10 @@ pub struct PartitionWalker<P: crate::loop_filter::Pixel = i32, R: crate::loop_fi
     /// `DecodedBlockRecord` leaves emitted by [`Self::decode_partition`]
     /// in §5.11.4 syntax order.
     blocks: Vec<DecodedBlockRecord>,
-    /// Frame-relative restoration origin for a tile-sized intra walker.
+    /// r475 — the frame-level mi origin of a TILE-SIZED walker (the
+    /// tile at the origin of its own frame): §5.11.57 `read_lr`
+    /// indexes the frame's restoration-unit grid at `( r + row, c +
+    /// col )`. `(0, 0)` for a frame-scope walker.
     lr_origin: (u32, u32),
     /// `CurrFrame[ plane ][ y ][ x ]` (av1-spec §7.12.3 step-3 / §7.11.x
     /// prediction kernels / §7.14 loop filter / §7.15 CDEF / §7.16
@@ -16231,13 +16699,14 @@ pub struct PartitionWalker<P: crate::loop_filter::Pixel = i32, R: crate::loop_fi
     /// identity for the §7.12.3 step-3 additive merge before any
     /// upstream §7.11.x prediction-sample writer fires (a TU with no
     /// prediction sees `CurrFrame[..][..] = Clip1(0 + Residual[i][j])`,
-    /// the spec's `prediction == 0` arm). Clipped samples use the
-    /// selected native storage; residual addition widens before clipping.
-    curr_frame: [Option<CurrFramePlane<P>>; 3],
+    /// the spec's `prediction == 0` arm). Stored as `i32` so the
+    /// pre-`Clip1` `prediction + Residual[i][j]` sum fits without
+    /// truncation across all `BitDepth ∈ {8, 10, 12}` modes.
+    curr_frame: [Option<CurrFramePlane>; 3],
     /// r408 — §7.11.5 luma TU-overhang side store (see
     /// [`LumaOverhang`]). Lazily allocated on the first clipped
     /// plane-0 write.
-    luma_overhang: Option<Box<LumaOverhang<P>>>,
+    luma_overhang: Option<Box<LumaOverhang>>,
     /// `RefLrWiener[ plane ][ pass ][ WIENER_COEFFS ]` (§5.11.2 /
     /// §5.11.58 — av1-spec p.60 / p.106). The per-plane, per-pass
     /// running reference for the §5.11.58 `decode_signed_subexp_with_ref_bool`
@@ -16317,12 +16786,13 @@ pub struct PartitionWalker<P: crate::loop_filter::Pixel = i32, R: crate::loop_fi
 
 /// Per-plane `CurrFrame[plane]` sample buffer — owned `(rows, cols,
 /// samples)` triple. The flat `samples` buffer is row-major with
-/// `rows * cols` native clipped entries.
+/// `rows * cols` 16-bit entries (every stored sample is post-`Clip1`,
+/// at most `(1 << BitDepth) - 1 <= 4095`).
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct CurrFramePlane<P: crate::loop_filter::Pixel> {
+struct CurrFramePlane {
     rows: u32,
     cols: u32,
-    samples: Vec<P>,
+    samples: Vec<u16>,
 }
 
 /// r408 — §7.11.5 luma TU-overhang store. The spec's `CurrFrame[ 0 ]`
@@ -16339,36 +16809,36 @@ struct CurrFramePlane<P: crate::loop_filter::Pixel> {
 /// LUMA_OH)`, `corner` both. `LUMA_OH = 64` bounds the largest
 /// possible overhang (`Tx_Width ≤ 64`).
 #[derive(Debug, Clone, PartialEq)]
-struct LumaOverhang<P: crate::loop_filter::Pixel> {
+struct LumaOverhang {
     rows: u32,
     cols: u32,
     /// `rows × LUMA_OH`, row-major.
-    right: Vec<P>,
+    right: Vec<i32>,
     /// `LUMA_OH × cols`, row-major.
-    bottom: Vec<P>,
+    bottom: Vec<i32>,
     /// `LUMA_OH × LUMA_OH`, row-major.
-    corner: Vec<P>,
+    corner: Vec<i32>,
 }
 
 /// Maximum §5.11.35 luma TU overhang past the mi-padded grid.
 const LUMA_OH: u32 = 64;
 
-impl<P: crate::loop_filter::Pixel> LumaOverhang<P> {
+impl LumaOverhang {
     fn new(rows: u32, cols: u32) -> Option<Box<Self>> {
         let r = (rows as usize).checked_mul(LUMA_OH as usize)?;
         let b = (LUMA_OH as usize).checked_mul(cols as usize)?;
         let mut right = Vec::new();
         right.try_reserve_exact(r).ok()?;
-        right.resize(r, P::default());
+        right.resize(r, 0);
         let mut bottom = Vec::new();
         bottom.try_reserve_exact(b).ok()?;
-        bottom.resize(b, P::default());
+        bottom.resize(b, 0);
         Some(Box::new(Self {
             rows,
             cols,
             right,
             bottom,
-            corner: vec![P::default(); (LUMA_OH as usize) * (LUMA_OH as usize)],
+            corner: vec![0i32; (LUMA_OH as usize) * (LUMA_OH as usize)],
         }))
     }
 
@@ -16383,23 +16853,23 @@ impl<P: crate::loop_filter::Pixel> LumaOverhang<P> {
             if ox >= LUMA_OH {
                 return 0;
             }
-            return self.right[(y as usize) * (LUMA_OH as usize) + (ox as usize)].to_i32();
+            return self.right[(y as usize) * (LUMA_OH as usize) + (ox as usize)];
         }
         let oy = y - self.rows;
         if oy >= LUMA_OH {
             return 0;
         }
         if x < self.cols {
-            return self.bottom[(oy as usize) * (self.cols as usize) + (x as usize)].to_i32();
+            return self.bottom[(oy as usize) * (self.cols as usize) + (x as usize)];
         }
         let ox = x - self.cols;
         if ox >= LUMA_OH {
             return 0;
         }
-        self.corner[(oy as usize) * (LUMA_OH as usize) + (ox as usize)].to_i32()
+        self.corner[(oy as usize) * (LUMA_OH as usize) + (ox as usize)]
     }
 
-    fn slot(&mut self, y: u32, x: u32) -> Option<&mut P> {
+    fn slot(&mut self, y: u32, x: u32) -> Option<&mut i32> {
         if y < self.rows && x < self.cols {
             return None;
         }
@@ -16681,7 +17151,7 @@ pub struct TileDecodeParams<'a> {
     pub enable_intra_edge_filter: bool,
 }
 
-impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker<P, R> {
+impl PartitionWalker {
     /// Construct a fresh walker for a frame with the given mi-unit
     /// extent and tile bounds. Every `MiSizes[]` cell starts at
     /// [`BLOCK_INVALID`] (the §5.11.4 unfilled-cell sentinel).
@@ -16830,10 +17300,15 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         // == 0` ⇒ return) ensures the pre-fill value is unobservable
         // on the conformant path until `assign_mv` (next-arc) writes
         // it.
-        let area4 = area.checked_mul(4)?;
-        let mut mvs: Vec<i16> = Vec::new();
-        mvs.try_reserve_exact(area4).ok()?;
-        mvs.resize(area4, 0);
+        // r479 — `Mvs[]`, `InterpFilters[]`, the §5.11.27 / §5.11.28 /
+        // §5.11.29 side-data grids, `DeltaLFs[]` and `LocalValid[]`
+        // are materialised lazily (see [`Self::ensure_inter_grids`] /
+        // [`Self::ensure_delta_lfs`]): only an inter or intra-block-
+        // copy leaf stamps them, so an intra frame's walker never
+        // carries their 21 bytes per mi (15 MiB at 12 MP — the
+        // encoder keeps up to four walkers alive per picture). Every
+        // reader treats the empty grid as the pre-fill value.
+        let mvs: Vec<i16> = Vec::new();
         // §5.11.29 / §8.3.2: pre-fill `CompGroupIdxs[r][c]` with `0`,
         // the §5.11.29 default `comp_group_idx = 0` initialiser (also
         // the natural identity for an unavailable neighbour — the
@@ -16841,17 +17316,13 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         // the `!AboveSingle` / `!LeftSingle` arms which fire on
         // compound-coded neighbours, never on intra / single-pred or
         // unavailable cells).
-        let mut comp_group_idxs: Vec<u8> = Vec::new();
-        comp_group_idxs.try_reserve_exact(area).ok()?;
-        comp_group_idxs.resize(area, 0);
+        let comp_group_idxs: Vec<u8> = Vec::new();
         // §5.11.29 / §8.3.2: pre-fill `CompoundIdxs[r][c]` with `1`,
         // the §5.11.29 default `compound_idx = 1` initialiser. The
         // §8.3.2 `compound_idx` ctx body only consults this grid on
         // the `!AboveSingle` / `!LeftSingle` arms (same identity
         // story as `CompGroupIdxs` above).
-        let mut compound_idxs: Vec<u8> = Vec::new();
-        compound_idxs.try_reserve_exact(area).ok()?;
-        compound_idxs.resize(area, 1);
+        let compound_idxs: Vec<u8> = Vec::new();
         // §5.11.29 / §5.11.28 / §5.11.27 inter side-data grids — the
         // already-resolved decode outputs the §5.11.33 frame walk
         // dispatches compound / inter-intra / warped leaves from. Each
@@ -16860,36 +17331,18 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         // pre-fill values are the §5.11.29 / §5.11.28 / §5.11.27
         // short-circuit defaults (never read on a single-ref / intra
         // cell). See the field docs for the per-grid semantics.
-        let mut compound_types: Vec<u8> = Vec::new();
-        compound_types.try_reserve_exact(area).ok()?;
-        compound_types.resize(area, crate::inter_pred::COMPOUND_AVERAGE);
-        let mut compound_wedge_indices: Vec<u8> = Vec::new();
-        compound_wedge_indices.try_reserve_exact(area).ok()?;
-        compound_wedge_indices.resize(area, 0);
-        let mut compound_wedge_signs: Vec<u8> = Vec::new();
-        compound_wedge_signs.try_reserve_exact(area).ok()?;
-        compound_wedge_signs.resize(area, 0);
-        let mut compound_mask_types: Vec<u8> = Vec::new();
-        compound_mask_types.try_reserve_exact(area).ok()?;
-        compound_mask_types.resize(area, 0);
-        let mut interintra_modes: Vec<u8> = Vec::new();
-        interintra_modes.try_reserve_exact(area).ok()?;
-        interintra_modes.resize(area, 0);
-        let mut wedge_interintras: Vec<u8> = Vec::new();
-        wedge_interintras.try_reserve_exact(area).ok()?;
-        wedge_interintras.resize(area, 0);
-        let mut interintra_wedge_indices: Vec<u8> = Vec::new();
-        interintra_wedge_indices.try_reserve_exact(area).ok()?;
-        interintra_wedge_indices.resize(area, 0);
-        let mut motion_modes: Vec<u8> = Vec::new();
-        motion_modes.try_reserve_exact(area).ok()?;
-        motion_modes.resize(area, MOTION_MODE_SIMPLE);
+        let compound_types: Vec<u8> = Vec::new();
+        let compound_wedge_indices: Vec<u8> = Vec::new();
+        let compound_wedge_signs: Vec<u8> = Vec::new();
+        let compound_mask_types: Vec<u8> = Vec::new();
+        let interintra_modes: Vec<u8> = Vec::new();
+        let wedge_interintras: Vec<u8> = Vec::new();
+        let interintra_wedge_indices: Vec<u8> = Vec::new();
+        let motion_modes: Vec<u8> = Vec::new();
         // §5.11.5 `DeltaLFs[ r ][ c ][ i ]` per-mi snapshot grid —
         // `area * FRAME_LF_COUNT` slots, pre-filled `0` (the §5.9.18
         // zero default). Stamped per block via `stamp_delta_lfs`.
-        let mut delta_lfs: Vec<i8> = Vec::new();
-        delta_lfs.try_reserve_exact(area * FRAME_LF_COUNT).ok()?;
-        delta_lfs.resize(area * FRAME_LF_COUNT, 0);
+        let delta_lfs: Vec<i8> = Vec::new();
         // §5.11.x / §8.3.2: pre-fill `InterpFilters[r][c][0..2]` with
         // `EIGHTTAP = 0`, the spec's `interp_filter[ dir ] = EIGHTTAP`
         // fallback (set when `needs_interp_filter() == 0`). The §8.3.2
@@ -16899,9 +17352,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         // `aboveType = 3` / `leftType = 3` sentinel and never read the
         // grid value, so the pre-fill is unobserved on the conformant
         // path for the first inter block.
-        let mut interp_filters: Vec<u8> = Vec::new();
-        interp_filters.try_reserve_exact(area2).ok()?;
-        interp_filters.resize(area2, EIGHTTAP);
+        let interp_filters: Vec<u8> = Vec::new();
         // §6.10.3 `BlockDecoded[ plane ][ y ][ x ]` — a constant-size
         // superblock-local grid (`3 * BD_STRIDE * BD_STRIDE`). The
         // fresh-walker fill is `0`; the §5.11.3
@@ -16924,24 +17375,26 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
             }
         }
         Some(Self {
-            reference_sample: core::marker::PhantomData,
             mi_rows,
             mi_cols,
             geometry,
             enable_intra_edge_filter: false,
+            parse_only: false,
+            ref_rows: None,
+            coeff_levels: Vec::new(),
+            tx_quant_scratch: Vec::new(),
+            tx_dequant_scratch: Vec::new(),
+            tx_residual_scratch: Vec::new(),
+            keep_residual_readouts: true,
             walk_avail_u,
             walk_avail_l,
+            inter_pred_scratch: [Vec::new(), Vec::new(), Vec::new()],
             // r464 — materialised lazily by the first WARPED_CAUSAL
             // stamp (`ensure_local_warp_params`): 24 bytes per mi, 18
             // MB of zeros per walker at 12 MP that an intra frame
             // never reads.
             local_warp_params: Vec::new(),
-            local_warp_valid: {
-                let mut v: Vec<u8> = Vec::new();
-                v.try_reserve_exact(area).ok()?;
-                v.resize(area, 0);
-                v
-            },
+            local_warp_valid: Vec::new(),
             mi_sizes,
             skips,
             skip_modes,
@@ -17025,6 +17478,123 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
     /// single-tile decode never needs to call this; multi-tile decodes
     /// (or a re-used walker) call it at each tile's entry to reset the
     /// running subexp references the §5.11.58 `read_lr_unit` reads.
+    /// r475 — declare this walker TILE-SIZED at frame mi origin
+    /// `(mi_row, mi_col)`: §5.11.57 `read_lr` then indexes the
+    /// frame's restoration-unit grid from that origin (the grid
+    /// itself keeps the frame's unit extents, which `LrParams`
+    /// carries). Every other §5.11 process is tile-scoped by the
+    /// spec, so the walk is the frame walk's.
+    pub fn set_lr_origin(&mut self, mi_row: u32, mi_col: u32) {
+        self.lr_origin = (mi_row, mi_col);
+    }
+
+    /// r475 — stitch a tile-sized walker's `CurrFrame[ plane ]` planes
+    /// into this frame-scope walker's planes at frame mi position
+    /// `(dst_row4, dst_col4)` (the planes are allocated at the frame
+    /// extent on first use). Tile boundaries are superblock aligned,
+    /// so the chroma rect origin is exact under any subsampling.
+    pub(crate) fn import_curr_frame_rect_from(
+        &mut self,
+        src: &Self,
+        dst_row4: u32,
+        dst_col4: u32,
+        sub_x: u8,
+        sub_y: u8,
+    ) {
+        for plane in 0..3usize {
+            let Some(sp) = src.curr_frame[plane].as_ref() else {
+                continue;
+            };
+            let (ssx, ssy) = if plane == 0 { (0, 0) } else { (sub_x, sub_y) };
+            let rows = (self.mi_rows * (MI_SIZE as u32)) >> ssy;
+            let cols = (self.mi_cols * (MI_SIZE as u32)) >> ssx;
+            self.ensure_curr_frame_plane(plane, rows, cols);
+            let Some(dp) = self.curr_frame[plane].as_mut() else {
+                continue;
+            };
+            let y0 = ((dst_row4 * (MI_SIZE as u32)) >> ssy) as usize;
+            let x0 = ((dst_col4 * (MI_SIZE as u32)) >> ssx) as usize;
+            let w = (sp.cols as usize).min((dp.cols as usize).saturating_sub(x0));
+            let h = (sp.rows as usize).min((dp.rows as usize).saturating_sub(y0));
+            let (sc, dc) = (sp.cols as usize, dp.cols as usize);
+            for y in 0..h {
+                dp.samples[(y0 + y) * dc + x0..(y0 + y) * dc + x0 + w]
+                    .copy_from_slice(&sp.samples[y * sc..y * sc + w]);
+            }
+        }
+    }
+
+    /// r475 — import the §5.11.58 restoration units a tile-sized
+    /// walker decoded for the frame mi rect `[ mi_row0, mi_row1 ) ×
+    /// [ mi_col0, mi_col1 )`: the unit ranges the §5.11.57 window
+    /// arithmetic visits over that rect (the union over its
+    /// superblocks — `div_ceil` is monotone, so the union is one
+    /// range per axis).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn import_lr_units_from(
+        &mut self,
+        src: &Self,
+        mi_row0: u32,
+        mi_row1: u32,
+        mi_col0: u32,
+        mi_col1: u32,
+        params: &LrParams,
+    ) {
+        for plane in 0..params.num_planes.min(3) {
+            if params.frame_restoration_type[plane] == RESTORE_NONE {
+                continue;
+            }
+            let Some(sg) = src.lr_units[plane].as_ref() else {
+                continue;
+            };
+            let sub_x = if plane == 0 { 0 } else { params.subsampling_x };
+            let sub_y = if plane == 0 { 0 } else { params.subsampling_y };
+            let unit_size = params.loop_restoration_size[plane];
+            if unit_size == 0 {
+                continue;
+            }
+            let needs_alloc = match self.lr_units.get(plane).and_then(Option::as_ref) {
+                Some(g) => g.unit_rows != sg.unit_rows || g.unit_cols != sg.unit_cols,
+                None => true,
+            };
+            if needs_alloc {
+                self.lr_units[plane] = Some(LrUnitGrid {
+                    unit_rows: sg.unit_rows,
+                    unit_cols: sg.unit_cols,
+                    units: vec![LrUnit::NONE; (sg.unit_rows as usize) * (sg.unit_cols as usize)],
+                });
+            }
+            let mi_size_shift_y = (MI_SIZE as u32) >> sub_y;
+            let row_start = (mi_row0 * mi_size_shift_y).div_ceil(unit_size);
+            let row_end = core::cmp::min(
+                sg.unit_rows,
+                (mi_row1 * mi_size_shift_y).div_ceil(unit_size),
+            );
+            let mi_size_shift_x = (MI_SIZE as u32) >> sub_x;
+            let (numerator, denominator) = if params.use_superres {
+                (
+                    mi_size_shift_x * params.superres_denom,
+                    unit_size * SUPERRES_NUM,
+                )
+            } else {
+                (mi_size_shift_x, unit_size)
+            };
+            let col_start = (mi_col0 * numerator).div_ceil(denominator);
+            let col_end = core::cmp::min(sg.unit_cols, (mi_col1 * numerator).div_ceil(denominator));
+            let Some(dg) = self.lr_units[plane].as_mut() else {
+                continue;
+            };
+            for ur in row_start..row_end {
+                for uc in col_start..col_end {
+                    let idx = (ur as usize) * (sg.unit_cols as usize) + uc as usize;
+                    if let (Some(d), Some(&v)) = (dg.units.get_mut(idx), sg.units.get(idx)) {
+                        *d = v;
+                    }
+                }
+            }
+        }
+    }
+
     pub fn reset_lr_refs(&mut self) {
         self.ref_lr_wiener = [[crate::loop_restoration::WIENER_TAPS_MID; 2]; 3];
         self.ref_sgr_xqd = [crate::loop_restoration::SGRPROJ_XQD_MID; 3];
@@ -17093,13 +17663,13 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
     ///
     /// Indexed `samples()[ y * cols + x ]` against the `(rows, cols)`
     /// pair returned by [`Self::curr_frame_dims`]. Sample values are
-    /// native post-`Clip1` (so always in `0..=(1 << BitDepth) - 1` for
+    /// 16-bit post-`Clip1` (so always in `0..=(1 << BitDepth) - 1` for
     /// the `BitDepth` the §7.12.3 step-3 merge was driven with).
     ///
     /// `plane` is `0` (Y), `1` (Cb), `2` (Cr); out-of-range `plane`
     /// returns `None`.
     #[must_use]
-    pub fn curr_frame(&self, plane: usize) -> Option<&[P]> {
+    pub fn curr_frame(&self, plane: usize) -> Option<&[u16]> {
         self.curr_frame
             .get(plane)
             .and_then(|p| p.as_ref().map(|cp| cp.samples.as_slice()))
@@ -17110,9 +17680,9 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
     /// §7.16 / §7.17 in-loop passes operate on caller-owned buffers
     /// and nothing in the walker reads `CurrFrame` after the walk, so
     /// the frame driver takes ownership instead of copying the
-    /// full-frame native buffer. Returns `(rows, cols, samples)`; the
+    /// full-frame buffer. Returns `(rows, cols, samples)`; the
     /// plane's slot is left unallocated (as before the first merge).
-    pub(crate) fn take_curr_frame_plane(&mut self, plane: usize) -> Option<(u32, u32, Vec<P>)> {
+    pub(crate) fn take_curr_frame_plane(&mut self, plane: usize) -> Option<(u32, u32, Vec<u16>)> {
         self.curr_frame
             .get_mut(plane)
             .and_then(|p| p.take())
@@ -17143,7 +17713,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
     /// [`LumaOverhang`] side store (lazily allocated / re-shaped to
     /// the current luma extents). Returns `None` when `(y, x)` is
     /// inside the main buffer or past the `LUMA_OH` headroom.
-    fn luma_overhang_slot(&mut self, y: u32, x: u32) -> Option<&mut P> {
+    fn luma_overhang_slot(&mut self, y: u32, x: u32) -> Option<&mut i32> {
         let (rows, cols) = {
             let b = self.curr_frame[0].as_ref()?;
             (b.rows, b.cols)
@@ -17161,6 +17731,17 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         self.luma_overhang.as_mut()?.slot(y, x)
     }
 
+    /// r481 — allocate every `CurrFrame` plane of the frame up front
+    /// (the frame-parallel in-loop passes run on them mid-walk).
+    pub(crate) fn ensure_curr_frame_planes(&mut self, num_planes: usize, sub_x: u8, sub_y: u8) {
+        for plane in 0..num_planes.min(3) {
+            let (sx, sy) = if plane == 0 { (0, 0) } else { (sub_x, sub_y) };
+            let rows = (self.mi_rows * (MI_SIZE as u32)) >> sy;
+            let cols = (self.mi_cols * (MI_SIZE as u32)) >> sx;
+            self.ensure_curr_frame_plane(plane, rows, cols);
+        }
+    }
+
     fn ensure_curr_frame_plane(&mut self, plane: usize, rows: u32, cols: u32) {
         if plane >= 3 {
             return;
@@ -17169,11 +17750,11 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
             return;
         }
         let len = (rows as usize).saturating_mul(cols as usize);
-        let mut samples: Vec<P> = Vec::new();
+        let mut samples: Vec<u16> = Vec::new();
         if samples.try_reserve_exact(len).is_err() {
             return;
         }
-        samples.resize(len, P::default());
+        samples.resize(len, 0);
         self.curr_frame[plane] = Some(CurrFramePlane {
             rows,
             cols,
@@ -17283,9 +17864,10 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
 
         let read = |yy: u32, xx: u32| -> u16 {
             let idx = (yy as usize) * (buf_cols as usize) + (xx as usize);
-            buf.samples[idx].to_i32() as u16
+            buf.samples[idx]
         };
-        let Some(pred) = Self::intra_predict_block_samples(
+        let mut scratch = IntraPredScratch::take();
+        if !Self::intra_predict_block_samples(
             &read,
             max_x,
             max_y,
@@ -17306,15 +17888,26 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
             // the normal mode dispatch exactly as before the r417
             // core extraction.
             filter_intra_mode.filter(|_| plane == 0),
-        ) else {
+            &mut scratch.0,
+        ) {
             return;
-        };
+        }
+        let pred: &[u16] = &scratch.0;
 
         let Some(buf) = self.curr_frame[plane as usize].as_mut() else {
             return;
         };
         let cols_buf = buf.cols;
         let rows_buf = buf.rows;
+        // r487 — a block wholly inside the plane buffer: row copies.
+        if start_y + h as u32 <= rows_buf && start_x + w as u32 <= cols_buf && pred.len() >= w * h {
+            let cols_u = cols_buf as usize;
+            for (i, src) in pred.chunks_exact(w).take(h).enumerate() {
+                let d0 = (start_y as usize + i) * cols_u + start_x as usize;
+                buf.samples[d0..d0 + w].copy_from_slice(src);
+            }
+            return;
+        }
         // r408: a §5.11.35 TU legally overhangs the mi-padded grid;
         // §7.11.5 CfL reads the overhung luma samples back (spec
         // CurrFrame is unbounded), so plane-0 out-of-buffer cells go
@@ -17331,12 +17924,12 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
                     continue;
                 }
                 let idx = (dst_y as usize) * (cols_buf as usize) + (dst_x as usize);
-                buf.samples[idx] = P::from_i32(pred[(i as usize) * w + (j as usize)] as i32);
+                buf.samples[idx] = pred[(i as usize) * w + (j as usize)];
             }
         }
         for (y, x, v) in overhang {
             if let Some(slot) = self.luma_overhang_slot(y, x) {
-                *slot = P::from_i32(v);
+                *slot = v;
             }
         }
     }
@@ -17380,7 +17973,8 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
     ) {
         let w = TX_WIDTH[tx_sz];
         let h = TX_HEIGHT[tx_sz];
-        let Some(pred) = Self::intra_predict_block_samples(
+        let mut scratch = IntraPredScratch::take();
+        if !Self::intra_predict_block_samples(
             neigh,
             max_x,
             max_y,
@@ -17397,9 +17991,11 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
             enable_intra_edge_filter,
             filter_type,
             filter_intra_mode,
-        ) else {
+            &mut scratch.0,
+        ) {
             return;
-        };
+        }
+        let pred: &[u16] = &scratch.0;
         for i in 0..h as u32 {
             let dst_y = start_y + i;
             if dst_y > max_y {
@@ -17448,14 +18044,15 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         enable_intra_edge_filter: bool,
         filter_type: u8,
         filter_intra_mode: Option<usize>,
-    ) -> Option<Vec<u16>> {
+        pred: &mut Vec<u16>,
+    ) -> bool {
         if mode >= INTRA_MODES {
-            return None;
+            return false;
         }
         let w = TX_WIDTH[tx_sz];
         let h = TX_HEIGHT[tx_sz];
         if w == 0 || h == 0 || w > 64 || h > 64 {
-            return None;
+            return false;
         }
         let log2_w = w.trailing_zeros();
         let log2_h = h.trailing_zeros();
@@ -17495,7 +18092,11 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         // room. The un-upsampled directional / DC / smooth / PAETH
         // arms only read offsets `1 .. span + 1`.
         let ext_cap = 2 * span + 2;
-        let mut above_ext = vec![0u16; ext_cap];
+        // r487 — edge buffers on the stack (`2 * ( 64 + 64 ) + 2` cells
+        // at most), the prediction block in the caller's reused
+        // buffer: no allocation per predicted block.
+        let mut above_store = [0u16; INTRA_EDGE_CELLS];
+        let above_ext: &mut [u16] = &mut above_store[..ext_cap];
         above_ext[0] = corner;
         above_ext[1] = corner;
         if !have_above && have_left {
@@ -17516,7 +18117,8 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
             }
         }
 
-        let mut left_ext = vec![0u16; ext_cap];
+        let mut left_store = [0u16; INTRA_EDGE_CELLS];
+        let left_ext: &mut [u16] = &mut left_store[..ext_cap];
         left_ext[0] = corner;
         left_ext[1] = corner;
         if !have_left && have_above {
@@ -17573,7 +18175,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
                     let num_px = (w.min((max_x - start_x + 1) as usize))
                         + (if p_angle < 90 { h } else { 0 })
                         + 1;
-                    let _ = intra_edge_filter(num_px, strength, &mut above_ext);
+                    let _ = intra_edge_filter(num_px, strength, above_ext);
                 }
                 // §7.11.2.4 step-4 left-edge filter (haveLeft == 1).
                 if have_left {
@@ -17582,19 +18184,19 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
                     let num_px = (h.min((max_y - start_y + 1) as usize))
                         + (if p_angle > 180 { w } else { 0 })
                         + 1;
-                    let _ = intra_edge_filter(num_px, strength, &mut left_ext);
+                    let _ = intra_edge_filter(num_px, strength, left_ext);
                 }
                 // §7.11.2.4 step-4 above-edge upsample selection + apply.
                 upsample_above = intra_edge_upsample_selection(w, h, filter_type, p_angle - 90);
                 if upsample_above == 1 {
                     let num_px = w + (if p_angle < 90 { h } else { 0 });
-                    let _ = intra_edge_upsample(num_px, bit_depth, &mut above_ext);
+                    let _ = intra_edge_upsample(num_px, bit_depth, above_ext);
                 }
                 // §7.11.2.4 step-4 left-edge upsample selection + apply.
                 upsample_left = intra_edge_upsample_selection(w, h, filter_type, p_angle - 180);
                 if upsample_left == 1 {
                     let num_px = h + (if p_angle > 180 { w } else { 0 });
-                    let _ = intra_edge_upsample(num_px, bit_depth, &mut left_ext);
+                    let _ = intra_edge_upsample(num_px, bit_depth, left_ext);
                 }
             }
         }
@@ -17602,7 +18204,9 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         let above_row = &above_ext[2..2 + span];
         let left_col = &left_ext[2..2 + span];
 
-        let mut pred = vec![0u16; w * h];
+        pred.clear();
+        pred.resize(w * h, 0);
+        let pred: &mut [u16] = pred.as_mut_slice();
         // §7.11.2.1 first dispatch arm: `plane == 0 && use_filter_intra`
         // ⇒ the §7.11.2.3 recursive intra prediction process, fed the
         // head-extended `above_ext` / `left_ext` (corner at offset 1).
@@ -17610,8 +18214,8 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         // `Block_Width[MiSize] <= 32 && Block_Height[MiSize] <= 32`
         // reader constraint, so `w`/`h` are always within the
         // `[4, 32]` recursive-kernel domain (`w >= 4 && h >= 2`).
-        let ok = if let Some(fim) = filter_intra_mode {
-            predict_intra_recursive(w, h, fim, bit_depth, &above_ext, &left_ext, &mut pred).is_ok()
+        if let Some(fim) = filter_intra_mode {
+            predict_intra_recursive(w, h, fim, bit_depth, above_ext, left_ext, pred).is_ok()
         } else {
             match mode {
                 DC_PRED => predict_intra_dc_pred(
@@ -17624,51 +18228,41 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
                     bit_depth,
                     above_row,
                     left_col,
-                    &mut pred,
+                    pred,
                 )
                 .is_ok(),
                 // §7.11.2.4 steps 10/11 — the exact-90/180 degenerate
                 // copies (angle_delta == 0). A non-zero delta makes
                 // V_PRED / H_PRED fully directional (see below).
-                V_PRED if angle_delta == 0 => {
-                    predict_intra_v_pred(w, h, above_row, &mut pred).is_ok()
-                }
-                H_PRED if angle_delta == 0 => {
-                    predict_intra_h_pred(w, h, left_col, &mut pred).is_ok()
-                }
+                V_PRED if angle_delta == 0 => predict_intra_v_pred(w, h, above_row, pred).is_ok(),
+                H_PRED if angle_delta == 0 => predict_intra_h_pred(w, h, left_col, pred).is_ok(),
                 m if (V_PRED..=D67_PRED).contains(&m) => predict_intra_directional(
                     w,
                     h,
                     MODE_TO_ANGLE[m] + angle_delta * ANGLE_STEP,
                     upsample_above,
                     upsample_left,
-                    &above_ext,
-                    &left_ext,
-                    &mut pred,
+                    above_ext,
+                    left_ext,
+                    pred,
                 )
                 .is_ok(),
                 SMOOTH_PRED => {
-                    predict_intra_smooth_pred(log2_w, log2_h, w, h, above_row, left_col, &mut pred)
+                    predict_intra_smooth_pred(log2_w, log2_h, w, h, above_row, left_col, pred)
                         .is_ok()
                 }
                 SMOOTH_V_PRED => {
-                    predict_intra_smooth_v_pred(log2_h, w, h, above_row, left_col, &mut pred)
-                        .is_ok()
+                    predict_intra_smooth_v_pred(log2_h, w, h, above_row, left_col, pred).is_ok()
                 }
                 SMOOTH_H_PRED => {
-                    predict_intra_smooth_h_pred(log2_w, w, h, above_row, left_col, &mut pred)
-                        .is_ok()
+                    predict_intra_smooth_h_pred(log2_w, w, h, above_row, left_col, pred).is_ok()
                 }
                 PAETH_PRED => {
-                    predict_intra_paeth_pred(w, h, above_row, left_col, corner, &mut pred).is_ok()
+                    predict_intra_paeth_pred(w, h, above_row, left_col, corner, pred).is_ok()
                 }
                 _ => false,
             }
-        };
-        if !ok {
-            return None;
         }
-        Some(pred)
     }
 
     /// §7.11.5 predict-chroma-from-luma process (av1-spec p.287) — the
@@ -17746,7 +18340,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         let overhang = self.luma_overhang.as_deref();
         let read_luma = |yy: u32, xx: u32| -> i64 {
             if yy < luma_rows && xx < luma_cols {
-                return i64::from(luma.samples[(yy as usize) * (luma_cols as usize) + (xx as usize)].to_i32());
+                return luma.samples[(yy as usize) * (luma_cols as usize) + (xx as usize)] as i64;
             }
             overhang.map_or(0, |oh| oh.get(yy, xx)) as i64
         };
@@ -17800,10 +18394,10 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
                     break;
                 }
                 let idx = (dst_y as usize) * (cols_buf as usize) + (dst_x as usize);
-                let dc = i64::from(buf.samples[idx].to_i32());
+                let dc = buf.samples[idx] as i64;
                 let l_ij = l[(i as usize) * w + (j as usize)];
                 let scaled = round2_signed((alpha as i64) * (l_ij - luma_avg), 6);
-                buf.samples[idx] = P::from_i32((dc + scaled).clamp(0, max_val) as i32);
+                buf.samples[idx] = (dc + scaled).clamp(0, max_val) as u16;
             }
         }
     }
@@ -17878,21 +18472,29 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         let cols_buf = buf.cols;
         let rows_buf = buf.rows;
         let max = (1i32 << bit_depth) - 1;
-        if start_x <= cols_buf && w <= cols_buf - start_x
-            && start_y <= rows_buf && h <= rows_buf - start_y
-        {
-            let merge = |(dst, res): (&mut P, &i64)| {
-                *dst = P::from_i32(i64::from(dst.to_i32()).saturating_add(*res).clamp(0, i64::from(max)) as i32);
-            };
-            let width = w as usize;
-            for (i, src) in residual.chunks_exact(width).enumerate() {
-                let yy = if flip_ud { h as usize - i - 1 } else { i };
-                let start = (start_y as usize + yy) * cols_buf as usize + start_x as usize;
-                let dst = &mut buf.samples[start..start + width];
+        // r487 — a block wholly inside the plane buffer (every block
+        // but the frame-edge overhangs): one row slice at a time, the
+        // flips resolved per row, no per-sample bounds or overhang
+        // test. The residual is first clamped to ±2^20 — beyond
+        // `max + 1` in magnitude the `Clip1` result is already
+        // decided — so the sum runs in 32-bit lanes.
+        if start_y + h <= rows_buf && start_x + w <= cols_buf {
+            const RESIDUAL_BOUND: i64 = 1 << 20;
+            let (wu, hu, cols_u) = (w as usize, h as usize, cols_buf as usize);
+            for (i, src) in residual.chunks_exact(wu).enumerate() {
+                let yy = if flip_ud { hu - 1 - i } else { i };
+                let d0 = (start_y as usize + yy) * cols_u + start_x as usize;
+                let dst = &mut buf.samples[d0..d0 + wu];
                 if flip_lr {
-                    dst.iter_mut().rev().zip(src).for_each(merge);
+                    for (d, &r) in dst.iter_mut().rev().zip(src) {
+                        let r = r.clamp(-RESIDUAL_BOUND, RESIDUAL_BOUND) as i32;
+                        *d = i32::from(*d).saturating_add(r).max(0).min(max) as u16;
+                    }
                 } else {
-                    dst.iter_mut().zip(src).for_each(merge);
+                    for (d, &r) in dst.iter_mut().zip(src) {
+                        let r = r.clamp(-RESIDUAL_BOUND, RESIDUAL_BOUND) as i32;
+                        *d = i32::from(*d).saturating_add(r).max(0).min(max) as u16;
+                    }
                 }
             }
             return;
@@ -17919,7 +18521,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
                     continue;
                 }
                 let idx = (dst_y as usize) * (cols_buf as usize) + (dst_x as usize);
-                let cur = i64::from(buf.samples[idx].to_i32());
+                let cur = buf.samples[idx] as i64;
                 let res = residual[(i as usize) * (w as usize) + (j as usize)];
                 let sum = cur.saturating_add(res);
                 // `Clip1(x) = Clip3(0, (1 << BitDepth) - 1, x)`.
@@ -17930,13 +18532,13 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
                 } else {
                     sum as i32
                 };
-                buf.samples[idx] = P::from_i32(clipped);
+                buf.samples[idx] = clipped as u16;
             }
         }
         for (y, x, res) in overhang {
             if let Some(slot) = self.luma_overhang_slot(y, x) {
-                let sum = i64::from(slot.to_i32()).saturating_add(res);
-                *slot = P::from_i32(sum.clamp(0, max as i64) as i32);
+                let sum = (*slot as i64).saturating_add(res);
+                *slot = sum.clamp(0, max as i64) as i32;
             }
         }
     }
@@ -17971,8 +18573,13 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
     /// caller bug ([`crate::Error::PartitionWalkOutOfRange`]) — the intra
     /// half of the blend must already be present.
     ///
-    /// The walker buffers hold native post-`Clip1` samples. Plane contexts
-    /// borrow them directly for the blend's strided write footprint.
+    /// The walker buffers are `i32` (post-`Clip1`, always in
+    /// `0..=(1 << BitDepth) - 1`); the §7.11.3.14 driver works in `u16`,
+    /// so this bridge materialises a `u16` mirror of each plane buffer,
+    /// drives the blend, and copies the (post-`Clip1`, in-range) result
+    /// back as `i32`. The mirror is the whole plane buffer (the driver
+    /// addresses it at the leaf's plane-space `(baseX, baseY)` origin via
+    /// `curr_stride`).
     ///
     /// Returns [`crate::Error::PartitionWalkOutOfRange`] for an empty
     /// `plane_refs`, a `plane >= 3`, a plane with no tracked buffer, or
@@ -17985,31 +18592,83 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         leaf: &crate::InterIntraLeaf,
         ref_frame_idx: &[u8],
         bit_depth: u8,
-        plane_refs: &[crate::PlaneRefSpec<'_, R>],
+        plane_refs: &[crate::PlaneRefSpec<'_>],
     ) -> Result<(), crate::Error> {
         if plane_refs.is_empty() {
             return Err(crate::Error::PartitionWalkOutOfRange);
         }
-        let mut slots = self.curr_frame.each_mut().map(|plane| plane.as_mut());
-        let mut planes: Vec<crate::PlaneReconContext<'_, R, P>> = Vec::new();
-        planes.try_reserve(plane_refs.len()).map_err(|_| crate::Error::PartitionWalkOutOfRange)?;
-        for spec in plane_refs {
-            let cp = slots.get_mut(spec.plane as usize).and_then(Option::take)
-                .ok_or(crate::Error::PartitionWalkOutOfRange)?;
-            planes.push(crate::PlaneReconContext {
-                plane: spec.plane,
-                subsampling_x: spec.subsampling_x,
-                subsampling_y: spec.subsampling_y,
-                frame_store: spec.frame_store,
-                frame_width: spec.frame_width,
-                frame_height: spec.frame_height,
-                curr: &mut cp.samples,
-                curr_stride: cp.cols as usize,
-            });
+        // Materialise a `u16` mirror of each plane's `i32` `curr_frame`
+        // buffer (the intra half of the §7.11.3.14 blend the step-3
+        // merge already wrote). Each `plane_refs[k].plane` must have an
+        // allocated buffer; samples are post-`Clip1` so the `i32 → u16`
+        // narrowing is lossless.
+        let mut mirrors: Vec<(u8, Vec<u16>, usize, usize)> = Vec::new();
+        if mirrors.try_reserve(plane_refs.len()).is_err() {
+            return Err(crate::Error::PartitionWalkOutOfRange);
         }
-        crate::reconstruct_inter_intra_from_dispatch(
-            readout, leaf, ref_frame_idx, bit_depth, None, &mut planes,
-        )?;
+        for spec in plane_refs {
+            let p = spec.plane as usize;
+            if p >= 3 {
+                return Err(crate::Error::PartitionWalkOutOfRange);
+            }
+            let Some(cp) = self.curr_frame[p].as_ref() else {
+                // No tracked buffer — the intra half of the blend has
+                // not been written yet (caller-bug ordering).
+                return Err(crate::Error::PartitionWalkOutOfRange);
+            };
+            let cols = cp.cols as usize;
+            let rows = cp.rows as usize;
+            let mut mirror: Vec<u16> = Vec::new();
+            if mirror.try_reserve_exact(cp.samples.len()).is_err() {
+                return Err(crate::Error::PartitionWalkOutOfRange);
+            }
+            mirror.extend(cp.samples.iter().copied());
+            mirrors.push((spec.plane, mirror, cols, rows));
+        }
+        // Build the per-plane reconstruction contexts over the mirrors.
+        // The mirror borrow and the `plane_refs` borrow are disjoint
+        // (the frame store lives in `plane_refs`, the curr buffer in the
+        // mirror), so the contexts can hold both.
+        {
+            let mut planes: Vec<crate::PlaneReconContext<'_>> = Vec::new();
+            if planes.try_reserve(plane_refs.len()).is_err() {
+                return Err(crate::Error::PartitionWalkOutOfRange);
+            }
+            for ((p, mirror, cols, _rows), spec) in mirrors.iter_mut().zip(plane_refs.iter()) {
+                planes.push(crate::PlaneReconContext {
+                    plane: *p,
+                    subsampling_x: spec.subsampling_x,
+                    subsampling_y: spec.subsampling_y,
+                    frame_store: spec.frame_store,
+                    frame_width: spec.frame_width,
+                    frame_height: spec.frame_height,
+                    curr: mirror.as_mut_slice(),
+                    curr_stride: *cols,
+                });
+            }
+            crate::reconstruct_inter_intra_from_dispatch(
+                readout,
+                leaf,
+                ref_frame_idx,
+                bit_depth,
+                // Translational inter half — this walker bridge
+                // carries no §5.9.24 global-motion context; the
+                // in-walk §5.11.33 route supplies the §7.11.3.1
+                // step-7 warp context for GLOBALMV-class leaves.
+                None,
+                &mut planes,
+            )?;
+        }
+        // §7.11.3.1 final step writes the blended samples in place; copy
+        // the (post-`Clip1`, in-range) `u16` result back into the
+        // walker's `i32` `curr_frame` buffers.
+        for (p, mirror, _cols, _rows) in &mirrors {
+            if let Some(cp) = self.curr_frame[*p as usize].as_mut() {
+                for (dst, &src) in cp.samples.iter_mut().zip(mirror.iter()) {
+                    *dst = src;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -18035,12 +18694,16 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
     /// does not own the decoded-picture buffer), and the §7.11.3.2
     /// interpolation-filter pair through the shared
     /// [`crate::reconstruct_inter_block`] driver, then writes the
-    /// clipped result directly into the walker's native `curr_frame` buffer.
+    /// (post-`Clip1`, in-range) result back into the walker's `i32`
+    /// `curr_frame` buffer.
     ///
     /// `x` / `y` are the block's top-left in `ref_spec.plane`-space
     /// samples; `w` / `h` are its plane-space size. The walker buffer is
-    /// native and post-`Clip1`; the driver writes the `w × h` footprint
-    /// directly, leaving the rest of the plane unchanged.
+    /// `i32` (post-`Clip1`, always in `0..=(1 << BitDepth) - 1`); the
+    /// driver works in `u16`, so the bridge mirrors the plane buffer to
+    /// `u16`, drives the block, and copies the result back as `i32`
+    /// (lossless in both directions). Only the `w × h` write footprint
+    /// changes; the rest of the mirror round-trips unchanged.
     ///
     /// Returns [`crate::Error::PartitionWalkOutOfRange`] for a
     /// `ref_spec.plane >= 3`, negative `x` / `y`, a `w`/`h` write region
@@ -18053,7 +18716,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         &mut self,
         mode_info: crate::InterModeInfo,
         ref_frame_idx: &[u8],
-        ref_spec: &crate::PlaneRefSpec<'_, R>,
+        ref_spec: &crate::PlaneRefSpec<'_>,
         x: i32,
         y: i32,
         w: usize,
@@ -18075,11 +18738,19 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         let rows = (self.mi_rows * (MI_SIZE as u32)) >> ref_spec.subsampling_y;
         let cols = (self.mi_cols * (MI_SIZE as u32)) >> ref_spec.subsampling_x;
         self.ensure_curr_frame_plane(p, rows, cols);
-        let Some(cp) = self.curr_frame[p].as_mut() else {
+        let Some(cp) = self.curr_frame[p].as_ref() else {
             // Allocation failed (try_reserve) — surface as a caller-bug.
             return Err(crate::Error::PartitionWalkOutOfRange);
         };
         let buf_cols = cp.cols as usize;
+        // Materialise a `u16` mirror of the whole `i32` plane buffer; the
+        // samples are post-`Clip1` so the `i32 → u16` narrowing is
+        // lossless.
+        let mut mirror: Vec<u16> = Vec::new();
+        if mirror.try_reserve_exact(cp.samples.len()).is_err() {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        mirror.extend(cp.samples.iter().copied());
 
         // Drive the single-ref translational reconstruction; the final
         // stitch overwrites the `w × h` footprint at `(x, y)`.
@@ -18099,10 +18770,17 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
             ref_spec.frame_height,
             interp_filter_x,
             interp_filter_y,
-            &mut cp.samples,
+            mirror.as_mut_slice(),
             buf_cols,
         )?;
 
+        // Copy the (post-`Clip1`, in-range) `u16` result back into the
+        // walker's `i32` `curr_frame` buffer.
+        if let Some(cp) = self.curr_frame[p].as_mut() {
+            for (dst, &src) in cp.samples.iter_mut().zip(mirror.iter()) {
+                *dst = src;
+            }
+        }
         Ok(())
     }
 
@@ -18129,7 +18807,10 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
     ///
     /// `x` / `y` are the block's top-left in `ref_spec.plane`-space
     /// samples; `w` / `h` are its plane-space size. The walker buffer is
-    /// native and post-`Clip1`; only the `w × h` write footprint changes.
+    /// `i32` (post-`Clip1`); the driver works in `u16`, so the bridge
+    /// mirrors the plane buffer to `u16`, drives the block, and copies the
+    /// result back as `i32` (lossless in both directions). Only the
+    /// `w × h` write footprint changes.
     ///
     /// Returns [`crate::Error::PartitionWalkOutOfRange`] for a
     /// `ref_spec.plane >= 3`, negative `x` / `y`, a `w`/`h` write region
@@ -18143,7 +18824,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         mode_info: crate::InterModeInfo,
         warp: &crate::WarpDriverParams,
         ref_frame_idx: &[u8],
-        ref_spec: &crate::PlaneRefSpec<'_, R>,
+        ref_spec: &crate::PlaneRefSpec<'_>,
         x: i32,
         y: i32,
         w: usize,
@@ -18162,10 +18843,18 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         let rows = (self.mi_rows * (MI_SIZE as u32)) >> ref_spec.subsampling_y;
         let cols = (self.mi_cols * (MI_SIZE as u32)) >> ref_spec.subsampling_x;
         self.ensure_curr_frame_plane(p, rows, cols);
-        let Some(cp) = self.curr_frame[p].as_mut() else {
+        let Some(cp) = self.curr_frame[p].as_ref() else {
             return Err(crate::Error::PartitionWalkOutOfRange);
         };
         let buf_cols = cp.cols as usize;
+        // Materialise a `u16` mirror of the whole `i32` plane buffer; the
+        // samples are post-`Clip1` so the `i32 → u16` narrowing is
+        // lossless.
+        let mut mirror: Vec<u16> = Vec::new();
+        if mirror.try_reserve_exact(cp.samples.len()).is_err() {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        mirror.extend(cp.samples.iter().copied());
 
         // Drive the single-ref warped reconstruction; the final stitch
         // overwrites the `w × h` footprint at `(x, y)`.
@@ -18186,10 +18875,17 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
             ref_spec.frame_height,
             interp_filter_x,
             interp_filter_y,
-            &mut cp.samples,
+            mirror.as_mut_slice(),
             buf_cols,
         )?;
 
+        // Copy the (post-`Clip1`, in-range) `u16` result back into the
+        // walker's `i32` `curr_frame` buffer.
+        if let Some(cp) = self.curr_frame[p].as_mut() {
+            for (dst, &src) in cp.samples.iter_mut().zip(mirror.iter()) {
+                *dst = src;
+            }
+        }
         Ok(())
     }
 
@@ -18220,7 +18916,10 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
     ///
     /// `x` / `y` are the block's top-left in `ref_spec.plane`-space
     /// samples; `w` / `h` are its plane-space size. The walker buffer is
-    /// native and post-`Clip1`; only the `w × h` write footprint changes.
+    /// `i32` (post-`Clip1`); the driver works in `u16`, so the bridge
+    /// mirrors the plane buffer to `u16`, drives the block, and copies the
+    /// result back as `i32` (lossless in both directions). Only the
+    /// `w × h` write footprint changes.
     ///
     /// Returns [`crate::Error::PartitionWalkOutOfRange`] for a
     /// `ref_spec.plane >= 3`, negative `x` / `y`, a `w`/`h` write region
@@ -18232,9 +18931,9 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
     pub fn reconstruct_inter_block_obmc_into_curr_frame(
         &mut self,
         mode_info: crate::InterModeInfo,
-        obmc: &crate::ObmcParams<'_, '_, R>,
+        obmc: &crate::ObmcParams<'_, '_>,
         ref_frame_idx: &[u8],
-        ref_spec: &crate::PlaneRefSpec<'_, R>,
+        ref_spec: &crate::PlaneRefSpec<'_>,
         x: i32,
         y: i32,
         w: usize,
@@ -18253,10 +18952,18 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         let rows = (self.mi_rows * (MI_SIZE as u32)) >> ref_spec.subsampling_y;
         let cols = (self.mi_cols * (MI_SIZE as u32)) >> ref_spec.subsampling_x;
         self.ensure_curr_frame_plane(p, rows, cols);
-        let Some(cp) = self.curr_frame[p].as_mut() else {
+        let Some(cp) = self.curr_frame[p].as_ref() else {
             return Err(crate::Error::PartitionWalkOutOfRange);
         };
         let buf_cols = cp.cols as usize;
+        // Materialise a `u16` mirror of the whole `i32` plane buffer; the
+        // samples are post-`Clip1` so the `i32 → u16` narrowing is
+        // lossless.
+        let mut mirror: Vec<u16> = Vec::new();
+        if mirror.try_reserve_exact(cp.samples.len()).is_err() {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        mirror.extend(cp.samples.iter().copied());
 
         // Drive the single-ref OBMC reconstruction; the final stitch
         // overwrites the `w × h` footprint at `(x, y)`.
@@ -18277,10 +18984,17 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
             ref_spec.frame_height,
             interp_filter_x,
             interp_filter_y,
-            &mut cp.samples,
+            mirror.as_mut_slice(),
             buf_cols,
         )?;
 
+        // Copy the (post-`Clip1`, in-range) `u16` result back into the
+        // walker's `i32` `curr_frame` buffer.
+        if let Some(cp) = self.curr_frame[p].as_mut() {
+            for (dst, &src) in cp.samples.iter_mut().zip(mirror.iter()) {
+                *dst = src;
+            }
+        }
         Ok(())
     }
 
@@ -18311,7 +19025,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
     /// pair through the shared
     /// [`crate::inter_pred::reconstruct_inter_block_compound`] driver, then
     /// writes the (post-`Clip1`, in-range) result back into the walker's
-    /// native `curr_frame` buffer.
+    /// `i32` `curr_frame` buffer.
     ///
     /// The [`crate::COMPOUND_DIFFWTD`] arm's §7.11.3.12 mask is derived
     /// inside the driver from the two formed `preds[]` at `plane == 0`. For
@@ -18326,7 +19040,10 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
     ///
     /// `x` / `y` are the block's top-left in `ref_spec.plane`-space
     /// samples; `w` / `h` are its plane-space size. The walker buffer is
-    /// native and post-`Clip1`; only the `w × h` write footprint changes.
+    /// `i32` (post-`Clip1`); the driver works in `u16`, so the bridge
+    /// mirrors the plane buffer to `u16`, drives the block, and copies the
+    /// result back as `i32` (lossless both directions). Only the `w × h`
+    /// write footprint changes.
     ///
     /// Returns [`crate::Error::PartitionWalkOutOfRange`] for a
     /// `ref_spec.plane >= 3`, negative `x` / `y`, a `w`/`h` write region
@@ -18341,7 +19058,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         mode_info: crate::inter_pred::CompoundInterModeInfo,
         order_hints: crate::inter_pred::CompoundOrderHintContext,
         ref_frame_idx: &[u8],
-        ref_spec: &crate::PlaneRefSpec<'_, R>,
+        ref_spec: &crate::PlaneRefSpec<'_>,
         x: i32,
         y: i32,
         w: usize,
@@ -18360,10 +19077,18 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         let rows = (self.mi_rows * (MI_SIZE as u32)) >> ref_spec.subsampling_y;
         let cols = (self.mi_cols * (MI_SIZE as u32)) >> ref_spec.subsampling_x;
         self.ensure_curr_frame_plane(p, rows, cols);
-        let Some(cp) = self.curr_frame[p].as_mut() else {
+        let Some(cp) = self.curr_frame[p].as_ref() else {
             return Err(crate::Error::PartitionWalkOutOfRange);
         };
         let buf_cols = cp.cols as usize;
+        // Materialise a `u16` mirror of the whole `i32` plane buffer; the
+        // samples are post-`Clip1` so the `i32 → u16` narrowing is
+        // lossless.
+        let mut mirror: Vec<u16> = Vec::new();
+        if mirror.try_reserve_exact(cp.samples.len()).is_err() {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        mirror.extend(cp.samples.iter().copied());
 
         // §7.11.3.12 DIFFWTD persistent luma-grid mask — for a single
         // (luma) bridge call the mask buffer is `w × h`. The driver fills
@@ -18401,10 +19126,17 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
             interp_filter_y,
             diffwtd_arg,
             /* warp */ None,
-            &mut cp.samples,
+            mirror.as_mut_slice(),
             buf_cols,
         )?;
 
+        // Copy the (post-`Clip1`, in-range) `u16` result back into the
+        // walker's `i32` `curr_frame` buffer.
+        if let Some(cp) = self.curr_frame[p].as_mut() {
+            for (dst, &src) in cp.samples.iter_mut().zip(mirror.iter()) {
+                *dst = src;
+            }
+        }
         Ok(())
     }
 
@@ -18454,7 +19186,9 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
     /// ignored (the loop index drives it). `num_planes` is `1` (luma-only)
     /// or `3` (Y/Cb/Cr); chroma planes are skipped when `num_planes == 1`.
     ///
-    /// Each native post-`Clip1` plane is written directly. Its buffer
+    /// Like the single-plane bridges, the walker buffer is `i32`
+    /// (post-`Clip1`); the driver works in `u16`, so each plane is
+    /// mirrored, driven, and copied back (lossless). Each plane's buffer
     /// is allocated if untouched (compound overwrites — no intra-half
     /// prerequisite), sized from `MiRows × MiCols × MI_SIZE >>
     /// subsampling_*` so a later §7.12.3 step-3 merge is a no-op.
@@ -18473,7 +19207,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         mode_info: crate::inter_pred::CompoundInterModeInfo,
         order_hints: crate::inter_pred::CompoundOrderHintContext,
         ref_frame_idx: &[u8],
-        plane_specs: &[crate::PlaneRefSpec<'_, R>],
+        plane_specs: &[crate::PlaneRefSpec<'_>],
         mi_col: u32,
         mi_row: u32,
         mi_size: usize,
@@ -18528,10 +19262,17 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
             let rows = (self.mi_rows * (MI_SIZE as u32)) >> sub_y;
             let cols = (self.mi_cols * (MI_SIZE as u32)) >> sub_x;
             self.ensure_curr_frame_plane(plane, rows, cols);
-            let Some(cp) = self.curr_frame[plane].as_mut() else {
+            let Some(cp) = self.curr_frame[plane].as_ref() else {
                 return Err(crate::Error::PartitionWalkOutOfRange);
             };
             let buf_cols = cp.cols as usize;
+            // `u16` mirror of the whole `i32` plane buffer (samples are
+            // post-`Clip1`, so the narrowing is lossless).
+            let mut mirror: Vec<u16> = Vec::new();
+            if mirror.try_reserve_exact(cp.samples.len()).is_err() {
+                return Err(crate::Error::PartitionWalkOutOfRange);
+            }
+            mirror.extend(cp.samples.iter().copied());
 
             // The DIFFWTD arm receives the *shared* luma-grid mask; the
             // `plane == 0` call fills it, the chroma calls read it
@@ -18561,10 +19302,15 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
                 interp_filter_y,
                 diffwtd_arg,
                 /* warp */ None,
-                &mut cp.samples,
+                mirror.as_mut_slice(),
                 buf_cols,
             )?;
 
+            if let Some(cp) = self.curr_frame[plane].as_mut() {
+                for (dst, &src) in cp.samples.iter_mut().zip(mirror.iter()) {
+                    *dst = src;
+                }
+            }
         }
         Ok(())
     }
@@ -18607,7 +19353,9 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
     /// is `1` (luma-only) or `3` (Y/Cb/Cr); chroma planes are skipped
     /// when `num_planes == 1`.
     ///
-    /// Each native post-`Clip1` plane is written directly. Its buffer
+    /// Like the single-plane bridges, the walker buffer is `i32`
+    /// (post-`Clip1`); the driver works in `u16`, so each plane is
+    /// mirrored, driven, and copied back (lossless). Each plane's buffer
     /// is allocated if untouched (single-ref overwrites — no intra-half
     /// prerequisite), sized from `MiRows × MiCols × MI_SIZE >>
     /// subsampling_*` so a later §7.12.3 step-3 merge is a no-op.
@@ -18623,7 +19371,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         &mut self,
         mode_info: crate::InterModeInfo,
         ref_frame_idx: &[u8],
-        plane_specs: &[crate::PlaneRefSpec<'_, R>],
+        plane_specs: &[crate::PlaneRefSpec<'_>],
         mi_col: u32,
         mi_row: u32,
         mi_size: usize,
@@ -18665,10 +19413,17 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
             let rows = (self.mi_rows * (MI_SIZE as u32)) >> sub_y;
             let cols = (self.mi_cols * (MI_SIZE as u32)) >> sub_x;
             self.ensure_curr_frame_plane(plane, rows, cols);
-            let Some(cp) = self.curr_frame[plane].as_mut() else {
+            let Some(cp) = self.curr_frame[plane].as_ref() else {
                 return Err(crate::Error::PartitionWalkOutOfRange);
             };
             let buf_cols = cp.cols as usize;
+            // `u16` mirror of the whole `i32` plane buffer (samples are
+            // post-`Clip1`, so the narrowing is lossless).
+            let mut mirror: Vec<u16> = Vec::new();
+            if mirror.try_reserve_exact(cp.samples.len()).is_err() {
+                return Err(crate::Error::PartitionWalkOutOfRange);
+            }
+            mirror.extend(cp.samples.iter().copied());
 
             crate::reconstruct_inter_block(
                 mode_info,
@@ -18686,10 +19441,15 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
                 spec.frame_height,
                 interp_filter_x,
                 interp_filter_y,
-                &mut cp.samples,
+                mirror.as_mut_slice(),
                 buf_cols,
             )?;
 
+            if let Some(cp) = self.curr_frame[plane].as_mut() {
+                for (dst, &src) in cp.samples.iter_mut().zip(mirror.iter()) {
+                    *dst = src;
+                }
+            }
         }
         Ok(())
     }
@@ -18871,9 +19631,8 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
                     for i in 0..copy_h {
                         let dst_row = (start_y as usize + i) * buf_cols + start_x as usize;
                         let src_row = i * w;
-                        for j in 0..copy_w {
-                            cp.samples[dst_row + j] = P::from_i32(pred[src_row + j] as i32);
-                        }
+                        cp.samples[dst_row..dst_row + copy_w]
+                            .copy_from_slice(&pred[src_row..src_row + copy_w]);
                     }
                 }
                 x += step_x;
@@ -18968,7 +19727,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
             let dst = (start_y as usize + i) * buf_cols + start_x as usize;
             let src = i * w;
             for j in 0..copy_w {
-                cp.samples[dst + j] = P::from_i32(pred[src + j] as i32);
+                cp.samples[dst + j] = pred[src + j] as u16;
             }
         }
         Ok(())
@@ -19035,7 +19794,9 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
     ///
     /// Each plane buffer is allocated (sized `MiRows × MiCols × MI_SIZE >>
     /// subsampling_*`) if it has not been touched yet; the walker buffer is
-    /// native and post-`Clip1`, and the frame driver borrows it directly.
+    /// `i32` (post-`Clip1`), the driver works in `u16`, so the bridge
+    /// mirrors each plane to `u16`, drives the frame, and copies the result
+    /// back as `i32` (lossless in both directions).
     ///
     /// Returns [`crate::Error::PartitionWalkOutOfRange`] for an empty
     /// `plane_refs`, a `plane_refs[k].plane >= 3`, an allocation failure,
@@ -19047,7 +19808,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         &mut self,
         ref_frame_idx: &[u8],
         bit_depth: u8,
-        plane_refs: &[crate::PlaneRefSpec<'_, R>],
+        plane_refs: &[crate::PlaneRefSpec<'_>],
     ) -> Result<(), crate::Error> {
         // Delegate with identity-zero §7.11.3.15 order hints. The
         // mask-free [`COMPOUND_AVERAGE`], the [`COMPOUND_WEDGE`], the
@@ -19077,12 +19838,14 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         &mut self,
         ref_frame_idx: &[u8],
         bit_depth: u8,
-        plane_refs: &[crate::PlaneRefSpec<'_, R>],
+        plane_refs: &[crate::PlaneRefSpec<'_>],
         order_hints: FrameInterOrderHints,
     ) -> Result<(), crate::Error> {
         if plane_refs.is_empty() {
             return Err(crate::Error::PartitionWalkOutOfRange);
         }
+        // r479 — the grid snapshot below copies every inter grid.
+        self.ensure_inter_grids();
 
         let mi_rows = self.mi_rows;
         let mi_cols = self.mi_cols;
@@ -19090,14 +19853,85 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
             .checked_mul(mi_cols as usize)
             .ok_or(crate::Error::PartitionWalkOutOfRange)?;
 
-        // Availability is derived from the frame walk's tile geometry.
+        // Snapshot the grid slices into owned buffers. `reconstruct_inter_frame`
+        // borrows the grid (`&InterModeInfoGrid`) and the plane buffers
+        // (`&mut [PlaneReconContext]`) at once; the grid slices live in
+        // `&self` while the plane mirrors live in fresh allocations, so
+        // copying the grids out of `self` lets both borrows coexist.
+        let mut mi_sizes_snap: Vec<usize> = Vec::new();
+        let mut is_inters_snap: Vec<u8> = Vec::new();
+        let mut ref_frames_snap: Vec<i8> = Vec::new();
+        let mut mvs_snap: Vec<i16> = Vec::new();
+        let mut interp_filters_snap: Vec<u8> = Vec::new();
+        if mi_sizes_snap.try_reserve_exact(cells).is_err()
+            || is_inters_snap.try_reserve_exact(cells).is_err()
+            || ref_frames_snap.try_reserve_exact(cells * 2).is_err()
+            || mvs_snap.try_reserve_exact(cells * 4).is_err()
+            || interp_filters_snap.try_reserve_exact(cells * 2).is_err()
+        {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        mi_sizes_snap.extend_from_slice(&self.mi_sizes[..cells]);
+        is_inters_snap.extend_from_slice(&self.is_inters[..cells]);
+        ref_frames_snap.extend_from_slice(&self.ref_frames[..cells * 2]);
+        mvs_snap.extend_from_slice(&self.mvs[..cells * 4]);
+        interp_filters_snap.extend_from_slice(&self.interp_filters[..cells * 2]);
+
+        // Snapshot the §5.11.29 / §5.11.28 compound / inter-intra
+        // side-data grids the §5.11.23 inter cascade stamped, so the
+        // frame walk dispatches a decoded compound (AVERAGE / DISTANCE /
+        // WEDGE / DIFFWTD) or inter-intra leaf through the matching
+        // §7.11.3 arm instead of driving it translationally. Each is
+        // read only at the matching leaf-origin cell; the stamped values
+        // collapse to the §5.11.29 / §5.11.28 short-circuit defaults on
+        // single-ref / intra cells the walk never reads.
+        let mut compound_types_snap: Vec<u8> = Vec::new();
+        let mut compound_wedge_indices_snap: Vec<u8> = Vec::new();
+        let mut compound_wedge_signs_snap: Vec<u8> = Vec::new();
+        let mut compound_mask_types_snap: Vec<u8> = Vec::new();
+        let mut interintra_modes_snap: Vec<u8> = Vec::new();
+        let mut wedge_interintras_snap: Vec<u8> = Vec::new();
+        let mut interintra_wedge_indices_snap: Vec<u8> = Vec::new();
+        if compound_types_snap.try_reserve_exact(cells).is_err()
+            || compound_wedge_indices_snap
+                .try_reserve_exact(cells)
+                .is_err()
+            || compound_wedge_signs_snap.try_reserve_exact(cells).is_err()
+            || compound_mask_types_snap.try_reserve_exact(cells).is_err()
+            || interintra_modes_snap.try_reserve_exact(cells).is_err()
+            || wedge_interintras_snap.try_reserve_exact(cells).is_err()
+            || interintra_wedge_indices_snap
+                .try_reserve_exact(cells)
+                .is_err()
+        {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        compound_types_snap.extend_from_slice(&self.compound_types[..cells]);
+        compound_wedge_indices_snap.extend_from_slice(&self.compound_wedge_indices[..cells]);
+        compound_wedge_signs_snap.extend_from_slice(&self.compound_wedge_signs[..cells]);
+        compound_mask_types_snap.extend_from_slice(&self.compound_mask_types[..cells]);
+        interintra_modes_snap.extend_from_slice(&self.interintra_modes[..cells]);
+        wedge_interintras_snap.extend_from_slice(&self.wedge_interintras[..cells]);
+        interintra_wedge_indices_snap.extend_from_slice(&self.interintra_wedge_indices[..cells]);
+
+        // §5.11.27 / §7.11.3.9 OBMC context: snapshot the per-cell
+        // `motion_modes` grid the §5.11.27 read stamped, and derive the
+        // §5.11.18 `AvailU` / `AvailL` per-cell availability grids from the
+        // walker's tile geometry (`AvailU = is_inside(MiRow - 1, MiCol)`,
+        // `AvailL = is_inside(MiRow, MiCol - 1)` — av1-spec lines
+        // 3915-3916). The frame walk then dispatches a decoded
+        // `motion_mode == OBMC` single-ref leaf to the §7.11.3.9-10 overlap
+        // path, resolving its neighbour lists internally from the grid.
+        let mut motion_modes_snap: Vec<u8> = Vec::new();
         let mut avail_u_snap: Vec<u8> = Vec::new();
         let mut avail_l_snap: Vec<u8> = Vec::new();
-        if avail_u_snap.try_reserve_exact(cells).is_err()
+        if motion_modes_snap.try_reserve_exact(cells).is_err()
+            || avail_u_snap.try_reserve_exact(cells).is_err()
             || avail_l_snap.try_reserve_exact(cells).is_err()
         {
             return Err(crate::Error::PartitionWalkOutOfRange);
         }
+        motion_modes_snap.extend_from_slice(&self.motion_modes[..cells]);
         for r in 0..(mi_rows as usize) {
             for c in 0..(mi_cols as usize) {
                 avail_u_snap.push(self.geometry.is_inside(r as i32 - 1, c as i32) as u8);
@@ -19105,7 +19939,15 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
             }
         }
 
-        // Allocate untouched native planes before borrowing metadata and pixels.
+        // Mirror each plane's `i32` `curr_frame` buffer to `u16`,
+        // allocating the plane if the residual merge has not yet touched it
+        // (a skip-coded P-frame block has no residual writer, so its plane
+        // can be untouched at this point). Samples are post-`Clip1` so the
+        // `i32 → u16` narrowing is lossless.
+        let mut mirrors: Vec<(u8, Vec<u16>, usize)> = Vec::new();
+        if mirrors.try_reserve(plane_refs.len()).is_err() {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
         for spec in plane_refs {
             let p = spec.plane as usize;
             if p >= 3 {
@@ -19114,23 +19956,35 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
             let rows = (mi_rows * (MI_SIZE as u32)) >> spec.subsampling_y;
             let cols = (mi_cols * (MI_SIZE as u32)) >> spec.subsampling_x;
             self.ensure_curr_frame_plane(p, rows, cols);
+            let Some(cp) = self.curr_frame[p].as_ref() else {
+                return Err(crate::Error::PartitionWalkOutOfRange);
+            };
+            let buf_cols = cp.cols as usize;
+            let mut mirror: Vec<u16> = Vec::new();
+            if mirror.try_reserve_exact(cp.samples.len()).is_err() {
+                return Err(crate::Error::PartitionWalkOutOfRange);
+            }
+            mirror.extend(cp.samples.iter().copied());
+            mirrors.push((spec.plane, mirror, buf_cols));
         }
 
-        // Metadata and native plane fields have disjoint borrows.
+        // Drive the frame walk. The grid snapshots and plane mirrors are
+        // disjoint owned buffers, so the `&grid` / `&mut planes` borrows
+        // coexist.
         {
             let grid = crate::InterModeInfoGrid {
-                mi_sizes: &self.mi_sizes,
-                is_inters: &self.is_inters,
-                ref_frames: &self.ref_frames,
-                mvs: &self.mvs,
-                interp_filters: &self.interp_filters,
-                compound_types: &self.compound_types,
-                wedge_indices: &self.compound_wedge_indices,
-                wedge_signs: &self.compound_wedge_signs,
-                mask_types: &self.compound_mask_types,
-                interintra_modes: &self.interintra_modes,
-                wedge_interintras: &self.wedge_interintras,
-                interintra_wedge_indices: &self.interintra_wedge_indices,
+                mi_sizes: &mi_sizes_snap,
+                is_inters: &is_inters_snap,
+                ref_frames: &ref_frames_snap,
+                mvs: &mvs_snap,
+                interp_filters: &interp_filters_snap,
+                compound_types: &compound_types_snap,
+                wedge_indices: &compound_wedge_indices_snap,
+                wedge_signs: &compound_wedge_signs_snap,
+                mask_types: &compound_mask_types_snap,
+                interintra_modes: &interintra_modes_snap,
+                wedge_interintras: &wedge_interintras_snap,
+                interintra_wedge_indices: &interintra_wedge_indices_snap,
                 order_hint_bits: order_hints.order_hint_bits,
                 current_order_hint: order_hints.current_order_hint,
                 order_hints_by_ref: &order_hints.order_hints_by_ref,
@@ -19139,33 +19993,39 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
                 bit_depth,
                 warp: None,
                 obmc: Some(crate::GridObmcContext {
-                    motion_modes: &self.motion_modes,
+                    motion_modes: &motion_modes_snap,
                     avail_u: &avail_u_snap,
                     avail_l: &avail_l_snap,
                 }),
             };
-            let mut slots = self.curr_frame.each_mut().map(|plane| plane.as_mut());
-            let mut planes: Vec<crate::PlaneReconContext<'_, R, P>> = Vec::new();
+            let mut planes: Vec<crate::PlaneReconContext<'_>> = Vec::new();
             if planes.try_reserve(plane_refs.len()).is_err() {
                 return Err(crate::Error::PartitionWalkOutOfRange);
             }
-            for spec in plane_refs {
-                let cp = slots[spec.plane as usize].take()
-                    .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+            for ((p, mirror, cols), spec) in mirrors.iter_mut().zip(plane_refs.iter()) {
                 planes.push(crate::PlaneReconContext {
-                    plane: spec.plane,
+                    plane: *p,
                     subsampling_x: spec.subsampling_x,
                     subsampling_y: spec.subsampling_y,
                     frame_store: spec.frame_store,
                     frame_width: spec.frame_width,
                     frame_height: spec.frame_height,
-                    curr: &mut cp.samples,
-                    curr_stride: cp.cols as usize,
+                    curr: mirror.as_mut_slice(),
+                    curr_stride: *cols,
                 });
             }
             crate::reconstruct_inter_frame(&grid, ref_frame_idx, &mut planes)?;
         }
 
+        // Copy the (post-`Clip1`, in-range) `u16` result back into the
+        // walker's `i32` `curr_frame` buffers.
+        for (p, mirror, _cols) in &mirrors {
+            if let Some(cp) = self.curr_frame[*p as usize].as_mut() {
+                for (dst, &src) in cp.samples.iter_mut().zip(mirror.iter()) {
+                    *dst = src;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -19197,14 +20057,14 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
     /// sample list is not retained); wiring it is the warped-motion
     /// follow-up.
     ///
-    /// The field-split plane contexts borrow native `CurrFrame` storage
-    /// directly; no full-frame representation mirror is needed.
+    /// The §7.11.3 drivers write straight into the walker's 16-bit
+    /// `CurrFrame` planes.
     pub fn predict_inter_leaf_from_walk(
         &mut self,
         mi_row: u32,
         mi_col: u32,
         mi_size: usize,
-        ctx: &InterFrameContext<'_, R>,
+        ctx: &InterFrameContext<'_>,
     ) -> Result<(), crate::Error> {
         if mi_size >= BLOCK_SIZES || mi_row >= self.mi_rows || mi_col >= self.mi_cols {
             return Err(crate::Error::PartitionWalkOutOfRange);
@@ -19217,6 +20077,12 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
             return Err(crate::Error::PartitionWalkOutOfRange);
         }
 
+        // Per visited plane: its `CurrFrame` index and row stride.
+        struct LeafRect {
+            plane: usize,
+            stride: usize,
+        }
+        let mut rects: Vec<LeafRect> = Vec::with_capacity(pixels.plane_refs.len());
         for spec in pixels.plane_refs {
             let p = spec.plane as usize;
             if p >= 3 {
@@ -19232,6 +20098,10 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
             self.ensure_curr_frame_plane(p, rows as u32, cols as u32);
             get_plane_residual_size(mi_size, spec.plane, sub_x, sub_y)
                 .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+            rects.push(LeafRect {
+                plane: p,
+                stride: cols,
+            });
         }
 
         // §5.9.24 global-motion tables in the [`crate::GridWarpContext`]
@@ -19250,9 +20120,38 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
             is_scaled_by_ref[crate::uncompressed_header_tail::LAST_FRAME + i] = *s;
         }
 
+        // r481 — frame-parallel decode: wait for the rows of every
+        // still-decoding reference this leaf reads, then predict from
+        // the published prefixes.
+        let ref_rows = self.ref_rows.clone();
+        let mut prefix_stores: Vec<[crate::RefFrameStoreEntry<'_>; 8]> = Vec::new();
+        if let Some(sources) = ref_rows.as_deref() {
+            let needs =
+                self.leaf_ref_rows_needed(mi_row, mi_col, mi_size, ctx, &pixels.ref_frame_idx);
+            for (planes, &need) in sources.slots.iter().zip(needs.iter()) {
+                if let (Some(planes), true) = (planes, need > 0) {
+                    planes.wait_rows(need)?;
+                }
+            }
+            for spec in pixels.plane_refs {
+                if spec.frame_store.len() < 8 {
+                    return Err(crate::Error::PartitionWalkOutOfRange);
+                }
+                let mut entries: [crate::RefFrameStoreEntry<'_>; 8] =
+                    core::array::from_fn(|slot| spec.frame_store[slot]);
+                for (entry, planes) in entries.iter_mut().zip(sources.slots.iter()) {
+                    if let Some(planes) = planes {
+                        entry.plane = planes.readable(spec.plane as usize);
+                    }
+                }
+                prefix_stores.push(entries);
+            }
+        }
+
         // Drive the shared per-leaf walk. Field-split borrows: the grid
         // views borrow the walker's grid vectors immutably while the
-        // plane contexts borrow native `CurrFrame` storage mutably.
+        // plane contexts borrow the `CurrFrame` planes mutably (the
+        // §7.11.3.1 process writes its prediction straight into them).
         {
             if self.walk_avail_u.len() < cells || self.walk_avail_l.len() < cells {
                 return Err(crate::Error::PartitionWalkOutOfRange);
@@ -19298,21 +20197,35 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
                     avail_l: &self.walk_avail_l,
                 }),
             };
-            let mut slots = self.curr_frame.each_mut().map(|plane| plane.as_mut());
-            let mut planes: Vec<crate::PlaneReconContext<'_, R, P>> =
+            let mut scratch_iter = self.curr_frame.iter_mut();
+            let (s0, s1, s2) = (
+                scratch_iter.next().unwrap(),
+                scratch_iter.next().unwrap(),
+                scratch_iter.next().unwrap(),
+            );
+            let mut slots: [Option<&mut Vec<u16>>; 3] = [
+                s0.as_mut().map(|cp| &mut cp.samples),
+                s1.as_mut().map(|cp| &mut cp.samples),
+                s2.as_mut().map(|cp| &mut cp.samples),
+            ];
+            let mut planes: Vec<crate::PlaneReconContext<'_>> =
                 Vec::with_capacity(pixels.plane_refs.len());
-            for spec in pixels.plane_refs {
-                let buf = slots[spec.plane as usize].take()
+            for (i, (spec, rect)) in pixels.plane_refs.iter().zip(rects.iter()).enumerate() {
+                let buf = slots[rect.plane]
+                    .take()
                     .ok_or(crate::Error::PartitionWalkOutOfRange)?;
                 planes.push(crate::PlaneReconContext {
                     plane: spec.plane,
                     subsampling_x: spec.subsampling_x,
                     subsampling_y: spec.subsampling_y,
-                    frame_store: spec.frame_store,
+                    frame_store: match prefix_stores.get(i) {
+                        Some(entries) => &entries[..],
+                        None => spec.frame_store,
+                    },
                     frame_width: spec.frame_width,
                     frame_height: spec.frame_height,
-                    curr: &mut buf.samples,
-                    curr_stride: buf.cols as usize,
+                    curr: buf.as_mut_slice(),
+                    curr_stride: rect.stride,
                 });
             }
             crate::inter_pred::reconstruct_inter_leaf_at(
@@ -19471,7 +20384,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
                 for xx in x0..=x1 {
                     // `CurrFrame` samples are post-Clip1 (`0..=clip_max`),
                     // so the u16 narrowing is lossless.
-                    win.push(cp.samples[row + xx as usize].to_i32() as u16);
+                    win.push(cp.samples[row + xx as usize]);
                 }
             }
             let mut pred = vec![0i32; w * h];
@@ -19518,7 +20431,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
                     if tx < 0 || tx > last_x {
                         continue;
                     }
-                    cp.samples[out_row + tx as usize] = P::from_i32(pred[i * w + j].clamp(0, clip_max));
+                    cp.samples[out_row + tx as usize] = pred[i * w + j].clamp(0, clip_max) as u16;
                 }
             }
         }
@@ -19624,6 +20537,13 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         // §5.11.13 clamps every accumulator slot to ±MAX_LOOP_FILTER
         // (±63) before it lands here, so the i8 narrowing is lossless.
         let acc: [i8; FRAME_LF_COUNT] = core::array::from_fn(|i| self.current_delta_lf[i] as i8);
+        // r479 — stamping the zero default into a never-materialised
+        // grid is the identity (the §5.9.18 default every reader
+        // assumes for the empty grid).
+        if self.delta_lfs.is_empty() && acc == [0; FRAME_LF_COUNT] {
+            return;
+        }
+        self.ensure_delta_lfs();
         for dr in 0..bh4 {
             let rr = mi_row + dr;
             if rr >= self.mi_rows {
@@ -19653,7 +20573,12 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         if r >= self.mi_rows || c >= self.mi_cols {
             return 0;
         }
-        i32::from(self.delta_lfs[((r * self.mi_cols + c) as usize) * FRAME_LF_COUNT + idx])
+        i32::from(
+            self.delta_lfs
+                .get(((r * self.mi_cols + c) as usize) * FRAME_LF_COUNT + idx)
+                .copied()
+                .unwrap_or(0),
+        )
     }
 
     /// View of the §5.11.5 `DeltaLFs[]` grid after the walk —
@@ -19892,18 +20817,28 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
             let sb_height4 = (mi_row_end - r as i32) >> sub_y;
             let y_max = sb_size4 >> sub_y;
             let x_max = sb_size4 >> sub_x;
-            for y in -1..=y_max {
-                for x in -1..=x_max {
-                    // §5.11.3 lines: the top border (`y < 0`) within the
-                    // in-frame column span and the left border (`x < 0`)
-                    // within the in-frame row span are `1`; everything
-                    // else (interior + off-frame border tails) is `0`.
-                    // The two `1` arms in the spec collapse to a single
-                    // boolean `or` (both yield the same value).
-                    let val = u8::from((y < 0 && x < sb_width4) || (x < 0 && y < sb_height4));
-                    if let Some(slot) = Self::block_decoded_slot(plane, y, x) {
-                        self.block_decoded[slot] = val;
+            // §5.11.3 lines: the top border (`y < 0`) within the
+            // in-frame column span and the left border (`x < 0`)
+            // within the in-frame row span are `1`; everything else
+            // (interior + off-frame border tails) is `0`. r481 — one
+            // row slice at a time: on the top row the value is `x <
+            // sbWidth4` (`x = -1` included, `sbWidth4 >= 0`), on every
+            // other row only the left-border cell can be `1`.
+            let base = plane * BD_STRIDE * BD_STRIDE;
+            let cols = ((x_max + 2) as usize).min(BD_STRIDE);
+            for (y, row) in (-1..=y_max).zip(
+                self.block_decoded[base..base + BD_STRIDE * BD_STRIDE]
+                    .as_chunks_mut::<BD_STRIDE>()
+                    .0,
+            ) {
+                let row = &mut row[..cols];
+                if y < 0 {
+                    for (xi, cell) in row.iter_mut().enumerate() {
+                        *cell = u8::from((xi as i32 - 1) < sb_width4);
                     }
+                } else {
+                    row.fill(0);
+                    row[0] = u8::from(y < sb_height4);
                 }
             }
             // §5.11.3 final line: `BlockDecoded[ plane ][ sbSize4 >>
@@ -20159,8 +21094,8 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         frame_restoration_type: u8,
     ) -> Result<LrUnit, crate::Error> {
         use crate::loop_restoration::{
-            SGRPROJ_PARAMS_BITS, SGRPROJ_PRJ_BITS, SGRPROJ_PRJ_SUBEXP_K, SGRPROJ_XQD_MAX,
-            SGRPROJ_XQD_MIN, SGR_PARAMS, WIENER_COEFFS, WIENER_TAPS_K, WIENER_TAPS_MAX,
+            SGR_PARAMS, SGRPROJ_PARAMS_BITS, SGRPROJ_PRJ_BITS, SGRPROJ_PRJ_SUBEXP_K,
+            SGRPROJ_XQD_MAX, SGRPROJ_XQD_MIN, WIENER_COEFFS, WIENER_TAPS_K, WIENER_TAPS_MAX,
             WIENER_TAPS_MIN,
         };
         if plane >= 3 || frame_restoration_type > RESTORE_SWITCHABLE {
@@ -20348,6 +21283,8 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
                     units,
                 });
             }
+            // r475 — a tile-sized walker addresses the frame's unit
+            // grid from its origin.
             let (r, c) = (r + self.lr_origin.0, c + self.lr_origin.1);
             let mi_size_shift_y = (MI_SIZE as u32) >> sub_y;
             let unit_row_start = (r * mi_size_shift_y).div_ceil(unit_size);
@@ -20471,59 +21408,227 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
     /// order, so the buffers here are at the un-upscaled
     /// `(MiRows * MI_SIZE) >> subY` × `(MiCols * MI_SIZE) >> subX` extent.
     #[allow(clippy::too_many_arguments)]
-    pub fn cdef_frame_from_idx(
+    pub fn cdef_frame_from_idx<S: crate::loop_filter::Sample>(
         &self,
         cdef_params: &crate::uncompressed_header_tail::CdefParams,
         num_planes: u8,
         bit_depth: u8,
         subsampling_x: u8,
         subsampling_y: u8,
-        src_planes: &[crate::loop_filter::PlaneBuffer<'_, P>],
-        dst_planes: &mut [crate::loop_filter::PlaneBuffer<'_, P>],
+        src_planes: &[crate::loop_filter::PlaneBuffer<'_, S>],
+        dst_planes: &mut [crate::loop_filter::PlaneBuffer<'_, S>],
     ) {
-        self.cdef_frame_from_idx_with_workers(cdef_params, num_planes, bit_depth, subsampling_x, subsampling_y, src_planes, dst_planes, 1);
+        self.with_cdef_ctx(
+            cdef_params,
+            num_planes,
+            bit_depth,
+            subsampling_x,
+            subsampling_y,
+            |ctx| crate::cdef::cdef_frame(ctx, src_planes, dst_planes),
+        );
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn cdef_frame_from_idx_with_workers(
+    /// r475 — [`Self::cdef_frame_from_idx`] in place over the
+    /// deblocked planes ([`crate::cdef::cdef_frame_in_place`]).
+    pub(crate) fn cdef_frame_in_place_from_idx<S: crate::loop_filter::Sample>(
         &self,
         cdef_params: &crate::uncompressed_header_tail::CdefParams,
         num_planes: u8,
         bit_depth: u8,
         subsampling_x: u8,
         subsampling_y: u8,
-        src_planes: &[crate::loop_filter::PlaneBuffer<'_, P>],
-        dst_planes: &mut [crate::loop_filter::PlaneBuffer<'_, P>],
-        workers: usize,
+        planes: &mut [crate::loop_filter::PlaneBuffer<'_, S>],
     ) {
-        use crate::cdef::{cdef_frame_with_workers, CdefFrameContext};
-        let mi_rows = self.mi_rows;
-        let mi_cols = self.mi_cols;
-        let skips = &self.skips;
-        let cdef_idx = &self.cdef_idx;
+        self.with_cdef_ctx(
+            cdef_params,
+            num_planes,
+            bit_depth,
+            subsampling_x,
+            subsampling_y,
+            |ctx| crate::cdef::cdef_frame_in_place(ctx, planes),
+        );
+    }
+
+    /// r475 — [`Self::cdef_frame_in_place_from_idx`] `threads`-wide:
+    /// the 64-luma-row bands are filtered in waves of `threads`; a
+    /// wave first copies every band's source window (the band ± 2
+    /// unfiltered rows — §7.15.3 `cdef_get_at` reaches at most 2
+    /// samples, bounded by §5.11.52) and the two rows the next wave's
+    /// first band will need from this wave's last band, then filters
+    /// the bands concurrently, each into its own row window. Byte-
+    /// identical to the serial filter.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn cdef_frame_parallel_from_idx<S: crate::loop_filter::Sample>(
+        &self,
+        cdef_params: &crate::uncompressed_header_tail::CdefParams,
+        num_planes: u8,
+        bit_depth: u8,
+        subsampling_x: u8,
+        subsampling_y: u8,
+        planes: &mut [crate::loop_filter::PlaneBuffer<'_, S>],
+        threads: usize,
+    ) {
+        use crate::cdef::{CdefSrc, cdef_band_in_place};
+        use crate::loop_filter::{PlaneBuffer, row_windows_mut, run_jobs};
+        const BAND_MI: u32 = 16;
+        const HALO: usize = 2;
+        let num_planes = num_planes.min(planes.len() as u8) as usize;
+        if num_planes == 0 {
+            return;
+        }
+        let dims: Vec<(usize, usize)> = planes
+            .iter()
+            .map(|p| (p.rows as usize, p.cols as usize))
+            .collect();
+        // Bands: mi rows `[ r0, r1 )`.
+        let mut bands: Vec<(u32, u32)> = Vec::new();
+        let mut r = 0u32;
+        while r < self.mi_rows {
+            let r1 = (r + BAND_MI).min(self.mi_rows);
+            bands.push((r, r1));
+            r = r1;
+        }
+        let plane_rows = |plane: usize, r: u32| -> usize {
+            let sub_y = if plane == 0 {
+                0
+            } else {
+                u32::from(subsampling_y)
+            };
+            (((r * MI_SIZE as u32) >> sub_y) as usize).min(dims[plane].0)
+        };
+        // Unfiltered rows `[ by0 - 2, by0 )` of the next wave's first band.
+        let mut carry: Vec<Vec<S>> = vec![Vec::new(); num_planes];
+        for wave in bands.chunks(threads.max(1)) {
+            // Copy phase: source windows per (band, plane).
+            let mut windows: Vec<Vec<(Vec<S>, usize)>> = Vec::with_capacity(wave.len());
+            for (k, &(r0, r1)) in wave.iter().enumerate() {
+                let mut per_plane = Vec::with_capacity(num_planes);
+                for (plane, pb) in planes.iter().enumerate().take(num_planes) {
+                    let (rows, cols) = dims[plane];
+                    let (by0, by1) = (plane_rows(plane, r0), plane_rows(plane, r1));
+                    let new0 = by0.saturating_sub(HALO);
+                    let new1 = (by1 + HALO).min(rows);
+                    let mut win: Vec<S> = Vec::with_capacity((new1 - new0) * cols);
+                    if k == 0 && by0 >= HALO && !carry[plane].is_empty() {
+                        win.extend_from_slice(&carry[plane]);
+                        win.extend_from_slice(&pb.samples[by0 * cols..new1 * cols]);
+                    } else {
+                        win.extend_from_slice(&pb.samples[new0 * cols..new1 * cols]);
+                    }
+                    per_plane.push((win, new0));
+                }
+                windows.push(per_plane);
+            }
+            let &(_, last_r1) = wave.last().expect("non-empty wave");
+            for (plane, pb) in planes.iter().enumerate().take(num_planes) {
+                let cols = dims[plane].1;
+                let by1 = plane_rows(plane, last_r1);
+                let c = &mut carry[plane];
+                c.clear();
+                if by1 >= HALO {
+                    c.extend_from_slice(&pb.samples[(by1 - HALO) * cols..by1 * cols]);
+                }
+            }
+            // Filter phase: disjoint band windows per plane.
+            let mut per_plane_windows: Vec<Vec<&mut [S]>> = Vec::with_capacity(num_planes);
+            let mut per_plane_row0: Vec<Vec<usize>> = Vec::with_capacity(num_planes);
+            for (plane, pb) in planes.iter_mut().enumerate().take(num_planes) {
+                let cols = dims[plane].1;
+                let ranges: Vec<(usize, usize)> = wave
+                    .iter()
+                    .map(|&(r0, r1)| (plane_rows(plane, r0), plane_rows(plane, r1)))
+                    .collect();
+                per_plane_row0.push(ranges.iter().map(|&(a, _)| a).collect());
+                per_plane_windows.push(row_windows_mut(pb.samples, cols, &ranges));
+            }
+            // Transpose into per-band plane sets.
+            let mut band_sets: Vec<Vec<&mut [S]>> = (0..wave.len()).map(|_| Vec::new()).collect();
+            for plane_wins in per_plane_windows.into_iter() {
+                for (k, w) in plane_wins.into_iter().enumerate() {
+                    band_sets[k].push(w);
+                }
+            }
+            let mut jobs: Vec<Box<dyn FnOnce() + Send + '_>> = Vec::with_capacity(wave.len());
+            for ((k, &(r0, r1)), (set, srcs_owned)) in wave
+                .iter()
+                .enumerate()
+                .zip(band_sets.into_iter().zip(windows.iter()))
+            {
+                let dims = &dims;
+                let per_plane_row0 = &per_plane_row0;
+                let job = move || {
+                    let mut srcs = [None, None, None];
+                    for (plane, slot) in srcs.iter_mut().enumerate().take(num_planes) {
+                        let (win, row0) = &srcs_owned[plane];
+                        *slot = Some(CdefSrc {
+                            samples: win,
+                            cols: dims[plane].1,
+                            row0: *row0,
+                            plane_rows: dims[plane].0,
+                            plane_cols: dims[plane].1,
+                        });
+                    }
+                    let mut dst_row0 = [0usize; 3];
+                    let mut dsts: Vec<PlaneBuffer<'_, S>> = Vec::with_capacity(num_planes);
+                    for (plane, win) in set.into_iter().enumerate() {
+                        let cols = dims[plane].1;
+                        dst_row0[plane] = per_plane_row0[plane][k];
+                        dsts.push(PlaneBuffer {
+                            rows: (win.len() / cols.max(1)) as u32,
+                            cols: cols as u32,
+                            samples: win,
+                        });
+                    }
+                    self.with_cdef_ctx(
+                        cdef_params,
+                        num_planes as u8,
+                        bit_depth,
+                        subsampling_x,
+                        subsampling_y,
+                        |ctx| cdef_band_in_place(ctx, &srcs, &mut dsts, dst_row0, r0, r1),
+                    );
+                };
+                jobs.push(Box::new(job));
+            }
+            run_jobs(threads, jobs);
+        }
+    }
+
+    /// The §7.15 frame context over this walker's `cdef_idx[]` /
+    /// `Skips[]` grids, handed to `f`.
+    pub(crate) fn with_cdef_ctx(
+        &self,
+        cdef_params: &crate::uncompressed_header_tail::CdefParams,
+        num_planes: u8,
+        bit_depth: u8,
+        subsampling_x: u8,
+        subsampling_y: u8,
+        f: impl FnOnce(&crate::cdef::CdefFrameContext<'_>),
+    ) {
+        use crate::cdef::CdefFrameContext;
         let ctx = CdefFrameContext {
-            mi_rows,
-            mi_cols,
+            mi_rows: self.mi_rows,
+            mi_cols: self.mi_cols,
             num_planes,
             bit_depth,
             subsampling_x,
             subsampling_y,
             cdef_params,
+            // §7.15.1 reads `cdef_idx[ baseR ][ baseC ]` at the 64×64
+            // anchor; the persisted grid carries `-1` for any untouched
+            // anchor, which the driver treats as "copy only".
             cdef_idx: &|r, c| {
-                if r >= mi_rows || c >= mi_cols {
+                if r >= self.mi_rows || c >= self.mi_cols {
                     return -1;
                 }
-                cdef_idx[(r * mi_cols + c) as usize]
+                self.cdef_idx[(r * self.mi_cols + c) as usize]
             },
-            skip: &|r, c| {
-                if r < mi_rows && c < mi_cols {
-                    skips[(r * mi_cols + c) as usize] != 0
-                } else {
-                    false
-                }
-            },
+            // §7.15.1 `skip` is the conjunction over the four 4×4 cells
+            // of the 8×8 block; the driver evaluates each cell, so this
+            // closure answers the per-cell `Skips[ r ][ c ]`.
+            skip: &|r, c| self.skip_at(r as i32, c as i32) != 0,
         };
-        cdef_frame_with_workers(&ctx, src_planes, dst_planes, workers);
+        f(&ctx);
     }
 
     /// r429 — [`Self::cdef_frame_from_idx`] with the §5.11.56
@@ -20537,7 +21642,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
     /// re-emitted with the §5.11.56 literals that make the walker's
     /// own grid carry the same ids.
     #[allow(clippy::too_many_arguments)]
-    pub fn cdef_frame_with_unit_grid(
+    pub fn cdef_frame_with_unit_grid<S: crate::loop_filter::Sample>(
         &self,
         cdef_params: &crate::uncompressed_header_tail::CdefParams,
         unit_idx: &[i8],
@@ -20545,39 +21650,31 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         bit_depth: u8,
         subsampling_x: u8,
         subsampling_y: u8,
-        src_planes: &[crate::loop_filter::PlaneBuffer<'_, P>],
-        dst_planes: &mut [crate::loop_filter::PlaneBuffer<'_, P>],
+        src_planes: &[crate::loop_filter::PlaneBuffer<'_, S>],
+        dst_planes: &mut [crate::loop_filter::PlaneBuffer<'_, S>],
     ) {
-        use crate::cdef::{cdef_frame, CdefFrameContext};
-        let mi_rows = self.mi_rows;
-        let mi_cols = self.mi_cols;
-        let skips = &self.skips;
+        use crate::cdef::{CdefFrameContext, cdef_frame};
         let sb_cols = self.mi_cols.div_ceil(16);
         let ctx = CdefFrameContext {
-            mi_rows,
-            mi_cols,
+            mi_rows: self.mi_rows,
+            mi_cols: self.mi_cols,
             num_planes,
             bit_depth,
             subsampling_x,
             subsampling_y,
             cdef_params,
             cdef_idx: &|r, c| {
-                if r >= mi_rows || c >= mi_cols {
+                if r >= self.mi_rows || c >= self.mi_cols {
                     return -1;
                 }
                 let unit = (r / 16) * sb_cols + (c / 16);
                 unit_idx.get(unit as usize).copied().unwrap_or(-1)
             },
-            skip: &|r, c| {
-                if r < mi_rows && c < mi_cols {
-                    skips[(r * mi_cols + c) as usize] != 0
-                } else {
-                    false
-                }
-            },
+            skip: &|r, c| self.skip_at(r as i32, c as i32) != 0,
         };
         cdef_frame(&ctx, src_planes, dst_planes);
     }
+
     /// §7.14 in-loop deblocking filter over the persisted §5.11 decode
     /// grids — av1-spec p.307-313.
     ///
@@ -20627,7 +21724,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
     /// selection. `delta_lf_multi` selects the §7.14.4 slot indexing (single
     /// `DeltaLFs[..][0]` vs the per-`(plane, pass)` multi-slot read).
     #[allow(clippy::too_many_arguments)]
-    pub fn loop_filter_frame_from_grid(
+    pub fn loop_filter_frame_from_grid<S: crate::loop_filter::Sample>(
         &self,
         lf_params: &crate::uncompressed_header_tail::LoopFilterParams,
         seg_params: &crate::uncompressed_header_tail::SegmentationParams,
@@ -20638,7 +21735,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         subsampling_y: u8,
         frame_width: u32,
         frame_height: u32,
-        planes: &mut [crate::loop_filter::PlaneBuffer<'_, P>],
+        planes: &mut [crate::loop_filter::PlaneBuffer<'_, S>],
     ) {
         self.loop_filter_rows_from_grid(
             lf_params,
@@ -20661,7 +21758,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
     /// [`crate::loop_filter::loop_filter_rows`]).
     #[doc(hidden)]
     #[allow(clippy::too_many_arguments)]
-    pub fn loop_filter_rows_from_grid(
+    pub fn loop_filter_rows_from_grid<S: crate::loop_filter::Sample>(
         &self,
         lf_params: &crate::uncompressed_header_tail::LoopFilterParams,
         seg_params: &crate::uncompressed_header_tail::SegmentationParams,
@@ -20672,19 +21769,192 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         subsampling_y: u8,
         frame_width: u32,
         frame_height: u32,
-        planes: &mut [crate::loop_filter::PlaneBuffer<'_, P>],
+        planes: &mut [crate::loop_filter::PlaneBuffer<'_, S>],
         mi_row_start: u32,
         mi_row_end: u32,
     ) {
-        self.loop_filter_rows_from_grid_with_workers(
-            lf_params, seg_params, delta_lf_multi, num_planes, bit_depth,
-            subsampling_x, subsampling_y, frame_width, frame_height,
-            planes, mi_row_start, mi_row_end, 1,
+        let table = self.lf_edge_table(
+            lf_params,
+            seg_params,
+            delta_lf_multi,
+            num_planes,
+            bit_depth,
+            subsampling_x,
+            subsampling_y,
+            frame_width,
+            frame_height,
+        );
+        let num_planes = num_planes.min(planes.len() as u8);
+        for plane in 0..num_planes {
+            for pass in 0..2u8 {
+                crate::loop_filter::loop_filter_rows_window_table(
+                    &table,
+                    plane,
+                    pass,
+                    &mut planes[plane as usize],
+                    0,
+                    mi_row_start,
+                    mi_row_end,
+                );
+            }
+        }
+    }
+
+    /// The closure-driven reference of [`Self::loop_filter_rows_from_grid`].
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn loop_filter_rows_from_grid_reference<S: crate::loop_filter::Sample>(
+        &self,
+        lf_params: &crate::uncompressed_header_tail::LoopFilterParams,
+        seg_params: &crate::uncompressed_header_tail::SegmentationParams,
+        delta_lf_multi: bool,
+        num_planes: u8,
+        bit_depth: u8,
+        subsampling_x: u8,
+        subsampling_y: u8,
+        frame_width: u32,
+        frame_height: u32,
+        planes: &mut [crate::loop_filter::PlaneBuffer<'_, S>],
+        mi_row_start: u32,
+        mi_row_end: u32,
+    ) {
+        self.with_lf_ctx(
+            lf_params,
+            seg_params,
+            delta_lf_multi,
+            num_planes,
+            bit_depth,
+            subsampling_x,
+            subsampling_y,
+            frame_width,
+            frame_height,
+            |ctx| crate::loop_filter::loop_filter_rows(ctx, planes, mi_row_start, mi_row_end),
         );
     }
 
+    /// r481 — hand the walker the still-decoding §7.20 slots of its
+    /// frame (see the `ref_rows` field); `None` when every slot is
+    /// final.
+    pub(crate) fn set_ref_rows(&mut self, sources: Option<std::sync::Arc<RefRowSources>>) {
+        self.ref_rows = sources;
+    }
+
+    /// r481 — the luma rows of each §7.20 slot the inter leaf at
+    /// `( mi_row, mi_col )` may read, as an exclusive bound (`0` = not
+    /// read, `u32::MAX` = the whole frame). Every §7.11.3 prediction
+    /// the leaf runs — its own references, the §7.11.3.9 OBMC
+    /// neighbours along the row above and the column to the left, and
+    /// the §5.11.33 sub-8×8 chroma candidates above / left — uses the
+    /// motion vector of a cell in `[ mi_row - 1, mi_row + bh4 ) ×
+    /// [ mi_col - 1, mi_col + bw4 )` and writes rows above the leaf's
+    /// bottom edge; a translational §7.11.3.4 read then ends at most
+    /// `( mv_row >> 3 ) + 4` luma rows below that edge plus the chroma
+    /// rounding, covered by a 16-row margin. Warped (§7.11.3.5, local
+    /// or global) and scaled-reference (§7.11.3.3) predictions take
+    /// the whole frame.
+    fn leaf_ref_rows_needed(
+        &self,
+        mi_row: u32,
+        mi_col: u32,
+        mi_size: usize,
+        ctx: &InterFrameContext<'_>,
+        ref_frame_idx: &[u8; 7],
+    ) -> [u32; 8] {
+        let mut needs = [0u32; 8];
+        let bw4 = NUM_4X4_BLOCKS_WIDE[mi_size] as u32;
+        let bh4 = NUM_4X4_BLOCKS_HIGH[mi_size] as u32;
+        let bottom = i64::from((mi_row + bh4) * MI_SIZE as u32);
+        let (r0, r1) = (mi_row.saturating_sub(1), (mi_row + bh4).min(self.mi_rows));
+        let (c0, c1) = (mi_col.saturating_sub(1), (mi_col + bw4).min(self.mi_cols));
+        for r in r0..r1 {
+            for c in c0..c1 {
+                let cell = (r * self.mi_cols + c) as usize;
+                if self.is_inters.get(cell).copied().unwrap_or(0) == 0 {
+                    continue;
+                }
+                let y_mode = self.y_modes.get(cell).copied().unwrap_or(0);
+                let warped =
+                    self.motion_modes.get(cell).copied() == Some(MOTION_MODE_WARPED_CAUSAL);
+                for list in 0..2 {
+                    let rf = self.ref_frames.get(cell * 2 + list).copied().unwrap_or(-1);
+                    if rf <= 0 {
+                        continue;
+                    }
+                    let rf = rf as usize;
+                    let Some(&slot) = ref_frame_idx.get(rf - 1) else {
+                        continue;
+                    };
+                    let global_warp = (y_mode == MODE_GLOBALMV || y_mode == MODE_GLOBAL_GLOBALMV)
+                        && ctx.gm_type.get(rf).copied().unwrap_or(0) > 1;
+                    let scaled = ctx.is_scaled_per_ref.get(rf - 1).copied().unwrap_or(true);
+                    let need = if warped || global_warp || scaled {
+                        u32::MAX
+                    } else {
+                        let mv_row =
+                            i64::from(self.mvs.get((cell * 2 + list) * 2).copied().unwrap_or(0));
+                        (bottom + (mv_row >> 3) + 16).clamp(0, i64::from(u32::MAX)) as u32
+                    };
+                    let n = &mut needs[(slot as usize) & 7];
+                    *n = (*n).max(need);
+                }
+            }
+        }
+        needs
+    }
+
+    /// r481 — run `f` over this walker's `CurrFrame` planes (the
+    /// mi-grid-padded `rows × cols` sample buffers, one per allocated
+    /// plane) with the walker's grids readable.
+    pub(crate) fn with_curr_frame_planes<R>(
+        &mut self,
+        num_planes: usize,
+        f: impl FnOnce(&Self, &mut [crate::loop_filter::PlaneBuffer<'_, u16>]) -> R,
+    ) -> R {
+        let mut taken: Vec<(u32, u32, Vec<u16>)> = (0..num_planes.min(3))
+            .map_while(|p| {
+                self.curr_frame[p]
+                    .as_mut()
+                    .map(|cp| (cp.rows, cp.cols, std::mem::take(&mut cp.samples)))
+            })
+            .collect();
+        let out = {
+            let mut bufs: Vec<crate::loop_filter::PlaneBuffer<'_, u16>> = taken
+                .iter_mut()
+                .map(|(rows, cols, samples)| crate::loop_filter::PlaneBuffer {
+                    rows: *rows,
+                    cols: *cols,
+                    samples: samples.as_mut_slice(),
+                })
+                .collect();
+            f(self, &mut bufs)
+        };
+        for (p, (_, _, samples)) in taken.into_iter().enumerate() {
+            if let Some(cp) = self.curr_frame[p].as_mut() {
+                cp.samples = samples;
+            }
+        }
+        out
+    }
+
+    /// r481 — switch the walk to syntax only (see the `parse_only`
+    /// field): symbols, grids and contexts as in the full walk, no
+    /// samples.
+    pub(crate) fn set_parse_only(&mut self, on: bool) {
+        self.parse_only = on;
+    }
+
+    /// r481 — stop `residual()` readouts from carrying each transform
+    /// block's residual (the frame decoder reads none of them).
+    pub(crate) fn set_keep_residual_readouts(&mut self, on: bool) {
+        self.keep_residual_readouts = on;
+    }
+
+    /// r481 — the §7.14 per-cell edge inputs of this walker's frame
+    /// (see [`crate::loop_filter::LfEdgeTable`]), read straight from
+    /// the mode-info grids: the values the [`Self::with_lf_ctx`]
+    /// closures return, cell by cell.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn loop_filter_rows_from_grid_with_workers(
+    pub(crate) fn lf_edge_table(
         &self,
         lf_params: &crate::uncompressed_header_tail::LoopFilterParams,
         seg_params: &crate::uncompressed_header_tail::SegmentationParams,
@@ -20695,12 +21965,278 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         subsampling_y: u8,
         frame_width: u32,
         frame_height: u32,
-        planes: &mut [crate::loop_filter::PlaneBuffer<'_, P>],
+    ) -> crate::loop_filter::LfEdgeTable {
+        let _ = num_planes;
+        let mut t = crate::loop_filter::LfEdgeTable::with_geometry(
+            self.mi_rows,
+            self.mi_cols,
+            bit_depth,
+            subsampling_x,
+            subsampling_y,
+            frame_width,
+            frame_height,
+            lf_params.loop_filter_level,
+            lf_params.loop_filter_sharpness,
+        );
+        let lp = Self::lf_level_params(lf_params, seg_params, delta_lf_multi);
+        self.fill_lf_edge_table(&mut t, &lp, 0, self.mi_rows);
+        t
+    }
+
+    /// r481 — the block-independent §7.14.4 / §7.14.5 inputs.
+    pub(crate) fn lf_level_params(
+        lf_params: &crate::uncompressed_header_tail::LoopFilterParams,
+        seg_params: &crate::uncompressed_header_tail::SegmentationParams,
+        delta_lf_multi: bool,
+    ) -> crate::loop_filter::LfLevelParams {
+        use crate::loop_filter::SEG_LVL_ALT_LF_Y_V;
+        crate::loop_filter::LfLevelParams {
+            loop_filter_level: lf_params.loop_filter_level,
+            loop_filter_sharpness: lf_params.loop_filter_sharpness,
+            loop_filter_delta_enabled: lf_params.loop_filter_delta_enabled,
+            loop_filter_ref_deltas: lf_params.loop_filter_ref_deltas,
+            loop_filter_mode_deltas: lf_params.loop_filter_mode_deltas,
+            delta_lf_multi,
+            seg_alt_lf_active: core::array::from_fn(|seg| {
+                core::array::from_fn(|i| {
+                    seg_params.segment_feature_active[seg][SEG_LVL_ALT_LF_Y_V + i]
+                })
+            }),
+            seg_alt_lf_data: core::array::from_fn(|seg| {
+                core::array::from_fn(|i| {
+                    seg_params.segment_feature_data[seg][SEG_LVL_ALT_LF_Y_V + i]
+                })
+            }),
+        }
+    }
+
+    /// r481 — fill the mi rows `[ r0, r1 )` of `t` from this walker's
+    /// grids (the plane `LoopfilterTxSizes` rows whose luma row lies
+    /// there).
+    pub(crate) fn fill_lf_edge_table(
+        &self,
+        t: &mut crate::loop_filter::LfEdgeTable,
+        lp: &crate::loop_filter::LfLevelParams,
+        r0: u32,
+        r1: u32,
+    ) {
+        let r1 = r1.min(self.mi_rows);
+        let mi_cols = self.mi_cols as usize;
+        let slots: [usize; 4] = core::array::from_fn(|i| lp.delta_lf_slot(i));
+        for idx in (r0 as usize) * mi_cols..(r1 as usize) * mi_cols {
+            t.mi_size[idx] = self.mi_sizes[idx] as u8;
+            let ref0 = self.ref_frames[idx * 2];
+            t.skip_inter[idx] =
+                self.skips[idx] != 0 && ref0 > crate::uncompressed_header_tail::INTRA_FRAME as i8;
+            let seg = self.segment_ids[idx];
+            let seg = if seg < 0 { u8::MAX } else { seg as u8 };
+            let mode = self.y_modes[idx];
+            let r = ref0.max(0) as u8;
+            let dl = self
+                .delta_lfs
+                .get(idx * FRAME_LF_COUNT..idx * FRAME_LF_COUNT + FRAME_LF_COUNT);
+            t.lvl[idx] = core::array::from_fn(|i| {
+                let d = dl.map_or(0, |d| d[slots[i]]);
+                lp.level(seg, r, mode, d, i)
+            });
+        }
+        let (sx, sy) = (t.subsampling_x, t.subsampling_y);
+        for plane in 0..3usize {
+            let (rows, cols) = t.tx_dims(plane);
+            let s = if plane == 0 { 0 } else { u32::from(sy) };
+            let sr0 = (r0 >> s) as usize + usize::from((r0 & ((1 << s) - 1)) != 0);
+            let sr1 = (r1.div_ceil(1 << s) as usize).min(rows);
+            for sr in sr0..sr1 {
+                for sc in 0..cols {
+                    t.tx[plane][sr * cols + sc] =
+                        self.loopfilter_tx_size_at(plane, sr as u32, sc as u32, sx, sy) as u8;
+                }
+            }
+        }
+    }
+
+    /// r475 — [`Self::loop_filter_frame_from_grid`] `threads`-wide by
+    /// 64-luma-row bands ([`crate::loop_filter::loop_filter_rows_window`]
+    /// states the independence the split relies on): per plane, pass
+    /// 0 over every band at once, then pass 1 over the even bands
+    /// (each on a window with 7-row skirts) and then the odd ones, so
+    /// the windows of concurrently filtered bands never overlap. Byte-
+    /// identical to the serial filter.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn loop_filter_frame_parallel_from_grid<S: crate::loop_filter::Sample>(
+        &self,
+        lf_params: &crate::uncompressed_header_tail::LoopFilterParams,
+        seg_params: &crate::uncompressed_header_tail::SegmentationParams,
+        delta_lf_multi: bool,
+        num_planes: u8,
+        bit_depth: u8,
+        subsampling_x: u8,
+        subsampling_y: u8,
+        frame_width: u32,
+        frame_height: u32,
+        planes: &mut [crate::loop_filter::PlaneBuffer<'_, S>],
+        threads: usize,
+    ) {
+        use crate::loop_filter::{
+            PlaneBuffer, loop_filter_rows_window_table, row_windows_mut, run_jobs,
+        };
+        const BAND_MI: u32 = 16;
+        const SKIRT: usize = 7;
+        let table = self.lf_edge_table(
+            lf_params,
+            seg_params,
+            delta_lf_multi,
+            num_planes,
+            bit_depth,
+            subsampling_x,
+            subsampling_y,
+            frame_width,
+            frame_height,
+        );
+        let table = &table;
+        let num_planes = num_planes.min(planes.len() as u8);
+        for plane in 0..num_planes {
+            if plane > 0 && lf_params.loop_filter_level[(1 + plane) as usize] == 0 {
+                continue;
+            }
+            let sub_y = if plane == 0 {
+                0
+            } else {
+                u32::from(subsampling_y)
+            };
+            let pb = &mut planes[plane as usize];
+            let (rows, cols) = (pb.rows as usize, pb.cols as usize);
+            // Band `k`: mi rows `[16k, 16k + 16)`, plane rows `[by0, by1)`.
+            let mut bands: Vec<(u32, u32, usize, usize)> = Vec::new();
+            let mut r = 0u32;
+            while r < self.mi_rows {
+                let r1 = (r + BAND_MI).min(self.mi_rows);
+                let by0 = (((r * MI_SIZE as u32) >> sub_y) as usize).min(rows);
+                let by1 = (((r1 * MI_SIZE as u32) >> sub_y) as usize).min(rows);
+                if by1 > by0 {
+                    bands.push((r, r1, by0, by1));
+                }
+                r = r1;
+            }
+            let run_phase = |pb: &mut PlaneBuffer<'_, S>, pass: u8, parity: Option<usize>| {
+                let selected: Vec<(u32, u32, usize, usize)> = bands
+                    .iter()
+                    .enumerate()
+                    .filter(|(k, _)| match parity {
+                        None => true,
+                        Some(p) => k % 2 == p,
+                    })
+                    .map(|(_, b)| *b)
+                    .collect();
+                let ranges: Vec<(usize, usize)> = selected
+                    .iter()
+                    .map(|&(_, _, by0, by1)| {
+                        if pass == 0 {
+                            (by0, by1)
+                        } else {
+                            (by0.saturating_sub(SKIRT), (by1 + SKIRT).min(rows))
+                        }
+                    })
+                    .collect();
+                let windows = row_windows_mut(pb.samples, cols, &ranges);
+                let mut jobs: Vec<Box<dyn FnOnce() + Send + '_>> =
+                    Vec::with_capacity(windows.len());
+                for (win, (&(mi0, mi1, _, _), &(w0, w1))) in
+                    windows.into_iter().zip(selected.iter().zip(ranges.iter()))
+                {
+                    let f = move || {
+                        let mut window = PlaneBuffer {
+                            rows: (w1 - w0) as u32,
+                            cols: cols as u32,
+                            samples: win,
+                        };
+                        loop_filter_rows_window_table(
+                            table,
+                            plane,
+                            pass,
+                            &mut window,
+                            w0 as u32,
+                            mi0,
+                            mi1,
+                        );
+                    };
+                    jobs.push(Box::new(f));
+                }
+                run_jobs(threads, jobs);
+            };
+            run_phase(pb, 0, None);
+            run_phase(pb, 1, Some(0));
+            run_phase(pb, 1, Some(1));
+        }
+    }
+
+    /// r479 — one plane, one pass of §7.14 over the edge rows
+    /// `mi_row_start .. mi_row_end`, the samples addressed through a
+    /// row window of the plane (`window_row0` = the plane row at
+    /// `window.samples[ 0 ]`; see
+    /// [`crate::loop_filter::loop_filter_rows_window`] for the reach
+    /// the window must cover). The encoder's deblocking election
+    /// runs its trials and its final filter through this on band
+    /// windows instead of frame-sized `i32` copies.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn loop_filter_pass_window_from_grid<S: crate::loop_filter::Sample>(
+        &self,
+        lf_params: &crate::uncompressed_header_tail::LoopFilterParams,
+        seg_params: &crate::uncompressed_header_tail::SegmentationParams,
+        delta_lf_multi: bool,
+        num_planes: u8,
+        bit_depth: u8,
+        subsampling_x: u8,
+        subsampling_y: u8,
+        frame_width: u32,
+        frame_height: u32,
+        plane: u8,
+        pass: u8,
+        window: &mut crate::loop_filter::PlaneBuffer<'_, S>,
+        window_row0: u32,
         mi_row_start: u32,
         mi_row_end: u32,
-        workers: usize,
     ) {
-        use crate::loop_filter::{loop_filter_frame_with_workers, loop_filter_rows, LoopFilterFrameContext};
+        self.with_lf_ctx(
+            lf_params,
+            seg_params,
+            delta_lf_multi,
+            num_planes,
+            bit_depth,
+            subsampling_x,
+            subsampling_y,
+            frame_width,
+            frame_height,
+            |ctx| {
+                crate::loop_filter::loop_filter_rows_window(
+                    ctx,
+                    plane,
+                    pass,
+                    window,
+                    window_row0,
+                    mi_row_start,
+                    mi_row_end,
+                );
+            },
+        );
+    }
+
+    /// The §7.14 frame context over this walker's grids, handed to `f`.
+    #[allow(clippy::too_many_arguments)]
+    fn with_lf_ctx(
+        &self,
+        lf_params: &crate::uncompressed_header_tail::LoopFilterParams,
+        seg_params: &crate::uncompressed_header_tail::SegmentationParams,
+        delta_lf_multi: bool,
+        num_planes: u8,
+        bit_depth: u8,
+        subsampling_x: u8,
+        subsampling_y: u8,
+        frame_width: u32,
+        frame_height: u32,
+        f: impl FnOnce(&crate::loop_filter::LoopFilterFrameContext<'_>),
+    ) {
+        use crate::loop_filter::LoopFilterFrameContext;
         let ctx = LoopFilterFrameContext {
             loop_filter_level: lf_params.loop_filter_level,
             loop_filter_sharpness: lf_params.loop_filter_sharpness,
@@ -20738,11 +22274,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
             // signalled as `u8::MAX` for cells with no segment id).
             segment_id: &|r, c| {
                 let s = self.segment_id_at(r as i32, c as i32);
-                if s < 0 {
-                    u8::MAX
-                } else {
-                    s as u8
-                }
+                if s < 0 { u8::MAX } else { s as u8 }
             },
             // §7.14.4 `DeltaLFs[ row ][ col ][ idx ]` — the per-mi snapshot
             // the §5.11.5 grid-fill stamped from the §5.11.13 accumulator.
@@ -20778,11 +22310,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
             // §7.14.2 line 17065: `MiSizes[ row ][ col ]`.
             mi_size: &|r, c| self.mi_size_at(r as i32, c as i32),
         };
-        if workers > 1 && mi_row_start == 0 && mi_row_end >= self.mi_rows {
-            loop_filter_frame_with_workers(&ctx, planes, workers);
-        } else {
-            loop_filter_rows(&ctx, planes, mi_row_start, mi_row_end);
-        }
+        f(&ctx);
     }
 
     /// Reconstruct `LoopfilterTxSizes[ plane ][ subRow ][ subCol ]` from
@@ -20866,7 +22394,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
     /// `UpscaledCurrFrame`, consulted by §7.17.6 for the cropped
     /// above/below-stripe neighbour lines.
     #[allow(clippy::too_many_arguments)]
-    pub fn loop_restore_frame_from_grid(
+    pub fn loop_restore_frame_from_grid<S: crate::loop_filter::Sample>(
         &self,
         lr_params: &crate::uncompressed_header_tail::LrParams,
         num_planes: u8,
@@ -20877,18 +22405,36 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         mi_cols: u32,
         frame_height: u32,
         upscaled_width: u32,
-        curr_planes: &[crate::loop_filter::PlaneBuffer<'_, P>],
-        cdef_planes: &[crate::loop_filter::PlaneBuffer<'_, P>],
-        lr_planes: &mut [crate::loop_filter::PlaneBuffer<'_, P>],
+        curr_planes: &[crate::loop_filter::PlaneBuffer<'_, S>],
+        cdef_planes: &[crate::loop_filter::PlaneBuffer<'_, S>],
+        lr_planes: &mut [crate::loop_filter::PlaneBuffer<'_, S>],
     ) {
-        self.loop_restore_frame_from_grid_with_workers(
-            lr_params, num_planes, bit_depth, subsampling_x, subsampling_y,
-            mi_rows, mi_cols, frame_height, upscaled_width, curr_planes, cdef_planes, lr_planes, 1,
+        self.with_lr_ctx(
+            lr_params,
+            num_planes,
+            bit_depth,
+            subsampling_x,
+            subsampling_y,
+            mi_rows,
+            mi_cols,
+            frame_height,
+            upscaled_width,
+            |ctx| {
+                crate::loop_restoration::loop_restoration_frame(
+                    ctx,
+                    curr_planes,
+                    cdef_planes,
+                    lr_planes,
+                )
+            },
         );
     }
 
+    /// r475 — [`Self::loop_restore_frame_from_grid`] in place over the
+    /// CDEF output with the captured pre-CDEF stripe-boundary rows
+    /// ([`crate::loop_restoration::loop_restoration_frame_in_place`]).
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn loop_restore_frame_from_grid_with_workers(
+    pub(crate) fn loop_restore_frame_in_place_from_grid<S: crate::loop_filter::Sample>(
         &self,
         lr_params: &crate::uncompressed_header_tail::LrParams,
         num_planes: u8,
@@ -20899,12 +22445,125 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         mi_cols: u32,
         frame_height: u32,
         upscaled_width: u32,
-        curr_planes: &[crate::loop_filter::PlaneBuffer<'_, P>],
-        cdef_planes: &[crate::loop_filter::PlaneBuffer<'_, P>],
-        lr_planes: &mut [crate::loop_filter::PlaneBuffer<'_, P>],
-        workers: usize,
+        planes: &mut [crate::loop_filter::PlaneBuffer<'_, S>],
+        boundary: &[crate::loop_restoration::StripeBoundaryRows<S>],
     ) {
-        use crate::loop_restoration::{loop_restoration_frame_with_workers, LoopRestorationFrameContext};
+        self.with_lr_ctx(
+            lr_params,
+            num_planes,
+            bit_depth,
+            subsampling_x,
+            subsampling_y,
+            mi_rows,
+            mi_cols,
+            frame_height,
+            upscaled_width,
+            |ctx| crate::loop_restoration::loop_restoration_frame_in_place(ctx, planes, boundary),
+        );
+    }
+
+    /// r475 — [`Self::loop_restore_frame_in_place_from_grid`]
+    /// `threads`-wide: §7.17.6 reads CDEF samples only inside the
+    /// unit's own stripe and pre-CDEF samples only at the stripe's
+    /// skirts (the captured `boundary` rows), and a unit writes only
+    /// its own rectangle — so the stripes of a plane restore
+    /// concurrently, each from its own copy into its own row window.
+    /// Byte-identical to the serial filter.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn loop_restore_frame_parallel_from_grid<S: crate::loop_filter::Sample>(
+        &self,
+        lr_params: &crate::uncompressed_header_tail::LrParams,
+        num_planes: u8,
+        bit_depth: u8,
+        subsampling_x: u8,
+        subsampling_y: u8,
+        mi_rows: u32,
+        mi_cols: u32,
+        frame_height: u32,
+        upscaled_width: u32,
+        planes: &mut [crate::loop_filter::PlaneBuffer<'_, S>],
+        boundary: &[crate::loop_restoration::StripeBoundaryRows<S>],
+        threads: usize,
+    ) {
+        use crate::loop_filter::{PlaneBuffer, row_windows_mut, run_jobs};
+        use crate::loop_restoration::{PlaneStripe, plane_stripes, restore_stripe_in_place};
+        if !lr_params.uses_lr {
+            return;
+        }
+        let num_planes = num_planes.min(planes.len() as u8);
+        for plane in 0..num_planes {
+            let Some(bnd) = boundary.get(plane as usize) else {
+                continue;
+            };
+            let mut stripes: Vec<PlaneStripe> = Vec::new();
+            self.with_lr_ctx(
+                lr_params,
+                num_planes,
+                bit_depth,
+                subsampling_x,
+                subsampling_y,
+                mi_rows,
+                mi_cols,
+                frame_height,
+                upscaled_width,
+                |ctx| stripes = plane_stripes(ctx, plane),
+            );
+            if stripes.is_empty() {
+                continue;
+            }
+            let pb = &mut planes[plane as usize];
+            let cols = pb.cols as usize;
+            let ranges: Vec<(usize, usize)> = stripes.iter().map(|s| (s.y0, s.y1)).collect();
+            let windows = row_windows_mut(pb.samples, cols, &ranges);
+            let mut jobs: Vec<Box<dyn FnOnce() + Send + '_>> = Vec::with_capacity(windows.len());
+            for (win, stripe) in windows.into_iter().zip(stripes.iter()) {
+                let job = move || {
+                    let mut out = PlaneBuffer {
+                        rows: (stripe.y1 - stripe.y0) as u32,
+                        cols: cols as u32,
+                        samples: win,
+                    };
+                    let mut copy = Vec::new();
+                    self.with_lr_ctx(
+                        lr_params,
+                        num_planes,
+                        bit_depth,
+                        subsampling_x,
+                        subsampling_y,
+                        mi_rows,
+                        mi_cols,
+                        frame_height,
+                        upscaled_width,
+                        |ctx| {
+                            restore_stripe_in_place(
+                                ctx, plane, stripe, bnd, &mut out, stripe.y0, &mut copy,
+                            )
+                        },
+                    );
+                };
+                jobs.push(Box::new(job));
+            }
+            run_jobs(threads, jobs);
+        }
+    }
+
+    /// The §7.17 frame context over this walker's §5.11.58 unit grid,
+    /// handed to `f`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn with_lr_ctx(
+        &self,
+        lr_params: &crate::uncompressed_header_tail::LrParams,
+        num_planes: u8,
+        bit_depth: u8,
+        subsampling_x: u8,
+        subsampling_y: u8,
+        mi_rows: u32,
+        mi_cols: u32,
+        frame_height: u32,
+        upscaled_width: u32,
+        f: impl FnOnce(&crate::loop_restoration::LoopRestorationFrameContext<'_>),
+    ) {
+        use crate::loop_restoration::LoopRestorationFrameContext;
         let ctx = LoopRestorationFrameContext {
             mi_rows,
             mi_cols,
@@ -20942,7 +22601,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
                 self.lr_unit(plane as usize, unit_row, unit_col).sgr_xqd[i]
             },
         };
-        loop_restoration_frame_with_workers(&ctx, curr_planes, cdef_planes, lr_planes, workers);
+        f(&ctx);
     }
 
     /// Helper to read `SkipModes[ r ][ c ]`. Returns `0` for
@@ -21255,6 +22914,49 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         }
     }
 
+    /// r479 — whether the lazily-materialised inter grids (see
+    /// [`Self::ensure_inter_grids`]) exist.
+    #[inline]
+    fn inter_grids_present(&self) -> bool {
+        !self.mvs.is_empty()
+    }
+
+    /// r479 — materialise the grids only inter / intra-block-copy
+    /// leaves stamp, at their construction pre-fill values: `Mvs[] =
+    /// 0`, `InterpFilters[] = EIGHTTAP`, `MotionModes[] = SIMPLE`,
+    /// `CompGroupIdxs[] = 0`, `CompoundIdxs[] = 1`, `CompoundTypes[]
+    /// = COMPOUND_AVERAGE`, the wedge / mask / inter-intra grids `0`,
+    /// `LocalValid[] = 0`. Idempotent.
+    pub(crate) fn ensure_inter_grids(&mut self) {
+        if self.inter_grids_present() {
+            return;
+        }
+        let area = (self.mi_rows as usize) * (self.mi_cols as usize);
+        self.mvs.resize(area * 4, 0);
+        self.interp_filters.resize(area * 2, EIGHTTAP);
+        self.motion_modes.resize(area, MOTION_MODE_SIMPLE);
+        self.comp_group_idxs.resize(area, 0);
+        self.compound_idxs.resize(area, 1);
+        self.compound_types
+            .resize(area, crate::inter_pred::COMPOUND_AVERAGE);
+        self.compound_wedge_indices.resize(area, 0);
+        self.compound_wedge_signs.resize(area, 0);
+        self.compound_mask_types.resize(area, 0);
+        self.interintra_modes.resize(area, 0);
+        self.wedge_interintras.resize(area, 0);
+        self.interintra_wedge_indices.resize(area, 0);
+        self.local_warp_valid.resize(area, 0);
+    }
+
+    /// r479 — materialise the §5.11.5 `DeltaLFs[]` grid (all zero,
+    /// the §5.9.18 default). Idempotent.
+    fn ensure_delta_lfs(&mut self) {
+        if self.delta_lfs.is_empty() {
+            let area = (self.mi_rows as usize) * (self.mi_cols as usize);
+            self.delta_lfs.resize(area * FRAME_LF_COUNT, 0);
+        }
+    }
+
     fn ensure_palette_colors(&mut self) {
         if self.palette_colors.is_empty() {
             let area = (self.mi_rows as usize) * (self.mi_cols as usize);
@@ -21343,6 +23045,9 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         let bw4 = NUM_4X4_BLOCKS_WIDE[s.sub_size] as u32;
         let bh4 = NUM_4X4_BLOCKS_HIGH[s.sub_size] as u32;
         let area = (self.mi_rows as usize) * (self.mi_cols as usize);
+        if s.is_inter != 0 {
+            self.ensure_inter_grids();
+        }
         for dr in 0..bh4 {
             let rr = s.mi_row + dr;
             if rr >= self.mi_rows {
@@ -21503,13 +23208,27 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         w4: u32,
         h4: u32,
     ) -> EncoderStampSnapshot {
+        self.snapshot_encoder_stamp_rect_wh_reusing(mi_row, mi_col, w4, h4, None)
+    }
+
+    /// [`Self::snapshot_encoder_stamp_rect_wh`] into the buffers of a
+    /// snapshot that is no longer needed (`recycled`), so a capture in
+    /// a pricing loop allocates nothing once the buffers have grown.
+    pub(crate) fn snapshot_encoder_stamp_rect_wh_reusing(
+        &self,
+        mi_row: u32,
+        mi_col: u32,
+        w4: u32,
+        h4: u32,
+        recycled: Option<EncoderStampSnapshot>,
+    ) -> EncoderStampSnapshot {
         let r1 = (mi_row + h4).min(self.mi_rows);
         let c1 = (mi_col + w4).min(self.mi_cols);
         let rows = r1.saturating_sub(mi_row);
         let cols = c1.saturating_sub(mi_col);
         let cells = (rows as usize) * (cols as usize);
         let area = (self.mi_rows as usize) * (self.mi_cols as usize);
-        let mut snap = EncoderStampSnapshot {
+        let mut snap = recycled.unwrap_or_else(|| EncoderStampSnapshot {
             mi_row,
             mi_col,
             rows,
@@ -21538,7 +23257,32 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
             interintra_modes: Vec::with_capacity(cells),
             wedge_interintras: Vec::with_capacity(cells),
             interintra_wedge_indices: Vec::with_capacity(cells),
-        };
+        });
+        (snap.mi_row, snap.mi_col, snap.rows, snap.cols) = (mi_row, mi_col, rows, cols);
+        snap.mi_sizes.clear();
+        snap.skips.clear();
+        snap.skip_modes.clear();
+        snap.segment_ids.clear();
+        snap.y_modes.clear();
+        snap.is_inters.clear();
+        snap.tx_sizes.clear();
+        snap.inter_tx_sizes.clear();
+        snap.motion_modes.clear();
+        snap.ref_frames.clear();
+        snap.interp_filters.clear();
+        snap.mvs.clear();
+        snap.delta_lfs.clear();
+        snap.palette_sizes.clear();
+        snap.palette_colors.clear();
+        snap.comp_group_idxs.clear();
+        snap.compound_idxs.clear();
+        snap.compound_types.clear();
+        snap.compound_wedge_indices.clear();
+        snap.compound_wedge_signs.clear();
+        snap.compound_mask_types.clear();
+        snap.interintra_modes.clear();
+        snap.wedge_interintras.clear();
+        snap.interintra_wedge_indices.clear();
         for rr in mi_row..r1 {
             for cc in mi_col..c1 {
                 let cell = (rr * self.mi_cols + cc) as usize;
@@ -21550,16 +23294,28 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
                 snap.is_inters.push(self.is_inters[cell]);
                 snap.tx_sizes.push(self.tx_sizes[cell]);
                 snap.inter_tx_sizes.push(self.inter_tx_sizes[cell]);
-                snap.motion_modes.push(self.motion_modes[cell]);
                 snap.ref_frames
                     .extend_from_slice(&self.ref_frames[cell * 2..cell * 2 + 2]);
-                snap.interp_filters
-                    .extend_from_slice(&self.interp_filters[cell * 2..cell * 2 + 2]);
-                snap.mvs
-                    .extend_from_slice(&self.mvs[cell * 4..cell * 4 + 4]);
-                snap.delta_lfs.extend_from_slice(
-                    &self.delta_lfs[cell * FRAME_LF_COUNT..(cell + 1) * FRAME_LF_COUNT],
-                );
+                if self.inter_grids_present() {
+                    snap.motion_modes.push(self.motion_modes[cell]);
+                    snap.interp_filters
+                        .extend_from_slice(&self.interp_filters[cell * 2..cell * 2 + 2]);
+                    snap.mvs
+                        .extend_from_slice(&self.mvs[cell * 4..cell * 4 + 4]);
+                } else {
+                    // r479 — lazily-materialised grids never touched:
+                    // snapshot the pre-fill values.
+                    snap.motion_modes.push(MOTION_MODE_SIMPLE);
+                    snap.interp_filters.extend_from_slice(&[EIGHTTAP; 2]);
+                    snap.mvs.extend_from_slice(&[0i16; 4]);
+                }
+                if self.delta_lfs.is_empty() {
+                    snap.delta_lfs.extend_from_slice(&[0i8; FRAME_LF_COUNT]);
+                } else {
+                    snap.delta_lfs.extend_from_slice(
+                        &self.delta_lfs[cell * FRAME_LF_COUNT..(cell + 1) * FRAME_LF_COUNT],
+                    );
+                }
                 for plane in 0..3usize {
                     let pcell = plane * area + cell;
                     snap.palette_sizes.push(self.palette_sizes[pcell]);
@@ -21575,19 +23331,32 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
                         );
                     }
                 }
-                snap.comp_group_idxs.push(self.comp_group_idxs[cell]);
-                snap.compound_idxs.push(self.compound_idxs[cell]);
-                snap.compound_types.push(self.compound_types[cell]);
-                snap.compound_wedge_indices
-                    .push(self.compound_wedge_indices[cell]);
-                snap.compound_wedge_signs
-                    .push(self.compound_wedge_signs[cell]);
-                snap.compound_mask_types
-                    .push(self.compound_mask_types[cell]);
-                snap.interintra_modes.push(self.interintra_modes[cell]);
-                snap.wedge_interintras.push(self.wedge_interintras[cell]);
-                snap.interintra_wedge_indices
-                    .push(self.interintra_wedge_indices[cell]);
+                if self.inter_grids_present() {
+                    snap.comp_group_idxs.push(self.comp_group_idxs[cell]);
+                    snap.compound_idxs.push(self.compound_idxs[cell]);
+                    snap.compound_types.push(self.compound_types[cell]);
+                    snap.compound_wedge_indices
+                        .push(self.compound_wedge_indices[cell]);
+                    snap.compound_wedge_signs
+                        .push(self.compound_wedge_signs[cell]);
+                    snap.compound_mask_types
+                        .push(self.compound_mask_types[cell]);
+                    snap.interintra_modes.push(self.interintra_modes[cell]);
+                    snap.wedge_interintras.push(self.wedge_interintras[cell]);
+                    snap.interintra_wedge_indices
+                        .push(self.interintra_wedge_indices[cell]);
+                } else {
+                    snap.comp_group_idxs.push(0);
+                    snap.compound_idxs.push(1);
+                    snap.compound_types
+                        .push(crate::inter_pred::COMPOUND_AVERAGE);
+                    snap.compound_wedge_indices.push(0);
+                    snap.compound_wedge_signs.push(0);
+                    snap.compound_mask_types.push(0);
+                    snap.interintra_modes.push(0);
+                    snap.wedge_interintras.push(0);
+                    snap.interintra_wedge_indices.push(0);
+                }
             }
         }
         snap
@@ -21599,6 +23368,31 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
     /// outside the rect is touched.
     pub(crate) fn restore_encoder_stamp_rect(&mut self, snap: &EncoderStampSnapshot) {
         let area = (self.mi_rows as usize) * (self.mi_cols as usize);
+        // r479 — writing the pre-fill values into a never-materialised
+        // grid is the identity: skip the allocation on the intra path.
+        let inter = self.inter_grids_present()
+            || snap.mvs.iter().any(|&v| v != 0)
+            || snap.interp_filters.iter().any(|&v| v != EIGHTTAP)
+            || snap.motion_modes.iter().any(|&v| v != MOTION_MODE_SIMPLE)
+            || snap.comp_group_idxs.iter().any(|&v| v != 0)
+            || snap.compound_idxs.iter().any(|&v| v != 1)
+            || snap
+                .compound_types
+                .iter()
+                .any(|&v| v != crate::inter_pred::COMPOUND_AVERAGE)
+            || snap.compound_wedge_indices.iter().any(|&v| v != 0)
+            || snap.compound_wedge_signs.iter().any(|&v| v != 0)
+            || snap.compound_mask_types.iter().any(|&v| v != 0)
+            || snap.interintra_modes.iter().any(|&v| v != 0)
+            || snap.wedge_interintras.iter().any(|&v| v != 0)
+            || snap.interintra_wedge_indices.iter().any(|&v| v != 0);
+        if inter {
+            self.ensure_inter_grids();
+        }
+        let dlf = !self.delta_lfs.is_empty() || snap.delta_lfs.iter().any(|&v| v != 0);
+        if dlf {
+            self.ensure_delta_lfs();
+        }
         let mut i = 0usize;
         for dr in 0..snap.rows {
             for dc in 0..snap.cols {
@@ -21611,14 +23405,20 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
                 self.is_inters[cell] = snap.is_inters[i];
                 self.tx_sizes[cell] = snap.tx_sizes[i];
                 self.inter_tx_sizes[cell] = snap.inter_tx_sizes[i];
-                self.motion_modes[cell] = snap.motion_modes[i];
                 self.ref_frames[cell * 2..cell * 2 + 2]
                     .copy_from_slice(&snap.ref_frames[i * 2..i * 2 + 2]);
-                self.interp_filters[cell * 2..cell * 2 + 2]
-                    .copy_from_slice(&snap.interp_filters[i * 2..i * 2 + 2]);
-                self.mvs[cell * 4..cell * 4 + 4].copy_from_slice(&snap.mvs[i * 4..i * 4 + 4]);
-                self.delta_lfs[cell * FRAME_LF_COUNT..(cell + 1) * FRAME_LF_COUNT]
-                    .copy_from_slice(&snap.delta_lfs[i * FRAME_LF_COUNT..(i + 1) * FRAME_LF_COUNT]);
+                if inter {
+                    self.motion_modes[cell] = snap.motion_modes[i];
+                    self.interp_filters[cell * 2..cell * 2 + 2]
+                        .copy_from_slice(&snap.interp_filters[i * 2..i * 2 + 2]);
+                    self.mvs[cell * 4..cell * 4 + 4].copy_from_slice(&snap.mvs[i * 4..i * 4 + 4]);
+                }
+                if dlf {
+                    self.delta_lfs[cell * FRAME_LF_COUNT..(cell + 1) * FRAME_LF_COUNT]
+                        .copy_from_slice(
+                            &snap.delta_lfs[i * FRAME_LF_COUNT..(i + 1) * FRAME_LF_COUNT],
+                        );
+                }
                 for plane in 0..3usize {
                     let pcell = plane * area + cell;
                     self.palette_sizes[pcell] = snap.palette_sizes[i * 3 + plane];
@@ -21632,15 +23432,17 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
                             .copy_from_slice(src);
                     }
                 }
-                self.comp_group_idxs[cell] = snap.comp_group_idxs[i];
-                self.compound_idxs[cell] = snap.compound_idxs[i];
-                self.compound_types[cell] = snap.compound_types[i];
-                self.compound_wedge_indices[cell] = snap.compound_wedge_indices[i];
-                self.compound_wedge_signs[cell] = snap.compound_wedge_signs[i];
-                self.compound_mask_types[cell] = snap.compound_mask_types[i];
-                self.interintra_modes[cell] = snap.interintra_modes[i];
-                self.wedge_interintras[cell] = snap.wedge_interintras[i];
-                self.interintra_wedge_indices[cell] = snap.interintra_wedge_indices[i];
+                if inter {
+                    self.comp_group_idxs[cell] = snap.comp_group_idxs[i];
+                    self.compound_idxs[cell] = snap.compound_idxs[i];
+                    self.compound_types[cell] = snap.compound_types[i];
+                    self.compound_wedge_indices[cell] = snap.compound_wedge_indices[i];
+                    self.compound_wedge_signs[cell] = snap.compound_wedge_signs[i];
+                    self.compound_mask_types[cell] = snap.compound_mask_types[i];
+                    self.interintra_modes[cell] = snap.interintra_modes[i];
+                    self.wedge_interintras[cell] = snap.wedge_interintras[i];
+                    self.interintra_wedge_indices[cell] = snap.interintra_wedge_indices[i];
+                }
                 i += 1;
             }
         }
@@ -21664,7 +23466,11 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
     /// row is inside the scope), the §5.11.9 segment-prediction
     /// context spans, and the §5.11.2 `CurrentQIndex` /
     /// `DeltaLF[]` / `ReadDeltas` scalars.
-    pub(crate) fn snapshot_price_scope(
+    ///
+    /// The capture reuses the buffers of a snapshot that is no longer
+    /// needed (`recycled`) when there is one.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn snapshot_price_scope_reusing(
         &self,
         mi_row: u32,
         mi_col: u32,
@@ -21672,12 +23478,41 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         h4: u32,
         subsampling_x: u8,
         subsampling_y: u8,
+        recycled: Option<PriceScopeSnapshot>,
     ) -> PriceScopeSnapshot {
-        let stamp = self.snapshot_encoder_stamp_rect_wh(mi_row, mi_col, w4, h4);
+        let (
+            old_stamp,
+            mut tx_types,
+            mut cdef,
+            mut above_ctx,
+            mut left_ctx,
+            mut above_seg,
+            mut left_seg,
+        ) = match recycled {
+            Some(r) => (
+                Some(r.stamp),
+                r.tx_types,
+                r.cdef,
+                r.above_ctx,
+                r.left_ctx,
+                r.above_seg,
+                r.left_seg,
+            ),
+            None => (
+                None,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            ),
+        };
+        let stamp = self.snapshot_encoder_stamp_rect_wh_reusing(mi_row, mi_col, w4, h4, old_stamp);
         let r1 = (mi_row + h4).min(self.mi_rows);
         let c1 = (mi_col + w4).min(self.mi_cols);
-        let mut tx_types =
-            Vec::with_capacity(((r1 - mi_row.min(r1)) * (c1 - mi_col.min(c1))) as usize);
+        tx_types.clear();
+        tx_types.reserve(((r1 - mi_row.min(r1)) * (c1 - mi_col.min(c1))) as usize);
         for rr in mi_row..r1 {
             for cc in mi_col..c1 {
                 tx_types.push(self.tx_types[(rr * self.mi_cols + cc) as usize]);
@@ -21685,7 +23520,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         }
         let cdef_size4 = NUM_4X4_BLOCKS_WIDE[BLOCK_64X64] as u32;
         let mask: u32 = !(cdef_size4 - 1);
-        let mut cdef = Vec::new();
+        cdef.clear();
         let mut i = mi_row & mask;
         while i < mi_row + h4 && i < self.mi_rows {
             let mut j = mi_col & mask;
@@ -21696,8 +23531,8 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
             }
             i += cdef_size4;
         }
-        let mut above_ctx = Vec::new();
-        let mut left_ctx = Vec::new();
+        above_ctx.clear();
+        left_ctx.clear();
         let mut spans = [(0usize, 0usize, 0usize, 0usize); 3];
         for (plane, span) in spans.iter_mut().enumerate() {
             let (ssx, ssy) = if plane == 0 {
@@ -21730,6 +23565,10 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         let seg_c1 = c1 as usize;
         let seg_r0 = mi_row.min(self.mi_rows) as usize;
         let seg_r1 = r1 as usize;
+        above_seg.clear();
+        above_seg.extend_from_slice(&self.above_seg_pred_context[seg_c0..seg_c1.max(seg_c0)]);
+        left_seg.clear();
+        left_seg.extend_from_slice(&self.left_seg_pred_context[seg_r0..seg_r1.max(seg_r0)]);
         PriceScopeSnapshot {
             stamp,
             tx_types,
@@ -21739,8 +23578,8 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
             left_ctx,
             seg_cols: (seg_c0, seg_c1),
             seg_rows: (seg_r0, seg_r1),
-            above_seg: self.above_seg_pred_context[seg_c0..seg_c1.max(seg_c0)].to_vec(),
-            left_seg: self.left_seg_pred_context[seg_r0..seg_r1.max(seg_r0)].to_vec(),
+            above_seg,
+            left_seg,
             current_q_index: self.current_q_index,
             current_delta_lf: self.current_delta_lf,
             read_deltas_pending: self.read_deltas_pending,
@@ -21894,7 +23733,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         // §5.11.49 `aboveN = 0; if ((MiRow * MI_SIZE) % 64) aboveN =
         // PaletteSizes[plane][MiRow - 1][MiCol]`. MI_SIZE = 4 so
         // `MiRow * 4 % 64` simplifies to `MiRow % 16`.
-        let above_n: usize = if mi_row > 0 && ((mi_row as usize) * MI_SIZE) % 64 != 0 {
+        let above_n: usize = if mi_row > 0 && !((mi_row as usize) * MI_SIZE).is_multiple_of(64) {
             self.palette_size_at(plane, mi_row as i32 - 1, mi_col as i32) as usize
         } else {
             0
@@ -22084,14 +23923,30 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         // §5.11.18 per-cell `AvailU` / `AvailL` follow the tile
         // geometry (`is_inside` is tile-relative) — rebuild for the
         // in-walk §5.11.33 OBMC dispatch.
+        // r481 — row-slice fills: `is_inside( r - 1, c )` holds exactly
+        // for `r - 1` in the tile's rows and `c` in its columns,
+        // `is_inside( r, c - 1 )` for `r` in its rows and `c - 1` in
+        // its columns.
+        let (rows, cols) = (self.mi_rows as usize, self.mi_cols as usize);
+        let g = self.geometry;
         self.walk_avail_u.clear();
+        self.walk_avail_u.resize(rows * cols, 0);
         self.walk_avail_l.clear();
-        for r in 0..self.mi_rows {
-            for c in 0..self.mi_cols {
-                self.walk_avail_u
-                    .push(u8::from(self.geometry.is_inside(r as i32 - 1, c as i32)));
-                self.walk_avail_l
-                    .push(u8::from(self.geometry.is_inside(r as i32, c as i32 - 1)));
+        self.walk_avail_l.resize(rows * cols, 0);
+        let (cs, ce) = (
+            (g.mi_col_start as usize).min(cols),
+            (g.mi_col_end as usize).min(cols),
+        );
+        let (ls, le) = (
+            (g.mi_col_start as usize + 1).min(cols),
+            (g.mi_col_end as usize + 1).min(cols),
+        );
+        for r in (g.mi_row_start as usize).min(rows)..(g.mi_row_end as usize).min(rows) {
+            if r + 1 < rows && cs < ce {
+                self.walk_avail_u[(r + 1) * cols + cs..(r + 1) * cols + ce].fill(1);
+            }
+            if ls < le {
+                self.walk_avail_l[r * cols + ls..r * cols + le].fill(1);
             }
         }
     }
@@ -23193,11 +25048,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         // lint is allowed on this block.
         #[allow(clippy::if_same_then_else)]
         let pred: i32 = if prev_u == -1 {
-            if prev_l == -1 {
-                0
-            } else {
-                prev_l
-            }
+            if prev_l == -1 { 0 } else { prev_l }
         } else if prev_l == -1 {
             prev_u
         } else if prev_ul == prev_u {
@@ -24037,7 +25888,12 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
             "frameLfCount cannot exceed FRAME_LF_COUNT = 4"
         );
 
-        for i in 0..frame_lf_count {
+        for (i, delta_lf) in self
+            .current_delta_lf
+            .iter_mut()
+            .enumerate()
+            .take(frame_lf_count)
+        {
             // delta_lf_abs                                          S()
             // §8.3.2: the cdf is given by TileDeltaLFCdf (single-LF)
             // or TileDeltaLFMultiCdf[ i ] (multi-LF).
@@ -24074,8 +25930,8 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
                 //   DeltaLF[ i ] + (reducedDeltaLfLevel << delta_lf_res))
                 let shift = delta_lf_res as u32;
                 let scaled = reduced.wrapping_shl(shift);
-                let pre_clip = self.current_delta_lf[i].wrapping_add(scaled);
-                self.current_delta_lf[i] = pre_clip.clamp(-MAX_LOOP_FILTER, MAX_LOOP_FILTER);
+                let pre_clip = delta_lf.wrapping_add(scaled);
+                *delta_lf = pre_clip.clamp(-MAX_LOOP_FILTER, MAX_LOOP_FILTER);
             }
         }
 
@@ -25761,11 +27617,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
                         "S() over Default_Cfl_Alpha_Cdf yields 0..CFL_ALPHABET_SIZE"
                     );
                     let signed = (1 + raw_u) as i8;
-                    if sign_u == 1 {
-                        -signed
-                    } else {
-                        signed
-                    }
+                    if sign_u == 1 { -signed } else { signed }
                 } else {
                     0
                 };
@@ -25779,11 +27631,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
                         "S() over Default_Cfl_Alpha_Cdf yields 0..CFL_ALPHABET_SIZE"
                     );
                     let signed = (1 + raw_v) as i8;
-                    if sign_v == 1 {
-                        -signed
-                    } else {
-                        signed
-                    }
+                    if sign_v == 1 { -signed } else { signed }
                 } else {
                     0
                 };
@@ -26318,21 +28166,16 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         // so the next block's §5.11.18 prologue / §8.3.2 ref-frame ctx
         // walks observe the value. Mirrors the §5.11.7 grid-stamp
         // convention applied to the y_modes / skips / etc. grids.
-        for dr in 0..bh4 {
-            let rr = mi_row + dr;
-            if rr >= self.mi_rows {
-                break;
-            }
-            for dc in 0..bw4 {
-                let cc = mi_col + dc;
-                if cc >= self.mi_cols {
-                    break;
-                }
-                let cell = ((rr * self.mi_cols + cc) as usize) * 2;
-                self.ref_frames[cell] = ref_frame[0] as i8;
-                self.ref_frames[cell + 1] = ref_frame[1] as i8;
-            }
-        }
+        stamp_rect(
+            &mut self.ref_frames,
+            self.mi_rows,
+            self.mi_cols,
+            mi_row,
+            mi_col,
+            bh4,
+            bw4,
+            [ref_frame[0] as i8, ref_frame[1] as i8],
+        );
 
         // §5.11.23 line 5: `find_mv_stack( isCompound )` per §7.10.2.
         // r205: full §7.10.2 driver wired in (r173 spatial scans plus
@@ -26495,38 +28338,46 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         // ordering is `mvs[ref][row][col]`; cast i32 → i16 (the
         // §6.10.27 conformance bound `Abs( Mv[ i ][ comp ] ) < ( 1 <<
         // 14 )` keeps the value in i16 range).
-        for dr in 0..bh4 {
-            let rr = mi_row + dr;
-            if rr >= self.mi_rows {
-                break;
-            }
-            for dc in 0..bw4 {
-                let cc = mi_col + dc;
-                if cc >= self.mi_cols {
-                    break;
-                }
-                let cell = (rr * self.mi_cols + cc) as usize;
-                // [row][list][comp] flat layout: `(cell * 2 + list) * 2 + comp`.
-                self.mvs[(cell * 2) * 2] = mv[0][0] as i16;
-                self.mvs[(cell * 2) * 2 + 1] = mv[0][1] as i16;
-                self.mvs[(cell * 2 + 1) * 2] = mv[1][0] as i16;
-                self.mvs[(cell * 2 + 1) * 2 + 1] = mv[1][1] as i16;
-                // §5.11.5 `YModes[ r + y ][ c + x ] = YMode` — the
-                // inter-arm grid-fill. §7.10.2.8 reads it back as
-                // `candMode` (the `has_newmv( candMode )` NewMvCount
-                // increment driving the §7.10.2.14 `NewMvContext`
-                // derivation, and the GLOBALMV `candMv` special case),
-                // and the §7.14.4 deblock strength selection reads it
-                // as `mode` for the `Mode_Deltas` modeType split.
-                // (r390 fix: the inter arm previously left the grid at
-                // its DC_PRED prefill, so a NEWMV neighbour never
-                // advanced `NewMvCount` and every `new_mv` read after
-                // one used ctx `5` where §7.10.2.14 requires `4` —
-                // desynchronising the arithmetic decoder on the first
-                // inter frame with a NEWMV-coded neighbour.)
-                self.y_modes[cell] = y_mode;
-            }
-        }
+        self.ensure_inter_grids();
+        // [row][list][comp] flat layout: `(cell * 2 + list) * 2 + comp`.
+        // §5.11.5 `YModes[ r + y ][ c + x ] = YMode` — the inter-arm
+        // grid-fill. §7.10.2.8 reads it back as `candMode` (the
+        // `has_newmv( candMode )` NewMvCount increment driving the
+        // §7.10.2.14 `NewMvContext` derivation, and the GLOBALMV
+        // `candMv` special case), and the §7.14.4 deblock strength
+        // selection reads it as `mode` for the `Mode_Deltas` modeType
+        // split. (r390 fix: the inter arm previously left the grid at
+        // its DC_PRED prefill, so a NEWMV neighbour never advanced
+        // `NewMvCount` and every `new_mv` read after one used ctx `5`
+        // where §7.10.2.14 requires `4` — desynchronising the
+        // arithmetic decoder on the first inter frame with a
+        // NEWMV-coded neighbour.)
+        let (mr, mc) = (self.mi_rows, self.mi_cols);
+        stamp_rect(
+            &mut self.mvs,
+            mr,
+            mc,
+            mi_row,
+            mi_col,
+            bh4,
+            bw4,
+            [
+                mv[0][0] as i16,
+                mv[0][1] as i16,
+                mv[1][0] as i16,
+                mv[1][1] as i16,
+            ],
+        );
+        stamp_rect(
+            &mut self.y_modes,
+            mr,
+            mc,
+            mi_row,
+            mi_col,
+            bh4,
+            bw4,
+            [y_mode],
+        );
 
         // §5.11.23 line 33: `read_interintra_mode( isCompound )` per
         // §5.11.28 (av1-spec p.79-80). Reads the inter-intra blending
@@ -26560,20 +28411,16 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
             // §5.11.x readers below see the post-override state
             // exactly as the spec's imperative assignment implies.
             // Slot 0 is unchanged.
-            for dr in 0..bh4 {
-                let rr = mi_row + dr;
-                if rr >= self.mi_rows {
-                    break;
-                }
-                for dc in 0..bw4 {
-                    let cc = mi_col + dc;
-                    if cc >= self.mi_cols {
-                        break;
-                    }
-                    let cell = ((rr * self.mi_cols + cc) as usize) * 2;
-                    self.ref_frames[cell + 1] = 0; // INTRA_FRAME
-                }
-            }
+            stamp_rect(
+                &mut self.ref_frames,
+                self.mi_rows,
+                self.mi_cols,
+                mi_row,
+                mi_col,
+                bh4,
+                bw4,
+                [ref_frame[0] as i8, 0], // RefFrame[ 1 ] = INTRA_FRAME
+            );
             [ref_frame[0], 0]
         } else {
             ref_frame
@@ -26682,21 +28529,28 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         // (`skip_mode == 1` or `!isCompound`) still stamps the pre-set
         // defaults (`0` / `1`) — matching the §5.11.29 line-1 / line-2
         // imperatives.
-        for dr in 0..bh4 {
-            let rr = mi_row + dr;
-            if rr >= self.mi_rows {
-                break;
-            }
-            for dc in 0..bw4 {
-                let cc = mi_col + dc;
-                if cc >= self.mi_cols {
-                    break;
-                }
-                let cell = (rr * self.mi_cols + cc) as usize;
-                self.comp_group_idxs[cell] = compound_type.comp_group_idx;
-                self.compound_idxs[cell] = compound_type.compound_idx;
-            }
-        }
+        self.ensure_inter_grids();
+        let (mr, mc) = (self.mi_rows, self.mi_cols);
+        stamp_rect(
+            &mut self.comp_group_idxs,
+            mr,
+            mc,
+            mi_row,
+            mi_col,
+            bh4,
+            bw4,
+            [compound_type.comp_group_idx],
+        );
+        stamp_rect(
+            &mut self.compound_idxs,
+            mr,
+            mc,
+            mi_row,
+            mi_col,
+            bh4,
+            bw4,
+            [compound_type.compound_idx],
+        );
 
         // §5.11.23 line 37: `read_interpolation_filter( )` per §5.11.x
         // (av1-spec p.74). The LAST leaf of the §5.11.23 inter cascade.
@@ -26727,21 +28581,17 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         // path (the §5.11.x short-circuit arms set both slots, with the
         // `!enable_dual_filter` mirror already applied inside
         // [`Self::read_interpolation_filter`]).
-        for dr in 0..bh4 {
-            let rr = mi_row + dr;
-            if rr >= self.mi_rows {
-                break;
-            }
-            for dc in 0..bw4 {
-                let cc = mi_col + dc;
-                if cc >= self.mi_cols {
-                    break;
-                }
-                let cell = (rr * self.mi_cols + cc) as usize;
-                self.interp_filters[cell * 2] = interp_filter.interp_filter[0];
-                self.interp_filters[cell * 2 + 1] = interp_filter.interp_filter[1];
-            }
-        }
+        self.ensure_inter_grids();
+        stamp_rect(
+            &mut self.interp_filters,
+            self.mi_rows,
+            self.mi_cols,
+            mi_row,
+            mi_col,
+            bh4,
+            bw4,
+            interp_filter.interp_filter,
+        );
 
         // §5.11.27 / §5.11.28 / §5.11.29 side-data grid stamp: write the
         // already-resolved `motion_mode` / inter-intra blend triple /
@@ -26762,27 +28612,88 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         let ii_mode = interintra.interintra_mode.unwrap_or(0);
         let ii_wedge = interintra.wedge_interintra.unwrap_or(0);
         let ii_wedge_index = interintra.wedge_index.unwrap_or(0);
-        for dr in 0..bh4 {
-            let rr = mi_row + dr;
-            if rr >= self.mi_rows {
-                break;
-            }
-            for dc in 0..bw4 {
-                let cc = mi_col + dc;
-                if cc >= self.mi_cols {
-                    break;
-                }
-                let cell = (rr * self.mi_cols + cc) as usize;
-                self.motion_modes[cell] = motion_mode;
-                self.compound_types[cell] = comp_type;
-                self.compound_wedge_indices[cell] = comp_wedge_index;
-                self.compound_wedge_signs[cell] = comp_wedge_sign;
-                self.compound_mask_types[cell] = comp_mask_type;
-                self.interintra_modes[cell] = ii_mode;
-                self.wedge_interintras[cell] = ii_wedge;
-                self.interintra_wedge_indices[cell] = ii_wedge_index;
-            }
-        }
+        self.ensure_inter_grids();
+        let (mr, mc) = (self.mi_rows, self.mi_cols);
+        stamp_rect(
+            &mut self.motion_modes,
+            mr,
+            mc,
+            mi_row,
+            mi_col,
+            bh4,
+            bw4,
+            [motion_mode],
+        );
+        stamp_rect(
+            &mut self.compound_types,
+            mr,
+            mc,
+            mi_row,
+            mi_col,
+            bh4,
+            bw4,
+            [comp_type],
+        );
+        stamp_rect(
+            &mut self.compound_wedge_indices,
+            mr,
+            mc,
+            mi_row,
+            mi_col,
+            bh4,
+            bw4,
+            [comp_wedge_index],
+        );
+        stamp_rect(
+            &mut self.compound_wedge_signs,
+            mr,
+            mc,
+            mi_row,
+            mi_col,
+            bh4,
+            bw4,
+            [comp_wedge_sign],
+        );
+        stamp_rect(
+            &mut self.compound_mask_types,
+            mr,
+            mc,
+            mi_row,
+            mi_col,
+            bh4,
+            bw4,
+            [comp_mask_type],
+        );
+        stamp_rect(
+            &mut self.interintra_modes,
+            mr,
+            mc,
+            mi_row,
+            mi_col,
+            bh4,
+            bw4,
+            [ii_mode],
+        );
+        stamp_rect(
+            &mut self.wedge_interintras,
+            mr,
+            mc,
+            mi_row,
+            mi_col,
+            bh4,
+            bw4,
+            [ii_wedge],
+        );
+        stamp_rect(
+            &mut self.interintra_wedge_indices,
+            mr,
+            mc,
+            mi_row,
+            mi_col,
+            bh4,
+            bw4,
+            [ii_wedge_index],
+        );
 
         Ok(DecodedInterBlockModeInfo {
             mi_row,
@@ -27124,7 +29035,6 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
     /// lives in a downstream arc and the data is recoverable from the
     /// walker grids).
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     fn add_sample(
         &self,
         mi_row: u32,
@@ -27179,8 +29089,8 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         let bh = block_height(sub_size) as i32;
         let threshold = core::cmp::max(bw, bh).clamp(16, 112);
         let nb_cell = (cand_row as u32 * self.mi_cols + cand_col as u32) as usize;
-        let nb_mv_row = self.mvs[(nb_cell * 2) * 2] as i32;
-        let nb_mv_col = self.mvs[(nb_cell * 2) * 2 + 1] as i32;
+        let nb_mv_row = i32::from(self.mvs.get((nb_cell * 2) * 2).copied().unwrap_or(0));
+        let nb_mv_col = i32::from(self.mvs.get((nb_cell * 2) * 2 + 1).copied().unwrap_or(0));
         let mv_diff_row = (nb_mv_row - mv[0][0]).unsigned_abs() as i64;
         let mv_diff_col = (nb_mv_col - mv[0][1]).unsigned_abs() as i64;
         let valid = mv_diff_row + mv_diff_col <= threshold as i64;
@@ -27624,13 +29534,13 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
             // the `0` identity (the §5.11.29 pre-fill value).
             let above_cg = if avail_u && mi_row > 0 {
                 let cell = ((mi_row - 1) * self.mi_cols + mi_col) as usize;
-                self.comp_group_idxs[cell]
+                self.comp_group_idxs.get(cell).copied().unwrap_or(0)
             } else {
                 0
             };
             let left_cg = if avail_l && mi_col > 0 {
                 let cell = (mi_row * self.mi_cols + (mi_col - 1)) as usize;
-                self.comp_group_idxs[cell]
+                self.comp_group_idxs.get(cell).copied().unwrap_or(0)
             } else {
                 0
             };
@@ -27668,13 +29578,13 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
                 // av1-spec p.384.
                 let above_ci = if avail_u && mi_row > 0 {
                     let cell = ((mi_row - 1) * self.mi_cols + mi_col) as usize;
-                    self.compound_idxs[cell]
+                    self.compound_idxs.get(cell).copied().unwrap_or(1)
                 } else {
                     1
                 };
                 let left_ci = if avail_l && mi_col > 0 {
                     let cell = (mi_row * self.mi_cols + (mi_col - 1)) as usize;
-                    self.compound_idxs[cell]
+                    self.compound_idxs.get(cell).copied().unwrap_or(1)
                 } else {
                     1
                 };
@@ -27933,7 +29843,10 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
                 let n1 = self.ref_frame_at(row, col, 1) as i32;
                 if n0 == ref_frame[0] || n1 == ref_frame[0] {
                     let cell = ((mi_row - 1) * self.mi_cols + mi_col) as usize;
-                    self.interp_filters[cell * 2 + dir] as usize
+                    self.interp_filters
+                        .get(cell * 2 + dir)
+                        .copied()
+                        .unwrap_or(EIGHTTAP) as usize
                 } else {
                     INTERP_FILTER_NONE
                 }
@@ -27947,7 +29860,10 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
                 let n1 = self.ref_frame_at(row, col, 1) as i32;
                 if n0 == ref_frame[0] || n1 == ref_frame[0] {
                     let cell = (mi_row * self.mi_cols + (mi_col - 1)) as usize;
-                    self.interp_filters[cell * 2 + dir] as usize
+                    self.interp_filters
+                        .get(cell * 2 + dir)
+                        .copied()
+                        .unwrap_or(EIGHTTAP) as usize
                 } else {
                     INTERP_FILTER_NONE
                 }
@@ -29714,7 +31630,6 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
     /// encoder-mirror drivers where §5.11.47 codes no symbol) can keep
     /// using [`Self::coefficients`], whose behaviour is unchanged.
     #[allow(clippy::too_many_arguments)]
-    #[inline(always)]
     pub fn coefficients_gate_open(
         &mut self,
         decoder: &mut crate::symbol_decoder::SymbolDecoder<'_>,
@@ -29726,26 +31641,6 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         dc_sign_ctx: usize,
         scan: &[u16],
         quant: &mut [i32],
-    ) -> Result<CoefficientsReadout, crate::Error> {
-        self.coefficients_gate_open_inner(
-            decoder, cdfs, plane, is_inter, tx_size, tx_class, dc_sign_ctx, scan, quant, true,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    #[inline(always)]
-    fn coefficients_gate_open_inner(
-        &mut self,
-        decoder: &mut crate::symbol_decoder::SymbolDecoder<'_>,
-        cdfs: &mut TileCdfContext,
-        plane: u8,
-        is_inter: u8,
-        tx_size: usize,
-        tx_class: usize,
-        dc_sign_ctx: usize,
-        scan: &[u16],
-        quant: &mut [i32],
-        zero_quant: bool,
     ) -> Result<CoefficientsReadout, crate::Error> {
         // ---------------- caller-bug guards ----------------
         if tx_size >= TX_SIZES_ALL {
@@ -29786,8 +31681,8 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         }
         // §5.11.39 lines 8-9 zero-fill (idempotent when the caller came
         // through [`Self::coefficients`], which already zeroed).
-        if zero_quant {
-            quant[..seg_eob].fill(0);
+        for cell in quant.iter_mut().take(seg_eob) {
+            *cell = 0;
         }
 
         // ---------------- §5.11.39 EOB read ----------------
@@ -29873,9 +31768,9 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
             // §8.3.2 `eob_extra`: ctx = `eobPt - 3`.
             let extra_ctx = (eob_pt - 3) as usize;
             let cdf = cdfs
-                .eob_extra_cdf(tx_sz_ctx, ptype, extra_ctx)
+                .eob_extra_row(tx_sz_ctx, ptype, extra_ctx)
                 .ok_or(crate::Error::PartitionWalkOutOfRange)?;
-            let eob_extra = decoder.read_symbol(cdf)?;
+            let eob_extra = decoder.read_symbol_sized(cdf)?;
             debug_assert!(
                 eob_extra <= 1,
                 "S() over Default_Eob_Extra_Cdf yields 0 or 1"
@@ -29891,7 +31786,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
             let mut i: i32 = 1;
             while i < upper {
                 eob_shift = upper - 1 - i;
-                let eob_extra_bit = decoder.read_literal(1)?;
+                let eob_extra_bit = decoder.read_bool()?;
                 if eob_extra_bit != 0 {
                     eob += 1u32 << eob_shift;
                 }
@@ -29911,10 +31806,28 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         // the already-written cells. The `Quant[]` array is the
         // §5.11.39 line-9 zero-initialised buffer; the buffer must be
         // wide enough to be indexed at every `pos = scan[c]`.
+        // r481 — the §8.3.2 `get_coeff_base_ctx` / `get_br_ctx`
+        // neighbour reads run over a zero-padded copy of the levels
+        // decoded so far (`Min( level, 15 )`, the larger of the two
+        // clamps; `get_coeff_base_ctx` clamps it further to 3): every
+        // neighbour offset is at most 4 rows / columns, and a neighbour
+        // outside the (adjusted) transform block reads the padding zero
+        // exactly as the spec's bounds test excludes it.
+        let adj = ADJUSTED_TX_SIZE[tx_size];
+        let bwl = TX_WIDTH_LOG2[adj];
+        let stride = (1usize << bwl) + LEVELS_PAD;
+        let levels_len = (TX_HEIGHT[adj] + LEVELS_PAD) * stride;
+        if self.coeff_levels.len() < levels_len {
+            self.coeff_levels.resize(levels_len, 0);
+        }
+        let levels = &mut self.coeff_levels[..levels_len];
+        levels.fill(0);
         if eob > 0 {
             let mut c: i32 = eob as i32 - 1;
             while c >= 0 {
                 let pos = scan[c as usize] as usize;
+                let row = pos >> bwl;
+                let lpos = row * stride + (pos - (row << bwl));
                 // §8.3.2 ctx derivations — see [`get_coeff_base_ctx`] /
                 // [`get_coeff_base_eob_ctx`].
                 let is_eob = c == (eob as i32 - 1);
@@ -29925,24 +31838,26 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
                     // SIG_COEF_CONTEXTS_EOB - SIG_COEF_CONTEXTS).
                     let ctx = get_coeff_base_eob_ctx(quant, tx_size, tx_class, pos, c as usize);
                     let cdf = cdfs
-                        .coeff_base_eob_cdf(tx_sz_ctx, ptype, ctx)
+                        .coeff_base_eob_row(tx_sz_ctx, ptype, ctx)
                         .ok_or(crate::Error::PartitionWalkOutOfRange)?;
                     // §5.11.39 line 60: `level = coeff_base_eob + 1`
                     // (the §9.4 alphabet is 3 values: 0, 1, 2 → levels
                     // 1, 2, 3).
-                    let sym = decoder.read_symbol(cdf)?;
+                    let sym = decoder.read_symbol_sized(cdf)?;
                     debug_assert!(sym <= 2, "S() over Default_Coeff_Base_Eob_Cdf yields 0..=2");
                     level = sym + 1;
                 } else {
                     // §8.3.2 `coeff_base`: ctx via
                     // [`get_coeff_base_ctx`] with `is_eob = false`.
-                    let ctx = get_coeff_base_ctx(quant, tx_size, tx_class, pos, c as usize, false);
+                    let ctx = coeff_base_ctx_from_levels(
+                        levels, stride, lpos, tx_size, tx_class, pos, bwl,
+                    );
                     let cdf = cdfs
-                        .coeff_base_cdf(tx_sz_ctx, ptype, ctx)
+                        .coeff_base_row(tx_sz_ctx, ptype, ctx)
                         .ok_or(crate::Error::PartitionWalkOutOfRange)?;
                     // §5.11.39 line 63: `level = coeff_base` (the §9.4
                     // alphabet is 4 values: 0, 1, 2, 3 → levels 0, 1, 2, 3).
-                    let sym = decoder.read_symbol(cdf)?;
+                    let sym = decoder.read_symbol_sized(cdf)?;
                     debug_assert!(sym <= 3, "S() over Default_Coeff_Base_Cdf yields 0..=3");
                     level = sym;
                 }
@@ -29954,12 +31869,15 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
                 // than BR_CDF_SIZE - 1 = 3.
                 if level as usize > NUM_BASE_LEVELS {
                     let br_iters = COEFF_BASE_RANGE / (BR_CDF_SIZE - 1);
+                    // The neighbours `get_br_ctx` reads do not change
+                    // across the `coeff_br` reads of one position.
+                    let br_ctx = br_ctx_from_levels(levels, stride, lpos, tx_class, pos, bwl);
                     for _ in 0..br_iters {
-                        let ctx = get_br_ctx(quant, tx_size, tx_class, pos);
+                        let ctx = br_ctx;
                         let cdf = cdfs
-                            .coeff_br_cdf(tx_sz_ctx, ptype, ctx)
+                            .coeff_br_row(tx_sz_ctx, ptype, ctx)
                             .ok_or(crate::Error::PartitionWalkOutOfRange)?;
-                        let coeff_br = decoder.read_symbol(cdf)?;
+                        let coeff_br = decoder.read_symbol_sized(cdf)?;
                         debug_assert!(
                             (coeff_br as usize) < BR_CDF_SIZE,
                             "S() over Default_Coeff_Br_Cdf yields 0..BR_CDF_SIZE"
@@ -29973,6 +31891,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
                 // §5.11.39 line 71: `Quant[ pos ] = level` (magnitude
                 // only; the sign-apply runs in the forward-scan loop).
                 quant[pos] = level as i32;
+                levels[lpos] = level.min(15) as u8;
                 c -= 1;
             }
         }
@@ -29992,13 +31911,13 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
                 if c == 0 {
                     // §8.3.2 `dc_sign`: ctx from caller.
                     let cdf = cdfs
-                        .dc_sign_cdf(ptype, dc_sign_ctx)
+                        .dc_sign_row(ptype, dc_sign_ctx)
                         .ok_or(crate::Error::PartitionWalkOutOfRange)?;
-                    let dc_sign = decoder.read_symbol(cdf)?;
+                    let dc_sign = decoder.read_symbol_sized(cdf)?;
                     debug_assert!(dc_sign <= 1, "S() over Default_Dc_Sign_Cdf yields 0 or 1");
                     dc_sign
                 } else {
-                    decoder.read_literal(1)?
+                    decoder.read_bool()?
                 }
             } else {
                 0
@@ -30026,7 +31945,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
                     if length > 30 {
                         return Err(crate::Error::GolombLengthOverflow);
                     }
-                    let bit = decoder.read_literal(1)?;
+                    let bit = decoder.read_bool()?;
                     if bit != 0 {
                         break;
                     }
@@ -30036,7 +31955,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
                 let mut x: u32 = 1;
                 let mut i: i32 = length as i32 - 2;
                 while i >= 0 {
-                    let bit = decoder.read_literal(1)?;
+                    let bit = decoder.read_bool()?;
                     x = (x << 1) | bit;
                     i -= 1;
                 }
@@ -30392,7 +32311,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         // through to [`Self::compute_prediction`] +
         // [`Self::residual`], and the walker advances past the
         // historical r189 stub site.
-        inter_ctx: Option<&InterFrameContext<'_, R>>,
+        inter_ctx: Option<&InterFrameContext>,
         // r286: §5.9.12 per-frame quantiser state + §5.9.21
         // `reduced_tx_set`. Threaded into the §5.11.34 `residual()`
         // dispatch's [`ResidualContext`] so the §5.11.47
@@ -30702,6 +32621,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
             // §5.11.5 `if ( !use_intrabc )` gate). Subsequent
             // intra-block-copy blocks' §7.10.2 neighbour scans read
             // these cells.
+            self.ensure_inter_grids();
             for dr in 0..bh4 {
                 let rr = mi_row_b + dr;
                 if rr >= self.mi_rows {
@@ -30932,27 +32852,10 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         // `uv_mode` carries the §5.11.7 / §5.11.22 decoded `UVMode`
         // (or `DC_PRED` when the `HasChroma` arm did not run — the
         // §5.11.33 chroma planes are not visited in that case).
-        let _readout = self.compute_prediction(
-            mi_row_b,
-            mi_col_b,
-            sub_size,
-            has_chroma,
-            avail_u,
-            avail_l,
-            avail_u_chroma,
-            avail_l_chroma,
-            subsampling_x,
-            subsampling_y,
-            is_inter != 0,
-            /* y_mode = */ y_mode,
-            /* uv_mode = */ uv_mode.unwrap_or(0),
-            /* ref_frame_1_is_intra = */ false,
-            // §5.11.28 `interintra_mode` — the §5.11.5 walker emits no
-            // inter-intra blocks (`ref_frame_1_is_intra == false`), so
-            // this is unread; pass `II_DC_PRED` as the inert default.
-            /* interintra_mode = */
-            II_DC_PRED,
-        )?;
+        // r481 — the §5.11.33 task readout of an intra block is not
+        // consumed (the §7.11.2 writes run from `residual()`), and its
+        // derivation reads no state the walk needs, so it is not
+        // evaluated here.
 
         // §5.11.33 `is_inter` arm, realised — on the §5.11.7 intra
         // path the only `is_inter == 1` blocks are `use_intrabc == 1`
@@ -30962,7 +32865,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         // between `compute_prediction( )` and `residual( )`, so the
         // §7.12.3 step-3 merge lands on the real prediction and later
         // blocks read reconstructed neighbours.
-        if use_intrabc != 0 {
+        if use_intrabc != 0 && !self.parse_only {
             self.predict_intrabc_leaf_into_curr_frame(
                 mi_row_b,
                 mi_col_b,
@@ -31070,7 +32973,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
             avail_u_chroma,
             enable_intra_edge_filter: self.enable_intra_edge_filter,
         };
-        self.residual_with_readout(
+        let _residual = self.residual(
             decoder,
             cdfs,
             mi_row_b,
@@ -31085,7 +32988,6 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
             tx_size as usize,
             use_128x128_superblock,
             &neutral_ctx,
-            None,
         )?;
         // §5.11.5 line `is_compound = RefFrame[ 1 ] > INTRA_FRAME` —
         // already derived above. The §5.11.5 walker concludes the
@@ -31171,7 +33073,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         bit_depth: u8,
         quant: &QuantizerParams,
         reduced_tx_set: bool,
-        ctx: &InterFrameContext<'_, R>,
+        ctx: &InterFrameContext,
     ) -> Result<DecodedBlock, crate::Error> {
         // §5.11.19 `predictedSegmentId = get_segment_id()` — the
         // §5.11.21 min-scan over `PrevSegmentIds` at THIS block's
@@ -31346,28 +33248,36 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         // (plane, 4x4-cell) on the `is_inter == 1` arm; on the
         // §5.11.28 inter-intra arm (`ref_frame_1_is_intra == true`)
         // it prepends one intra-half task per plane (r301).
-        let readout = self.compute_prediction(
-            mi_row,
-            mi_col,
-            sub_size,
-            has_chroma,
-            avail_u,
-            avail_l,
-            avail_u_chroma,
-            avail_l_chroma,
-            subsampling_x,
-            subsampling_y,
-            /* is_inter = */ true,
-            /* y_mode = */ inter_block.y_mode,
-            /* uv_mode = */ uv_mode_for_compute,
-            ref_frame_1_is_intra,
-            // §5.11.28 `interintra_mode` — present (`Some`) on the
-            // inter-intra arm (`ref_frame_1_is_intra == true`); the
-            // §5.11.33 dispatcher reads it only there. `None` (the
-            // non-interintra path) maps to the inert `II_DC_PRED`.
-            /* interintra_mode = */
-            inter_block.interintra.interintra_mode.unwrap_or(II_DC_PRED),
-        )?;
+        // r481 — a syntax-only walk predicts nothing, so it skips the
+        // §5.11.33 task derivation (it reads no state the syntax needs).
+        // r481 — the readout is consumed only by the inter-intra arm
+        // (its intra tasks), so it is derived only there.
+        let readout = if self.parse_only || !ref_frame_1_is_intra {
+            None
+        } else {
+            Some(self.compute_prediction(
+                mi_row,
+                mi_col,
+                sub_size,
+                has_chroma,
+                avail_u,
+                avail_l,
+                avail_u_chroma,
+                avail_l_chroma,
+                subsampling_x,
+                subsampling_y,
+                /* is_inter = */ true,
+                /* y_mode = */ inter_block.y_mode,
+                /* uv_mode = */ uv_mode_for_compute,
+                ref_frame_1_is_intra,
+                // §5.11.28 `interintra_mode` — present (`Some`) on the
+                // inter-intra arm (`ref_frame_1_is_intra == true`); the
+                // §5.11.33 dispatcher reads it only there. `None` (the
+                // non-interintra path) maps to the inert `II_DC_PRED`.
+                /* interintra_mode = */
+                inter_block.interintra.interintra_mode.unwrap_or(II_DC_PRED),
+            )?)
+        };
 
         // §5.11.33 `IsInterIntra` end-to-end propagation. The walker
         // tracks no `CurrFrame[plane]` sample buffers, so it cannot
@@ -31390,7 +33300,9 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         // condition. A mismatch is a §5.11.33 dispatcher contract
         // breach (a future spec/reader edit drifting the two apart),
         // surfaced as a caller-bug guard rather than silently trusted.
-        let is_inter_intra = readout.is_inter_intra;
+        let is_inter_intra = readout
+            .as_ref()
+            .map_or(ref_frame_1_is_intra, |r| r.is_inter_intra);
         if is_inter_intra != ref_frame_1_is_intra {
             return Err(crate::Error::PartitionWalkOutOfRange);
         }
@@ -31430,6 +33342,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
                 );
                 let origin = (mi_row * self.mi_cols + mi_col) as usize;
                 self.ensure_local_warp_params();
+                self.ensure_inter_grids();
                 self.local_warp_params[origin * 6..origin * 6 + 6]
                     .copy_from_slice(&lw.local_warp_params);
                 self.local_warp_valid[origin] = u8::from(lw.local_valid);
@@ -31441,7 +33354,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
             // dispatcher above emitted one intra task per plane
             // (`mode != COMPUTE_PRED_MODE_INTER`); drive each through
             // the §7.11.2 writer.
-            if is_inter_intra {
+            if let (true, Some(readout)) = (is_inter_intra, readout.as_ref()) {
                 let sb_mask: u32 = if use_128x128_superblock { 31 } else { 15 };
                 for task in readout
                     .tasks
@@ -31527,7 +33440,9 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
                 }
             }
             let _ = px.bit_depth;
-            self.predict_inter_leaf_from_walk(mi_row, mi_col, sub_size, ctx)?;
+            if !self.parse_only {
+                self.predict_inter_leaf_from_walk(mi_row, mi_col, sub_size, ctx)?;
+            }
         }
 
         // §5.11.5 line `residual( )` — §5.11.34 dispatcher.
@@ -31566,7 +33481,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
             avail_u_chroma: false,
             enable_intra_edge_filter: self.enable_intra_edge_filter,
         };
-        self.residual_with_readout(
+        let _residual = self.residual(
             decoder,
             cdfs,
             mi_row,
@@ -31575,13 +33490,12 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
             has_chroma,
             subsampling_x,
             subsampling_y,
-            true,
+            /* is_inter = */ true,
             info.lossless,
             info.skip != 0,
             tx_size as usize,
             use_128x128_superblock,
             &neutral_ctx,
-            None,
         )?;
 
         Ok(DecodedBlock {
@@ -31775,23 +33689,10 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         // (the §7.11.2 prediction itself happens per-TU inside the
         // §5.11.34 `residual()` dispatch below, mirroring the §5.11.7
         // intra-frame arm).
-        let _readout = self.compute_prediction(
-            mi_row,
-            mi_col,
-            sub_size,
-            has_chroma,
-            avail_u,
-            avail_l,
-            avail_u_chroma,
-            avail_l_chroma,
-            subsampling_x,
-            subsampling_y,
-            /* is_inter = */ false,
-            y_mode,
-            uv_mode.unwrap_or(0),
-            /* ref_frame_1_is_intra = */ false,
-            /* interintra_mode = */ II_DC_PRED,
-        )?;
+        // r481 — the §5.11.33 task readout of an intra block is not
+        // consumed (the §7.11.2 writes run from `residual()`), and its
+        // derivation reads no state the walk needs, so it is not
+        // evaluated here.
 
         // §5.11.5 line `residual( )` — the full intra `ResidualContext`
         // (mode-info + the caller-threaded §5.9.12 quantiser pair).
@@ -31828,7 +33729,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
             avail_u_chroma,
             enable_intra_edge_filter: self.enable_intra_edge_filter,
         };
-        self.residual_with_readout(
+        let _residual = self.residual(
             decoder,
             cdfs,
             mi_row,
@@ -31837,13 +33738,12 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
             has_chroma,
             subsampling_x,
             subsampling_y,
-            false,
+            /* is_inter = */ false,
             info.lossless,
             info.skip != 0,
             tx_size as usize,
             use_128x128_superblock,
             &res_ctx,
-            None,
         )?;
 
         Ok(DecodedBlock {
@@ -32511,25 +34411,35 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         use_128x128_superblock: bool,
         ctx: &ResidualContext,
     ) -> Result<ResidualReadout, crate::Error> {
-        if mi_size >= BLOCK_SIZES
-            || mi_row >= self.mi_rows
-            || mi_col >= self.mi_cols
-            || subsampling_x > 1
-            || subsampling_y > 1
-            || tx_size >= TX_SIZES_ALL
-        {
+        // ---------- caller-bug guards ----------
+        if mi_size >= BLOCK_SIZES {
             return Err(crate::Error::PartitionWalkOutOfRange);
         }
+        if mi_row >= self.mi_rows || mi_col >= self.mi_cols {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        if subsampling_x > 1 || subsampling_y > 1 {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        if tx_size >= TX_SIZES_ALL {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+
+        // §5.11.34 lines 3-4: `widthChunks` / `heightChunks`.
         let block_w = block_width(mi_size);
         let block_h = block_height(mi_size);
         let width_chunks = core::cmp::max(1, block_w >> 6);
         let height_chunks = core::cmp::max(1, block_h >> 6);
+        // §5.11.34 line 5: `miSizeChunk`.
         let mi_size_chunk = if width_chunks > 1 || height_chunks > 1 {
             BLOCK_64X64
         } else {
             mi_size
         };
+
+        // §5.11.34 line 22-ish: `1 + HasChroma * 2`.
         let num_planes = 1u8 + if has_chroma { 2 } else { 0 };
+
         let mut readout = ResidualReadout {
             width_chunks: width_chunks as u8,
             height_chunks: height_chunks as u8,
@@ -32540,64 +34450,6 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
             residuals: Vec::new(),
             skip,
         };
-        self.residual_with_readout(
-            decoder,
-            cdfs,
-            mi_row,
-            mi_col,
-            mi_size,
-            has_chroma,
-            subsampling_x,
-            subsampling_y,
-            is_inter,
-            lossless,
-            skip,
-            tx_size,
-            use_128x128_superblock,
-            ctx,
-            Some(&mut readout),
-        )?;
-        Ok(readout)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn residual_with_readout(
-        &mut self,
-        decoder: &mut crate::symbol_decoder::SymbolDecoder<'_>,
-        cdfs: &mut TileCdfContext,
-        mi_row: u32,
-        mi_col: u32,
-        mi_size: usize,
-        has_chroma: bool,
-        subsampling_x: u8,
-        subsampling_y: u8,
-        is_inter: bool,
-        lossless: bool,
-        skip: bool,
-        tx_size: usize,
-        use_128x128_superblock: bool,
-        ctx: &ResidualContext,
-        mut readout: Option<&mut ResidualReadout>,
-    ) -> Result<(), crate::Error> {
-        if mi_size >= BLOCK_SIZES
-            || mi_row >= self.mi_rows
-            || mi_col >= self.mi_cols
-            || subsampling_x > 1
-            || subsampling_y > 1
-            || tx_size >= TX_SIZES_ALL
-        {
-            return Err(crate::Error::PartitionWalkOutOfRange);
-        }
-        let block_w = block_width(mi_size);
-        let block_h = block_height(mi_size);
-        let width_chunks = core::cmp::max(1, block_w >> 6);
-        let height_chunks = core::cmp::max(1, block_h >> 6);
-        let mi_size_chunk = if width_chunks > 1 || height_chunks > 1 {
-            BLOCK_64X64
-        } else {
-            mi_size
-        };
-        let num_planes = 1u8 + if has_chroma { 2 } else { 0 };
 
         // §5.11.34 outer chunk loop. For `MiSize < BLOCK_128X128` the
         // body executes once with `chunkY = chunkX = 0`. For
@@ -32677,7 +34529,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
                             mi_size,
                             use_128x128_superblock,
                             ctx,
-                            readout.as_deref_mut(),
+                            &mut readout,
                         )?;
                     } else {
                         // §5.11.34 line 26-27: `baseXBlock` /
@@ -32714,7 +34566,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
                                     mi_size,
                                     use_128x128_superblock,
                                     ctx,
-                                    readout.as_deref_mut(),
+                                    &mut readout,
                                 )?;
                                 if step_x == 0 {
                                     break;
@@ -32731,7 +34583,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
             }
         }
 
-        Ok(())
+        Ok(readout)
     }
 
     /// `transform_tree( startX, startY, w, h )` per §5.11.36 (av1-spec
@@ -32772,7 +34624,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         mi_size: usize,
         use_128x128_superblock: bool,
         ctx: &ResidualContext,
-        mut readout: Option<&mut ResidualReadout>,
+        readout: &mut ResidualReadout,
     ) -> Result<(), crate::Error> {
         // §5.11.36 lines 1-3: `maxX = MiCols * MI_SIZE` / `maxY = MiRows
         // * MI_SIZE` early-return.
@@ -32847,7 +34699,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
                 mi_size,
                 use_128x128_superblock,
                 ctx,
-                readout.as_deref_mut(),
+                readout,
             )?;
             self.residual_transform_tree(
                 decoder,
@@ -32886,7 +34738,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
                 mi_size,
                 use_128x128_superblock,
                 ctx,
-                readout.as_deref_mut(),
+                readout,
             )?;
             self.residual_transform_tree(
                 decoder,
@@ -32925,7 +34777,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
                 mi_size,
                 use_128x128_superblock,
                 ctx,
-                readout.as_deref_mut(),
+                readout,
             )?;
             self.residual_transform_tree(
                 decoder,
@@ -32944,7 +34796,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
                 mi_size,
                 use_128x128_superblock,
                 ctx,
-                readout.as_deref_mut(),
+                readout,
             )?;
             self.residual_transform_tree(
                 decoder,
@@ -32963,7 +34815,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
                 mi_size,
                 use_128x128_superblock,
                 ctx,
-                readout.as_deref_mut(),
+                readout,
             )?;
             self.residual_transform_tree(
                 decoder,
@@ -33047,7 +34899,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         mi_size: usize,
         use_128x128_superblock: bool,
         ctx: &ResidualContext,
-        mut readout: Option<&mut ResidualReadout>,
+        readout: &mut ResidualReadout,
     ) -> Result<(), crate::Error> {
         // §5.11.35 lines 1-2: `startX = baseX + 4 * x`, `startY =
         // baseY + 4 * y`.
@@ -33072,7 +34924,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         // j]` so the subsequent §7.12.3 step-3 merge adds the residual
         // on top. The non-palette / non-CfL / non-filter-intra arm is
         // covered here; palette / CfL / filter-intra route elsewhere.
-        if !is_inter && ctx.is_intra {
+        if !is_inter && ctx.is_intra && !self.parse_only {
             // §5.11.35 palette arm: `if ( ( plane == 0 && PaletteSizeY )
             // || ( plane != 0 && PaletteSizeUV ) ) predict_palette(...)`
             // — a palette-coded plane takes the §7.11.4 sample write
@@ -33233,18 +35085,16 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         // identity (neither flip flag fires for DCT_DCT, so a
         // skip-path TU with no residual maps cleanly to a no-op step-3
         // merge anyway).
-        if let Some(ro) = readout.as_deref_mut() {
-            ro.tasks.push(ResidualTuTask {
-                plane,
-                start_x,
-                start_y,
-                tx_size: tx_sz as u8,
-                chunk_x,
-                chunk_y,
-                from_transform_tree,
-                plane_tx_type: DCT_DCT as u8,
-            });
-        }
+        readout.tasks.push(ResidualTuTask {
+            plane,
+            start_x,
+            start_y,
+            tx_size: tx_sz as u8,
+            chunk_x,
+            chunk_y,
+            from_transform_tree,
+            plane_tx_type: DCT_DCT as u8,
+        });
 
         // §5.11.35 line 32: `if ( !skip ) eob = coeffs( plane, startX,
         // startY, txSz )` — invoke the §5.11.39 reader for the
@@ -33302,15 +35152,13 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
                 // §5.11.39 tail — culLevel = 0 / dcCategory = 0 stamps
                 // fire on the gate-closed arm too.
                 self.stamp_txb_level_context(plane, tx_sz, x4, y4, 0, 0);
-                if let Some(ro) = readout.as_deref_mut() {
-                    ro.coeffs.push(CoefficientsReadout {
-                        all_zero: true,
-                        eob: 0,
-                        cul_level: 0,
-                        dc_category: 0,
-                    });
-                    ro.residuals.push(None);
-                }
+                readout.coeffs.push(CoefficientsReadout {
+                    all_zero: true,
+                    eob: 0,
+                    cul_level: 0,
+                    dc_category: 0,
+                });
+                readout.residuals.push(None);
             } else {
                 // §5.11.47 `transform_type` S() — luma-only on the
                 // `all_zero == 0` arm. The chroma plane uses
@@ -33383,188 +35231,101 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
                 // for the `flipUD` / `flipLR` destination remap. The task
                 // was pushed above with the DCT_DCT placeholder; on this
                 // arm we replace it with the actual `PlaneTxType`.
-                if let Some(ro) = readout.as_deref_mut() {
-                    if let Some(last) = ro.tasks.last_mut() {
-                        last.plane_tx_type = plane_tx_type as u8;
-                    }
+                if let Some(last) = readout.tasks.last_mut() {
+                    last.plane_tx_type = plane_tx_type as u8;
                 }
+
+                // §8.3.2 tx_class derivation — fold the §3 `*_DCT` /
+                // `*_ADST` / `*_FLIPADST` constants into TX_CLASS_2D /
+                // TX_CLASS_HORIZ / TX_CLASS_VERT.
                 let tx_class = match plane_tx_type {
                     V_DCT | V_ADST | V_FLIPADST => TX_CLASS_VERT,
                     H_DCT | H_ADST | H_FLIPADST => TX_CLASS_HORIZ,
                     _ => TX_CLASS_2D,
                 };
+
+                // §7.5 / §5.11.41 `get_scan( txSz )` — routes per
+                // `(txSz, PlaneTxType)` to the per-size Default / Mrow /
+                // Mcol scan table the §5.11.39 reader walks.
                 let scan = crate::scan::get_scan(tx_sz, plane_tx_type);
-                if let Some(ro) = readout {
-                    let mut quant = vec![0i32; tx_w * tx_h];
-                    let coeffs = self.coefficients_gate_open(
-                        decoder, cdfs, plane, is_inter as u8, tx_sz, tx_class, dc_sign_ctx, scan,
-                        &mut quant,
-                    )?;
-                    self.stamp_txb_level_context(
-                        plane, tx_sz, x4, y4, coeffs.cul_level, coeffs.dc_category,
-                    );
-                    ro.coeffs.push(coeffs);
-                    if coeffs.eob > 0 {
-                        let dequant = dequantize_step1(
-                            &quant,
-                            tx_sz,
-                            plane,
-                            ctx.segment_id,
-                            plane_tx_type,
-                            ctx.seg_qm_level[plane as usize],
-                            &ctx.quant,
-                        );
-                        let residual = crate::transform::inverse_transform_2d(
-                            &dequant,
-                            tx_sz,
-                            plane_tx_type,
-                            ctx.quant.bit_depth as u32,
-                            lossless,
-                        );
-                        self.curr_frame_step3_merge(
-                            plane, start_x, start_y, tx_sz, plane_tx_type, &residual,
-                            ctx.quant.bit_depth, sub_x, sub_y,
-                        );
-                        ro.residuals.push(Some(residual));
-                    } else {
-                        ro.residuals.push(None);
-                    }
-                } else {
-                    struct TuScratch {
-                        quant: [i32; 4096],
-                        dequant: [i64; 4096],
-                        dc_buf: [i64; 4096],
-                    }
-                    std::thread_local! {
-                        static AV1_TU_SCRATCH: core::cell::Cell<Option<Box<TuScratch>>> = const { core::cell::Cell::new(None) };
-                    }
-                    let mut scratch = AV1_TU_SCRATCH.with(|c| c.take()).unwrap_or_else(|| {
-                        Box::new(TuScratch {
-                            quant: [0; 4096],
-                            dequant: [0; 4096],
-                            dc_buf: [0; 4096],
-                        })
-                    });
-                    let n_tu = tx_w * tx_h;
-                    let res = self.coefficients_gate_open_inner(
-                        decoder,
-                        cdfs,
-                        plane,
-                        is_inter as u8,
+                // r481 — reused per-walker coefficient / dequant /
+                // residual buffers (the per-transform-block allocations).
+                let mut quant = std::mem::take(&mut self.tx_quant_scratch);
+                quant.clear();
+                quant.resize(tx_w * tx_h, 0);
+                let coeffs = self.coefficients_gate_open(
+                    decoder,
+                    cdfs,
+                    plane,
+                    is_inter as u8,
+                    tx_sz,
+                    tx_class,
+                    dc_sign_ctx,
+                    scan,
+                    &mut quant,
+                )?;
+                // §5.11.39 tail — stamp the TU's `culLevel` / `dcCategory`
+                // into the §6.10.2 context arrays.
+                self.stamp_txb_level_context(
+                    plane,
+                    tx_sz,
+                    x4,
+                    y4,
+                    coeffs.cul_level,
+                    coeffs.dc_category,
+                );
+                readout.coeffs.push(coeffs);
+                // §5.11.35 line 34: `if ( eob > 0 ) reconstruct(...)` —
+                // §7.12.3 dequantization (step 1) + §7.13 inverse
+                // transform + §7.12.3 step-3 frame-buffer merge.
+                if coeffs.eob > 0 && !self.parse_only {
+                    let mut dequant = std::mem::take(&mut self.tx_dequant_scratch);
+                    dequantize_step1_into(
+                        &quant,
                         tx_sz,
-                        tx_class,
-                        dc_sign_ctx,
-                        scan,
-                        &mut scratch.quant[..n_tu],
-                        false,
+                        plane,
+                        ctx.segment_id,
+                        plane_tx_type,
+                        ctx.seg_qm_level[plane as usize],
+                        &ctx.quant,
+                        &mut dequant,
                     );
-                    let coeffs = match res {
-                        Ok(c) => c,
-                        Err(e) => {
-                            scratch.quant[..n_tu.min(1024)].fill(0);
-                            AV1_TU_SCRATCH.with(|cell| cell.set(Some(scratch)));
-                            return Err(e);
-                        }
-                    };
-                    self.stamp_txb_level_context(
-                        plane, tx_sz, x4, y4, coeffs.cul_level, coeffs.dc_category,
+                    let mut residual = std::mem::take(&mut self.tx_residual_scratch);
+                    crate::transform::inverse_transform_2d_into(
+                        &dequant,
+                        tx_sz,
+                        plane_tx_type,
+                        ctx.quant.bit_depth as u32,
+                        lossless,
+                        &mut residual,
                     );
-                    if coeffs.eob > 0 {
-                        let eob_n = coeffs.eob as usize;
-                        let tw = core::cmp::min(32, tx_w);
-                        let dq_shift: u32 = match dequant_denom(tx_sz) {
-                            1 => 0,
-                            2 => 1,
-                            _ => 2,
-                        };
-                        let clip_min: i64 = -(1i64 << (7 + ctx.quant.bit_depth as u32));
-                        let clip_max: i64 = (1i64 << (7 + ctx.quant.bit_depth as u32)) - 1;
-                        let dc_q_val = get_dc_quant(&ctx.quant, plane, ctx.segment_id) as i64;
-                        let ac_q_val = get_ac_quant(&ctx.quant, plane, ctx.segment_id) as i64;
-                        let seg_qm_level = ctx.seg_qm_level[plane as usize];
-                        let qm_active =
-                            ctx.quant.using_qmatrix && plane_tx_type < IDTX && seg_qm_level < 15;
-                        for &pos_u16 in &scan[..eob_n] {
-                            let p = pos_u16 as usize;
-                            let ql = scratch.quant[p];
-                            if ql != 0 {
-                                scratch.quant[p] = 0;
-                                let i = p / tw;
-                                let j = p % tw;
-                                let q = if p == 0 { dc_q_val } else { ac_q_val };
-                                let q2 = if qm_active {
-                                    let qm = crate::qmatrix::qmatrix_value(
-                                        seg_qm_level, plane, tx_sz, i, j,
-                                    ) as i64;
-                                    (q * qm + 16) >> 5
-                                } else {
-                                    q
-                                };
-                                let dq = (ql as i64) * q2;
-                                let mag = ((dq.unsigned_abs() & 0xFF_FFFF) >> dq_shift) as i64;
-                                let dq2 = if dq < 0 { -mag } else { mag };
-                                scratch.dequant[i * tx_w + j] = dq2.clamp(clip_min, clip_max);
-                            }
-                        }
-                        let bd = ctx.quant.bit_depth as u32;
-                        if eob_n == 1
-                            && !lossless
-                            && plane_tx_type == DCT_DCT
-                            && matches!(bd, 8 | 10 | 12)
-                        {
-                            let mut dc = scratch.dequant[0];
-                            scratch.dequant[0] = 0;
-                            let log2_w = TX_WIDTH_LOG2[tx_sz] as u32;
-                            let log2_h = (tx_h as u32).trailing_zeros();
-                            if log2_w.abs_diff(log2_h) == 1 {
-                                dc = (dc * 2896 + 2048) >> 12;
-                            }
-                            let rs = crate::transform::TRANSFORM_ROW_SHIFT[tx_sz];
-                            let d1 = (dc * 2896 + 2048) >> 12;
-                            dc = if rs == 0 { d1 } else { (d1 + (1 << (rs - 1))) >> rs };
-                            let prec = (bd + 6).max(16);
-                            dc = dc.clamp(-(1 << (prec - 1)), (1 << (prec - 1)) - 1);
-                            let d2 = (dc * 2896 + 2048) >> 12;
-                            dc = (d2 + 8) >> 4;
-                            scratch.dc_buf[..n_tu].fill(dc);
-                            self.curr_frame_step3_merge(
-                                plane,
-                                start_x,
-                                start_y,
-                                tx_sz,
-                                plane_tx_type,
-                                &scratch.dc_buf[..n_tu],
-                                ctx.quant.bit_depth,
-                                sub_x,
-                                sub_y,
-                            );
-                        } else {
-                            let residual = crate::transform::inverse_transform_2d(
-                                &scratch.dequant[..n_tu],
-                                tx_sz,
-                                plane_tx_type,
-                                bd,
-                                lossless,
-                            );
-                            for &pos_u16 in &scan[..eob_n] {
-                                let p = pos_u16 as usize;
-                                scratch.dequant[(p / tw) * tx_w + (p % tw)] = 0;
-                            }
-                            self.curr_frame_step3_merge(
-                                plane,
-                                start_x,
-                                start_y,
-                                tx_sz,
-                                plane_tx_type,
-                                &residual,
-                                ctx.quant.bit_depth,
-                                sub_x,
-                                sub_y,
-                            );
-                        }
-                    }
-                    AV1_TU_SCRATCH.with(|cell| cell.set(Some(scratch)));
+                    self.tx_dequant_scratch = dequant;
+                    // §7.12.3 step-3 (av1-spec p.295) — merge the per-TU
+                    // `Residual[i][j]` into `CurrFrame[plane][y + yy][x +
+                    // xx]` with the `flipLR` / `flipUD` destination remap
+                    // for the FLIPADST family and a `Clip1` envelope
+                    // against `(1 << BitDepth) - 1`. The buffer is
+                    // allocated lazily on the first per-plane merge call
+                    // (see [`Self::ensure_curr_frame_plane`]).
+                    self.curr_frame_step3_merge(
+                        plane,
+                        start_x,
+                        start_y,
+                        tx_sz,
+                        plane_tx_type,
+                        &residual,
+                        ctx.quant.bit_depth,
+                        sub_x,
+                        sub_y,
+                    );
+                    readout
+                        .residuals
+                        .push(self.keep_residual_readouts.then(|| residual.clone()));
+                    self.tx_residual_scratch = residual;
+                } else {
+                    readout.residuals.push(None);
                 }
+                self.tx_quant_scratch = quant;
             }
         } else if plane == 0 {
             // §5.11.39 `all_zero == 1` luma stamp — the §5.11.39
@@ -33681,7 +35442,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         // r190: optional inter-arm context. See
         // [`Self::decode_block_syntax`]'s `inter_ctx` parameter for
         // the contract.
-        inter_ctx: Option<&InterFrameContext<'_, R>>,
+        inter_ctx: Option<&InterFrameContext>,
         // r286: §5.9.12 quantiser state + §5.9.21 `reduced_tx_set`. See
         // [`Self::decode_block_syntax`]'s `quant` / `reduced_tx_set`
         // parameters for the contract — threaded unchanged into every
@@ -33751,7 +35512,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         // sz )` in the §5.11.4 pseudocode routes through
         // `decode_block_syntax`.
         macro_rules! db {
-            ($self:ident, $r:expr, $c:expr, $sz:expr) => {
+            ($self:ident, $r:expr_2021, $c:expr_2021, $sz:expr_2021) => {
                 $self.decode_block_syntax(
                     decoder,
                     cdfs,
@@ -34056,7 +35817,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         decoder: &mut crate::symbol_decoder::SymbolDecoder<'_>,
         cdfs: &mut TileCdfContext,
         params: &TileDecodeParams<'_>,
-        inter_ctx: Option<&InterFrameContext<'_, R>>,
+        inter_ctx: Option<&InterFrameContext>,
         quant: &QuantizerParams,
         read_deltas: bool,
     ) -> Result<(), crate::Error> {
@@ -34085,9 +35846,37 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         cdfs: &mut TileCdfContext,
         params: &TileDecodeParams<'_>,
         lr_params: Option<&LrParams>,
-        inter_ctx: Option<&InterFrameContext<'_, R>>,
+        inter_ctx: Option<&InterFrameContext>,
         quant: &QuantizerParams,
         read_deltas: bool,
+    ) -> Result<(), crate::Error> {
+        self.decode_tile_syntax_rows(
+            decoder,
+            cdfs,
+            params,
+            lr_params,
+            inter_ctx,
+            quant,
+            read_deltas,
+            &mut |_, _| Ok(()),
+        )
+    }
+
+    /// r481 — [`Self::decode_tile_syntax_with_lr`] calling `on_row(
+    /// self, r_end )` after each superblock row of the tile (`r_end` =
+    /// the mi row below it): the frame-parallel decoder runs its
+    /// in-loop filters behind the walk from there.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn decode_tile_syntax_rows(
+        &mut self,
+        decoder: &mut crate::symbol_decoder::SymbolDecoder<'_>,
+        cdfs: &mut TileCdfContext,
+        params: &TileDecodeParams<'_>,
+        lr_params: Option<&LrParams>,
+        inter_ctx: Option<&InterFrameContext>,
+        quant: &QuantizerParams,
+        read_deltas: bool,
+        on_row: &mut dyn FnMut(&mut Self, u32) -> Result<(), crate::Error>,
     ) -> Result<(), crate::Error> {
         // §5.11.2: `sbSize = use_128x128_superblock ? BLOCK_128X128 :
         // BLOCK_64X64`; `sbSize4 = Num_4x4_Blocks_Wide[ sbSize ]`.
@@ -34187,6 +35976,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
                 c += sb_size4;
             }
             r += sb_size4;
+            on_row(self, r.min(mi_row_end))?;
         }
         Ok(())
     }
@@ -34223,7 +36013,10 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
             return 0;
         }
         let cell = (r * self.mi_cols + c) as usize;
-        self.mvs[(cell * 2 + list) * 2 + comp]
+        self.mvs
+            .get((cell * 2 + list) * 2 + comp)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Test-only setter to seed a synthetic inter-block neighbour for
@@ -34255,6 +36048,7 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
         debug_assert!(mi_size < BLOCK_SIZES);
         let bw4 = NUM_4X4_BLOCKS_WIDE[mi_size] as u32;
         let bh4 = NUM_4X4_BLOCKS_HIGH[mi_size] as u32;
+        self.ensure_inter_grids();
         for dr in 0..bh4 {
             let rr = mi_row + dr;
             if rr >= self.mi_rows {
@@ -34493,8 +36287,8 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
 
         // 15: WeightStack[0..numNearest] += REF_CAT_LEVEL.
         if num_nearest > 0 {
-            for idx in 0..num_nearest as usize {
-                state.weight_stack[idx] = state.weight_stack[idx].saturating_add(REF_CAT_LEVEL);
+            for weight in state.weight_stack.iter_mut().take(num_nearest as usize) {
+                *weight = weight.saturating_add(REF_CAT_LEVEL);
             }
         }
 
@@ -35308,11 +37102,12 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
                         cand_mv[1] = -cand_mv[1];
                     }
                     let mut found_idx = state.num_mv_found as usize;
-                    for idx in 0..state.num_mv_found as usize {
-                        if state.ref_stack_mv[idx][0] == cand_mv {
-                            found_idx = idx;
-                            break;
-                        }
+                    let found = state.num_mv_found as usize;
+                    if let Some(idx) = state.ref_stack_mv[..found]
+                        .iter()
+                        .position(|slot| slot[0] == cand_mv)
+                    {
+                        found_idx = idx;
                     }
                     if found_idx == state.num_mv_found as usize
                         && (state.num_mv_found as usize) < MAX_REF_MV_STACK_SIZE
@@ -35512,11 +37307,12 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
 
             // §7.10.2.6 dedupe loop — match only on list 0.
             let mut found_idx: Option<usize> = None;
-            for idx in 0..state.num_mv_found as usize {
-                if state.ref_stack_mv[idx][0] == cand_mv {
-                    found_idx = Some(idx);
-                    break;
-                }
+            let found = state.num_mv_found as usize;
+            if let Some(idx) = state.ref_stack_mv[..found]
+                .iter()
+                .position(|slot| slot[0] == cand_mv)
+            {
+                found_idx = Some(idx);
             }
             if let Some(idx) = found_idx {
                 state.weight_stack[idx] = state.weight_stack[idx].saturating_add(2);
@@ -35568,11 +37364,12 @@ impl<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel> PartitionWalker
 
             // §7.10.2.6 dedupe across both lists.
             let mut found_idx: Option<usize> = None;
-            for idx in 0..state.num_mv_found as usize {
-                if state.ref_stack_mv[idx][0] == cand0 && state.ref_stack_mv[idx][1] == cand1 {
-                    found_idx = Some(idx);
-                    break;
-                }
+            let found = state.num_mv_found as usize;
+            if let Some(idx) = state.ref_stack_mv[..found]
+                .iter()
+                .position(|slot| slot[0] == cand0 && slot[1] == cand1)
+            {
+                found_idx = Some(idx);
             }
             if let Some(idx) = found_idx {
                 state.weight_stack[idx] = state.weight_stack[idx].saturating_add(2);
@@ -35641,8 +37438,27 @@ pub struct MotionFieldMvs {
     /// Layout: `data[((ref - 1) * h8 + y8) * w8 + x8) * 2 + comp]`.
     /// Slot 0 of the outer dimension corresponds to `LAST_FRAME = 1`
     /// (the §7.9.1 grid skips `INTRA_FRAME = 0` since it is never an
-    /// inter prediction reference).
+    /// inter prediction reference). r481 — empty until an explicit
+    /// [`Self::set`]: the grid is held in projected form instead.
     data: Vec<i16>,
+    /// r481 — the §7.9.2 projection result per position: every valid
+    /// projection writes `MotionFieldMvs[ dst ][ PosY8 ][ PosX8 ] =
+    /// get_mv_projection( mv, refToDst, refOffset )` for ALL seven
+    /// destinations at once, so a position is fully described by the
+    /// last projected `( mv, refOffset )` (`refOffset > 0`; `0` = never
+    /// projected, every destination the sentinel), and a destination's
+    /// vector is derived when read.
+    projected: Vec<ProjectedMv>,
+    /// `refToDst = get_relative_dist( OrderHint, OrderHints[ dst ] )`.
+    ref_to_dst: [i32; 8],
+}
+
+/// r481 — one position of the projected motion field (see
+/// [`MotionFieldMvs`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProjectedMv {
+    mv: [i16; 2],
+    ref_offset: i8,
 }
 
 impl MotionFieldMvs {
@@ -35661,12 +37477,62 @@ impl MotionFieldMvs {
     pub fn new_invalid(mi_rows: u32, mi_cols: u32) -> Self {
         let h8 = mi_rows >> 1;
         let w8 = mi_cols >> 1;
-        let total = Self::NUM_REFS * (h8 as usize) * (w8 as usize) * 2;
         Self {
             h8,
             w8,
-            data: vec![MFMV_INVALID; total],
+            data: Vec::new(),
+            projected: vec![
+                ProjectedMv {
+                    mv: [0, 0],
+                    ref_offset: 0
+                };
+                (h8 as usize) * (w8 as usize)
+            ],
+            ref_to_dst: [0; 8],
         }
+    }
+
+    /// r481 — the §7.9.2 `refToDst` per destination reference.
+    pub(crate) fn set_ref_to_dst(&mut self, ref_to_dst: [i32; 8]) {
+        self.ref_to_dst = ref_to_dst;
+    }
+
+    /// r481 — record a valid §7.9.2 projection at `( y8, x8 )`: the
+    /// saved `mv` and its `refOffset` (`1..=MAX_FRAME_DISTANCE`), the
+    /// value of every destination's `MotionFieldMvs` there.
+    pub(crate) fn set_projected(&mut self, y8: u32, x8: u32, mv: [i16; 2], ref_offset: i32) {
+        if !self.data.is_empty() {
+            for dst in 1..=Self::NUM_REFS {
+                let v = get_mv_projection(mv, self.ref_to_dst[dst], ref_offset);
+                self.set(dst, y8, x8, v);
+            }
+            return;
+        }
+        self.projected[(y8 as usize) * (self.w8 as usize) + x8 as usize] = ProjectedMv {
+            mv,
+            ref_offset: ref_offset as i8,
+        };
+    }
+
+    /// Switch to the explicit per-destination grid (for [`Self::set`]).
+    fn materialize(&mut self) {
+        if !self.data.is_empty() {
+            return;
+        }
+        let (h8, w8) = (self.h8, self.w8);
+        let mut data = vec![MFMV_INVALID; Self::NUM_REFS * (h8 as usize) * (w8 as usize) * 2];
+        for dst in 1..=Self::NUM_REFS {
+            for y8 in 0..h8 {
+                for x8 in 0..w8 {
+                    let v = self.get(dst, y8, x8);
+                    let base = self.slot_index(dst, y8, x8, 0);
+                    data[base] = v[0];
+                    data[base + 1] = v[1];
+                }
+            }
+        }
+        self.data = data;
+        self.projected = Vec::new();
     }
 
     /// Height of the motion-field grid in 8×8-luma-sample units
@@ -35707,6 +37573,13 @@ impl MotionFieldMvs {
         if !(1..=7).contains(&ref_frame) || y8 >= self.h8 || x8 >= self.w8 {
             return [MFMV_INVALID, MFMV_INVALID];
         }
+        if self.data.is_empty() {
+            let p = self.projected[(y8 as usize) * (self.w8 as usize) + x8 as usize];
+            if p.ref_offset == 0 {
+                return [MFMV_INVALID, MFMV_INVALID];
+            }
+            return get_mv_projection(p.mv, self.ref_to_dst[ref_frame], i32::from(p.ref_offset));
+        }
         let base = self.slot_index(ref_frame, y8, x8, 0);
         [self.data[base], self.data[base + 1]]
     }
@@ -35717,6 +37590,7 @@ impl MotionFieldMvs {
     /// `ref_frame in 1..=7`.
     #[inline]
     pub fn set(&mut self, ref_frame: usize, y8: u32, x8: u32, mv: [i16; 2]) {
+        self.materialize();
         let base = self.slot_index(ref_frame, y8, x8, 0);
         self.data[base] = mv[0];
         self.data[base + 1] = mv[1];
@@ -36184,11 +38058,11 @@ pub struct FindMvStackResult {
 /// of any preceding decoded blocks committed into its `PaletteSizes` /
 /// `PaletteColors` grids.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn read_palette_entries_y<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel>(
+pub(crate) fn read_palette_entries_y(
     decoder: &mut crate::symbol_decoder::SymbolDecoder<'_>,
     bit_depth: u8,
     palette_size_y: usize,
-    walker: &PartitionWalker<P, R>,
+    walker: &PartitionWalker,
     mi_row: u32,
     mi_col: u32,
 ) -> Result<[u16; PALETTE_COLORS], crate::Error> {
@@ -36293,11 +38167,11 @@ pub(crate) fn read_palette_entries_y<P: crate::loop_filter::Pixel, R: crate::loo
 /// Returns a `(u, v)` tuple, each a `[u16; PALETTE_COLORS]` with the
 /// first `palette_size_uv` slots carrying the decoded entries.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn read_palette_entries_uv<P: crate::loop_filter::Pixel, R: crate::loop_filter::Pixel>(
+pub(crate) fn read_palette_entries_uv(
     decoder: &mut crate::symbol_decoder::SymbolDecoder<'_>,
     bit_depth: u8,
     palette_size_uv: usize,
-    walker: &PartitionWalker<P, R>,
+    walker: &PartitionWalker,
     mi_row: u32,
     mi_col: u32,
 ) -> Result<([u16; PALETTE_COLORS], [u16; PALETTE_COLORS]), crate::Error> {
@@ -36406,11 +38280,7 @@ pub(crate) fn read_palette_entries_uv<P: crate::loop_filter::Pixel, R: crate::lo
 #[inline]
 pub(crate) fn clip1_to_bit_depth(x: u32, bit_depth: u32) -> u32 {
     let max_val: u32 = (1u32 << bit_depth) - 1;
-    if x > max_val {
-        max_val
-    } else {
-        x
-    }
+    if x > max_val { max_val } else { x }
 }
 
 /// `CeilLog2( x )` per §4.7.
@@ -36787,7 +38657,7 @@ pub struct DecodedInterFrameModeInfo {
 /// argument shape one-to-one so callers can construct the context
 /// once per frame and reuse it across every per-block dispatch.
 #[derive(Debug, Clone)]
-pub struct InterFrameContext<'a, R: crate::loop_filter::Pixel = u16> {
+pub struct InterFrameContext<'a> {
     // ---- §5.9.14 / §6.10 segmentation state ----
     /// `segmentation_update_map` (§5.9.14).
     pub segmentation_update_map: bool,
@@ -36877,7 +38747,7 @@ pub struct InterFrameContext<'a, R: crate::loop_filter::Pixel = u16> {
     /// post-walk via the frame-scope bridge, valid only when no intra
     /// leaf reads an inter neighbour and no inter leaf codes a
     /// residual).
-    pub pixels: Option<&'a InterWalkPixels<'a, R>>,
+    pub pixels: Option<&'a InterWalkPixels<'a>>,
 }
 
 /// §7.11.3 reference-pixel state for the in-walk §5.11.33
@@ -36885,7 +38755,7 @@ pub struct InterFrameContext<'a, R: crate::loop_filter::Pixel = u16> {
 /// §5.11.5 walker motion-compensates against. Carried on
 /// [`InterFrameContext::pixels`].
 #[derive(Debug)]
-pub struct InterWalkPixels<'a, R: crate::loop_filter::Pixel = u16> {
+pub struct InterWalkPixels<'a> {
     /// §6.8.2 `ref_frame_idx[ 0..REFS_PER_FRAME ]` — the slot index
     /// each of the seven inter references (`LAST_FRAME - LAST_FRAME =
     /// 0` .. `ALTREF_FRAME - LAST_FRAME = 6`) resolves to.
@@ -36895,12 +38765,12 @@ pub struct InterWalkPixels<'a, R: crate::loop_filter::Pixel = u16> {
     /// Per-decoded-plane reference specs — each carries the plane
     /// ordinal, its subsampling, the per-slot §7.11.3.3 `FrameStore`
     /// slices, and the current frame's plane-space dimensions.
-    pub plane_refs: &'a [crate::PlaneRefSpec<'a, R>],
+    pub plane_refs: &'a [crate::PlaneRefSpec<'a>],
     /// §7.11.3.15 order-hint context (COMPOUND_DISTANCE weights).
     pub order_hints: FrameInterOrderHints,
 }
 
-impl<'a, R: crate::loop_filter::Pixel> InterFrameContext<'a, R> {
+impl<'a> InterFrameContext<'a> {
     /// Identity-default `InterFrameContext` — every flag off, segment
     /// id `0`, `gm_params[ref][2] = gm_params[ref][5] = 1 << WARPEDMODEL_PREC_BITS`
     /// (the §5.9.24 identity-warp defaults), zero MV / no skip-mode
@@ -38141,7 +40011,9 @@ mod tests {
         ));
         // bit_depth out of range.
         assert!(matches!(
-            derive_above_row(0, 0, 0, 0, 0, 4, 4, 0, &frame, 4, /* bit_depth = */ 9, &mut above),
+            derive_above_row(
+                0, 0, 0, 0, 0, 4, 4, 0, &frame, 4, /* bit_depth = */ 9, &mut above
+            ),
             Err(crate::Error::PartitionWalkOutOfRange)
         ));
         // above_row too small.
@@ -38157,13 +40029,17 @@ mod tests {
         ));
         // have_above == 1 with y == 0 (caller bug — no row -1).
         assert!(matches!(
-            derive_above_row(1, 0, 0, 0, /* y = */ 0, 4, 4, 3, &frame, 4, 8, &mut above),
+            derive_above_row(
+                1, 0, 0, 0, /* y = */ 0, 4, 4, 3, &frame, 4, 8, &mut above
+            ),
             Err(crate::Error::PartitionWalkOutOfRange)
         ));
         // have_left == 1 with have_above == 0, x == 0 (caller bug
         // — no col -1).
         assert!(matches!(
-            derive_above_row(0, 1, 0, /* x = */ 0, 1, 4, 4, 3, &frame, 4, 8, &mut above),
+            derive_above_row(
+                0, 1, 0, /* x = */ 0, 1, 4, 4, 3, &frame, 4, 8, &mut above
+            ),
             Err(crate::Error::PartitionWalkOutOfRange)
         ));
     }
@@ -38183,12 +40059,16 @@ mod tests {
         ));
         // have_left == 1 with x == 0 (no col -1).
         assert!(matches!(
-            derive_left_col(1, 0, 0, /* x = */ 0, 0, 4, 4, 3, &frame, 4, 8, &mut left),
+            derive_left_col(
+                1, 0, 0, /* x = */ 0, 0, 4, 4, 3, &frame, 4, 8, &mut left
+            ),
             Err(crate::Error::PartitionWalkOutOfRange)
         ));
         // have_above == 1 with y == 0 (no row -1).
         assert!(matches!(
-            derive_left_col(0, 1, 0, 1, /* y = */ 0, 4, 4, 3, &frame, 4, 8, &mut left),
+            derive_left_col(
+                0, 1, 0, 1, /* y = */ 0, 4, 4, 3, &frame, 4, 8, &mut left
+            ),
             Err(crate::Error::PartitionWalkOutOfRange)
         ));
     }
@@ -38944,7 +40824,7 @@ mod tests {
         assert_eq!(segment_id_ctx(Some(3), Some(3), Some(5)), 1); // UL==U
         assert_eq!(segment_id_ctx(Some(3), Some(5), Some(3)), 1); // UL==L
         assert_eq!(segment_id_ctx(Some(3), Some(5), Some(5)), 1); // U==L
-                                                                  // all distinct ⇒ 0.
+        // all distinct ⇒ 0.
         assert_eq!(segment_id_ctx(Some(3), Some(5), Some(7)), 0);
         // A missing U/L cannot equal a present UL, so it falls through.
         assert_eq!(segment_id_ctx(Some(3), None, Some(3)), 1); // UL==L
@@ -39038,7 +40918,9 @@ mod tests {
         // Default_Mv_Class_Cdf — first row, by literal §9.4 listing.
         assert_eq!(
             DEFAULT_MV_CLASS_CDF[0],
-            [28672, 30976, 31858, 32320, 32551, 32656, 32740, 32757, 32762, 32767, 32768, 0]
+            [
+                28672, 30976, 31858, 32320, 32551, 32656, 32740, 32757, 32762, 32767, 32768, 0
+            ]
         );
         // The leading `2` axis carries identical rows per spec.
         assert_eq!(DEFAULT_MV_CLASS_CDF[0], DEFAULT_MV_CLASS_CDF[1]);
@@ -39626,7 +41508,7 @@ mod tests {
         // Palette colour-index: a size-K table codes K symbols (row len
         // K + 1), with PALETTE_COLOR_CONTEXTS rows each.
         macro_rules! check_color {
-            ($tab:expr, $size:expr) => {{
+            ($tab:expr_2021, $size:expr_2021) => {{
                 assert_eq!($tab.len(), PALETTE_COLOR_CONTEXTS);
                 for r in &$tab {
                     assert_eq!(r.len(), $size + 1, "size-{} table row len", $size);
@@ -39796,6 +41678,107 @@ mod tests {
             }
         }
         assert_eq!(PALETTE_COLOR_HASH_MULTIPLIERS, [1, 2, 2]);
+    }
+
+    /// r487 — the run-wise directional predictor equals the per-sample
+    /// process: every block size, every angle in `1..270` (the two
+    /// axis angles are rejected by both), both upsampling flags on
+    /// both edges, on random edges — and with the edge arrays cut
+    /// short, where both must report the same out-of-range error.
+    #[test]
+    fn directional_prediction_runs_match_the_per_sample_process() {
+        let mut state = 0x6A09_E667_F3BC_C908u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let sides = [4usize, 8, 16, 32, 64];
+        let mut compared = 0usize;
+        let mut errors = 0usize;
+        for &w in &sides {
+            for &h in &sides {
+                let full = 2 * (w + h) + 2;
+                for p_angle in 1..270 {
+                    if p_angle == 90 || p_angle == 180 {
+                        continue;
+                    }
+                    for flags in 0..4u8 {
+                        let (up_a, up_l) = (flags & 1, flags >> 1);
+                        // Full-length edges, then edges cut to a random
+                        // shorter length.
+                        for cut in [false, true] {
+                            let (la, ll) = if cut {
+                                (
+                                    3 + (next() as usize) % (full - 2),
+                                    3 + (next() as usize) % (full - 2),
+                                )
+                            } else {
+                                (full, full)
+                            };
+                            let above: Vec<u16> = (0..la).map(|_| (next() % 4096) as u16).collect();
+                            let left: Vec<u16> = (0..ll).map(|_| (next() % 4096) as u16).collect();
+                            let mut got = vec![0u16; w * h];
+                            let mut want = vec![0u16; w * h];
+                            let r_got = predict_intra_directional(
+                                w, h, p_angle, up_a, up_l, &above, &left, &mut got,
+                            );
+                            let r_want = predict_intra_directional_literal(
+                                w, h, p_angle, up_a, up_l, &above, &left, &mut want,
+                            );
+                            assert_eq!(
+                                r_got.is_ok(),
+                                r_want.is_ok(),
+                                "{w}x{h} angle {p_angle} up {up_a}/{up_l} edges {la}/{ll}"
+                            );
+                            if r_want.is_ok() {
+                                assert_eq!(
+                                    got, want,
+                                    "{w}x{h} angle {p_angle} up {up_a}/{up_l} edges {la}/{ll}"
+                                );
+                                compared += 1;
+                            } else {
+                                errors += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(compared > 30_000 && errors > 1_000, "{compared} / {errors}");
+        // Angles at and past 270 are outside the process: an error,
+        // not an out-of-table read.
+        let (a, l) = (vec![0u16; 20], vec![0u16; 20]);
+        for p_angle in [270, 271, 300, 359] {
+            let mut pred = [0u16; 16];
+            assert!(predict_intra_directional(4, 4, p_angle, 0, 0, &a, &l, &mut pred).is_err());
+        }
+    }
+
+    /// r487 — the closed form of §5.11.50 equals the literal process
+    /// (score array + partial selection sort) for EVERY neighbour
+    /// triple (absent, or any index `0..PALETTE_COLORS` — including
+    /// indices at or above `n`, which take the literal arm) at every
+    /// palette size.
+    #[test]
+    fn palette_color_context_closed_form_is_exhaustively_literal() {
+        let options: Vec<Option<u8>> = core::iter::once(None)
+            .chain((0..PALETTE_COLORS as u8).map(Some))
+            .collect();
+        for n in 2..=PALETTE_COLORS {
+            for &l in &options {
+                for &al in &options {
+                    for &a in &options {
+                        assert_eq!(
+                            palette_color_context_from_neighbors(l, al, a, n),
+                            palette_color_context_literal(l, al, a, n),
+                            "n={n} left={l:?} above_left={al:?} above={a:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// §5.11.50 `get_palette_color_context` — spec example: every
@@ -40155,7 +42138,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
         // 4:2:0: luma plane 16×16, chroma plane 8×8.
         walker.ensure_curr_frame_plane(0, 16, 16);
         walker.ensure_curr_frame_plane(1, 8, 8);
@@ -40196,20 +42179,20 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
         walker.ensure_curr_frame_plane(0, 16, 16);
         walker.ensure_curr_frame_plane(1, 8, 8);
         // Luma gradient: sample(y, x) = 10 * y + x (in 0..255).
         if let Some(p) = walker.curr_frame[0].as_mut() {
             for y in 0..16u32 {
                 for x in 0..16u32 {
-                    p.samples[(y * 16 + x) as usize] = (10 * y + x) as i32;
+                    p.samples[(y * 16 + x) as usize] = (10 * y + x) as u16;
                 }
             }
         }
         let dc_base = 70i32;
         if let Some(p) = walker.curr_frame[1].as_mut() {
-            p.samples.iter_mut().for_each(|s| *s = dc_base);
+            p.samples.iter_mut().for_each(|s| *s = dc_base as u16);
         }
         walker.max_luma_w = 16;
         walker.max_luma_h = 16;
@@ -40248,7 +42231,7 @@ mod tests {
                 let scaled = round2_signed((alpha as i64) * (l[i][j] - luma_avg), 6);
                 let expected = ((dc_base as i64) + scaled).clamp(0, 255) as i32;
                 assert_eq!(
-                    chroma[i * 8 + j],
+                    i32::from(chroma[i * 8 + j]),
                     expected,
                     "CfL sample ({i},{j}) must match the §7.11.5 formula"
                 );
@@ -40728,12 +42711,14 @@ mod tests {
         assert!(ctx.inter_tx_type_cdf(TX_SET_DCTONLY, 0).is_none());
 
         // Out-of-range tx_size_sqr for Set1 / Set3.
-        assert!(ctx
-            .inter_tx_type_cdf(TX_SET_INTER_1, INTER_TX_TYPE_SET1_SIZES as u32)
-            .is_none());
-        assert!(ctx
-            .inter_tx_type_cdf(TX_SET_INTER_3, INTER_TX_TYPE_SET3_SIZES as u32)
-            .is_none());
+        assert!(
+            ctx.inter_tx_type_cdf(TX_SET_INTER_1, INTER_TX_TYPE_SET1_SIZES as u32)
+                .is_none()
+        );
+        assert!(
+            ctx.inter_tx_type_cdf(TX_SET_INTER_3, INTER_TX_TYPE_SET3_SIZES as u32)
+                .is_none()
+        );
 
         // Out-of-range set.
         assert!(ctx.inter_tx_type_cdf(99, 0).is_none());
@@ -40949,20 +42934,24 @@ mod tests {
 
         // Out-of-range tx_size_sqr for Set1 (only TX_4X4 / TX_8X8) /
         // Set2 (only TX_4X4 / TX_8X8 / TX_16X16).
-        assert!(ctx
-            .intra_tx_type_cdf(TX_SET_INTRA_1, INTRA_TX_TYPE_SET1_SIZES as u32, 0)
-            .is_none());
-        assert!(ctx
-            .intra_tx_type_cdf(TX_SET_INTRA_2, INTRA_TX_TYPE_SET2_SIZES as u32, 0)
-            .is_none());
+        assert!(
+            ctx.intra_tx_type_cdf(TX_SET_INTRA_1, INTRA_TX_TYPE_SET1_SIZES as u32, 0)
+                .is_none()
+        );
+        assert!(
+            ctx.intra_tx_type_cdf(TX_SET_INTRA_2, INTRA_TX_TYPE_SET2_SIZES as u32, 0)
+                .is_none()
+        );
 
         // Out-of-range intra_dir.
-        assert!(ctx
-            .intra_tx_type_cdf(TX_SET_INTRA_1, 0, INTRA_MODES)
-            .is_none());
-        assert!(ctx
-            .intra_tx_type_cdf(TX_SET_INTRA_2, 2, INTRA_MODES)
-            .is_none());
+        assert!(
+            ctx.intra_tx_type_cdf(TX_SET_INTRA_1, 0, INTRA_MODES)
+                .is_none()
+        );
+        assert!(
+            ctx.intra_tx_type_cdf(TX_SET_INTRA_2, 2, INTRA_MODES)
+                .is_none()
+        );
 
         // Out-of-range set (the inter set IDs share the same numeric
         // space — but the intra selector should not return a row for an
@@ -41656,7 +43645,9 @@ mod tests {
         assert_eq!(SIZE_GROUP.len(), BLOCK_SIZES);
         assert_eq!(
             SIZE_GROUP,
-            [0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 0, 0, 1, 1, 2, 2]
+            [
+                0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 0, 0, 1, 1, 2, 2
+            ]
         );
         for (mi_size, &want) in SIZE_GROUP.iter().enumerate() {
             let g = size_group(mi_size);
@@ -41682,7 +43673,9 @@ mod tests {
         assert_eq!(MI_WIDTH_LOG2.len(), BLOCK_SIZES);
         assert_eq!(
             MI_WIDTH_LOG2,
-            [0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4, 4, 5, 5, 0, 2, 1, 3, 2, 4]
+            [
+                0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4, 4, 5, 5, 0, 2, 1, 3, 2, 4
+            ]
         );
         for (mi_size, &want) in MI_WIDTH_LOG2.iter().enumerate() {
             assert_eq!(mi_width_log2(mi_size), want);
@@ -41699,7 +43692,9 @@ mod tests {
         assert_eq!(MI_HEIGHT_LOG2.len(), BLOCK_SIZES);
         assert_eq!(
             MI_HEIGHT_LOG2,
-            [0, 1, 0, 1, 2, 1, 2, 3, 2, 3, 4, 3, 4, 5, 4, 5, 2, 0, 3, 1, 4, 2]
+            [
+                0, 1, 0, 1, 2, 1, 2, 3, 2, 3, 4, 3, 4, 5, 4, 5, 2, 0, 3, 1, 4, 2
+            ]
         );
         for (mi_size, &want) in MI_HEIGHT_LOG2.iter().enumerate() {
             assert_eq!(mi_height_log2(mi_size), want);
@@ -41715,7 +43710,9 @@ mod tests {
         assert_eq!(NUM_4X4_BLOCKS_WIDE.len(), BLOCK_SIZES);
         assert_eq!(
             NUM_4X4_BLOCKS_WIDE,
-            [1, 1, 2, 2, 2, 4, 4, 4, 8, 8, 8, 16, 16, 16, 32, 32, 1, 4, 2, 8, 4, 16]
+            [
+                1, 1, 2, 2, 2, 4, 4, 4, 8, 8, 8, 16, 16, 16, 32, 32, 1, 4, 2, 8, 4, 16
+            ]
         );
         for (mi_size, &want) in NUM_4X4_BLOCKS_WIDE.iter().enumerate() {
             assert_eq!(num_4x4_blocks_wide(mi_size), want);
@@ -41735,7 +43732,9 @@ mod tests {
         assert_eq!(NUM_4X4_BLOCKS_HIGH.len(), BLOCK_SIZES);
         assert_eq!(
             NUM_4X4_BLOCKS_HIGH,
-            [1, 2, 1, 2, 4, 2, 4, 8, 4, 8, 16, 8, 16, 32, 16, 32, 4, 1, 8, 2, 16, 4]
+            [
+                1, 2, 1, 2, 4, 2, 4, 8, 4, 8, 16, 8, 16, 32, 16, 32, 4, 1, 8, 2, 16, 4
+            ]
         );
         for (mi_size, &want) in NUM_4X4_BLOCKS_HIGH.iter().enumerate() {
             assert_eq!(num_4x4_blocks_high(mi_size), want);
@@ -42348,9 +44347,10 @@ mod tests {
         assert!(ctx.angle_delta_cdf(0).is_none());
         // SMOOTH_PRED (9 == V_PRED + DIRECTIONAL_MODES) and beyond → None.
         assert!(ctx.angle_delta_cdf(V_PRED + DIRECTIONAL_MODES).is_none());
-        assert!(ctx
-            .angle_delta_cdf(V_PRED + DIRECTIONAL_MODES + 3)
-            .is_none());
+        assert!(
+            ctx.angle_delta_cdf(V_PRED + DIRECTIONAL_MODES + 3)
+                .is_none()
+        );
     }
 
     /// End-to-end: drive the real §8.2 `SymbolDecoder` through an
@@ -42425,7 +44425,7 @@ mod tests {
 
         // Eob_Pt_{16..256}: [4][2][2][N]; Eob_Pt_{512,1024}: [4][2][N].
         macro_rules! check_eob_two {
-            ($t:expr, $inner:expr) => {{
+            ($t:expr_2021, $inner:expr_2021) => {{
                 assert_eq!($t.len(), COEFF_CDF_Q_CTXS);
                 for q in &$t {
                     assert_eq!(q.len(), PLANE_TYPES);
@@ -42446,7 +44446,7 @@ mod tests {
         check_eob_two!(DEFAULT_EOB_PT_256_CDF, 10);
 
         macro_rules! check_eob_one {
-            ($t:expr, $inner:expr) => {{
+            ($t:expr_2021, $inner:expr_2021) => {{
                 assert_eq!($t.len(), COEFF_CDF_Q_CTXS);
                 for q in &$t {
                     assert_eq!(q.len(), PLANE_TYPES);
@@ -42512,7 +44512,9 @@ mod tests {
         // Eob_Pt_1024: longest EOB-position rows (12 wide).
         assert_eq!(
             DEFAULT_EOB_PT_1024_CDF[0][0],
-            [393, 421, 751, 1623, 3160, 6352, 13345, 18047, 22571, 25830, 32768, 0]
+            [
+                393, 421, 751, 1623, 3160, 6352, 13345, 18047, 22571, 25830, 32768, 0
+            ]
         );
 
         // Eob_Extra first anchor.
@@ -42828,9 +44830,10 @@ mod tests {
         // Out-of-range on each axis.
         assert!(ctx.coeff_base_eob_cdf(TX_SIZES, 0, 0).is_none());
         assert!(ctx.coeff_base_eob_cdf(0, PLANE_TYPES, 0).is_none());
-        assert!(ctx
-            .coeff_base_eob_cdf(0, 0, SIG_COEF_CONTEXTS_EOB)
-            .is_none());
+        assert!(
+            ctx.coeff_base_eob_cdf(0, 0, SIG_COEF_CONTEXTS_EOB)
+                .is_none()
+        );
     }
 
     /// End-to-end: drive the real §8.2 `SymbolDecoder` through the
@@ -43596,7 +45599,7 @@ mod tests {
     #[test]
     fn compute_tx_type_lossless_and_large_fallback() {
         let tx_types = |_: u32, _: u32| ADST_ADST; // would-be luma result
-                                                   // Lossless: must collapse to DCT_DCT even for plane 0.
+        // Lossless: must collapse to DCT_DCT even for plane 0.
         assert_eq!(
             compute_tx_type(
                 0,
@@ -43861,7 +45864,7 @@ mod tests {
     fn compute_tx_type_uses_selector_consistent_tx_set() {
         // tx_sz = TX_16X16 -> sqr = sqr_up = TX_16X16.
         let tx_sz_sqr = TX_WIDTH[TX_16X16].trailing_zeros() - 2; // 16 -> log2=4, bwl_index 2
-                                                                 // Just use the spec's explicit ordinal: TX_16X16.
+        // Just use the spec's explicit ordinal: TX_16X16.
         let tx_set = inter_tx_type_set(TX_16X16 as u32, TX_16X16 as u32, false);
         assert_eq!(tx_set, TX_SET_INTER_2);
 
@@ -45497,7 +47500,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -45536,7 +47539,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Empty byte slice — any read would panic / underflow, so a
         // successful walk here proves no symbol was consumed.
@@ -45571,7 +47574,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 1];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 1, true).unwrap();
@@ -45612,7 +47615,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: mi_cols,
         };
-        let mut walker = PartitionWalker::<i32>::new(mi_rows, mi_cols, geom).unwrap();
+        let mut walker = PartitionWalker::new(mi_rows, mi_cols, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 1];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 1, true).unwrap();
@@ -45635,7 +47638,7 @@ mod tests {
         // walk. Re-issue with a fresh decoder and assert no PANIC, and
         // the walker emits a non-empty leaf list (the inner reads
         // against defaults will resolve to *some* partition).
-        let mut walker2 = PartitionWalker::<i32>::new(mi_rows, mi_cols, geom).unwrap();
+        let mut walker2 = PartitionWalker::new(mi_rows, mi_cols, geom).unwrap();
         let mut cdfs2 = TileCdfContext::new_from_defaults();
         let mut dec2 = SymbolDecoder::init_symbol(&[0u8; 16], 16, true).unwrap();
         walker2
@@ -45659,12 +47662,12 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Override partition_w16[ctx=0] to force PARTITION_NONE (idx 0).
         let rigged = force_partition_cdf_w(PARTITION_NONE, 10);
-        for ctx_idx in 0..PARTITION_CONTEXTS {
-            cdfs.partition_w16[ctx_idx].copy_from_slice(&rigged);
+        for slot in cdfs.partition_w16.iter_mut().take(PARTITION_CONTEXTS) {
+            slot.copy_from_slice(&rigged);
         }
         let bytes = [0u8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -45687,11 +47690,11 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let rigged = force_partition_cdf_w(PARTITION_HORZ, 10);
-        for ctx_idx in 0..PARTITION_CONTEXTS {
-            cdfs.partition_w16[ctx_idx].copy_from_slice(&rigged);
+        for slot in cdfs.partition_w16.iter_mut().take(PARTITION_CONTEXTS) {
+            slot.copy_from_slice(&rigged);
         }
         let bytes = [0u8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -45727,11 +47730,11 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let rigged = force_partition_cdf_w(PARTITION_VERT, 10);
-        for ctx_idx in 0..PARTITION_CONTEXTS {
-            cdfs.partition_w16[ctx_idx].copy_from_slice(&rigged);
+        for slot in cdfs.partition_w16.iter_mut().take(PARTITION_CONTEXTS) {
+            slot.copy_from_slice(&rigged);
         }
         let bytes = [0u8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -45754,11 +47757,11 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let rigged = force_partition_cdf_w(PARTITION_HORZ_4, 10);
-        for ctx_idx in 0..PARTITION_CONTEXTS {
-            cdfs.partition_w16[ctx_idx].copy_from_slice(&rigged);
+        for slot in cdfs.partition_w16.iter_mut().take(PARTITION_CONTEXTS) {
+            slot.copy_from_slice(&rigged);
         }
         let bytes = [0u8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -45783,11 +47786,11 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let rigged = force_partition_cdf_w(PARTITION_VERT_4, 10);
-        for ctx_idx in 0..PARTITION_CONTEXTS {
-            cdfs.partition_w16[ctx_idx].copy_from_slice(&rigged);
+        for slot in cdfs.partition_w16.iter_mut().take(PARTITION_CONTEXTS) {
+            slot.copy_from_slice(&rigged);
         }
         let bytes = [0u8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -45812,11 +47815,11 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let rigged = force_partition_cdf_w(PARTITION_HORZ_A, 10);
-        for ctx_idx in 0..PARTITION_CONTEXTS {
-            cdfs.partition_w16[ctx_idx].copy_from_slice(&rigged);
+        for slot in cdfs.partition_w16.iter_mut().take(PARTITION_CONTEXTS) {
+            slot.copy_from_slice(&rigged);
         }
         let bytes = [0u8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -45845,11 +47848,11 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let rigged = force_partition_cdf_w(PARTITION_VERT_B, 10);
-        for ctx_idx in 0..PARTITION_CONTEXTS {
-            cdfs.partition_w16[ctx_idx].copy_from_slice(&rigged);
+        for slot in cdfs.partition_w16.iter_mut().take(PARTITION_CONTEXTS) {
+            slot.copy_from_slice(&rigged);
         }
         let bytes = [0u8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -45879,17 +47882,17 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Top-level BLOCK_16X16 → PARTITION_SPLIT.
         let rigged_w16 = force_partition_cdf_w(PARTITION_SPLIT, 10);
-        for ctx_idx in 0..PARTITION_CONTEXTS {
-            cdfs.partition_w16[ctx_idx].copy_from_slice(&rigged_w16);
+        for slot in cdfs.partition_w16.iter_mut().take(PARTITION_CONTEXTS) {
+            slot.copy_from_slice(&rigged_w16);
         }
         // Each BLOCK_8X8 child → PARTITION_NONE (W8 row has 5 symbols).
         let rigged_w8 = force_partition_cdf_w(PARTITION_NONE, 4);
-        for ctx_idx in 0..PARTITION_CONTEXTS {
-            cdfs.partition_w8[ctx_idx].copy_from_slice(&rigged_w8);
+        for slot in cdfs.partition_w8.iter_mut().take(PARTITION_CONTEXTS) {
+            slot.copy_from_slice(&rigged_w8);
         }
         let bytes = [0u8; 64];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 64, true).unwrap();
@@ -45924,11 +47927,11 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let rigged = force_partition_cdf_w(PARTITION_HORZ, 10);
-        for ctx_idx in 0..PARTITION_CONTEXTS {
-            cdfs.partition_w16[ctx_idx].copy_from_slice(&rigged);
+        for slot in cdfs.partition_w16.iter_mut().take(PARTITION_CONTEXTS) {
+            slot.copy_from_slice(&rigged);
         }
         let bytes = [0u8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -45971,7 +47974,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // 128 bytes of bitstream — plenty for the partition tree's
         // worst-case depth.
@@ -46013,7 +48016,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let walker = PartitionWalker::new(32, 32, geom).unwrap();
         // For any bsl, (r=0, c=0) -> AvailU=false, AvailL=false -> ctx=0.
         for bsl in 1..=5 {
             assert_eq!(walker.partition_ctx_for(0, 0, bsl), 0);
@@ -46032,7 +48035,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         // Fill row 0 with BLOCK_16X16 (mi_width_log2 = 2) so the
         // above-neighbour at (1, 0) is BLOCK_16X16.
         walker.decode_block(0, 0, BLOCK_16X16);
@@ -46076,7 +48079,7 @@ mod tests {
             mi_col_end: u32::MAX,
         };
         // mi_rows * mi_cols overflows usize on this platform.
-        assert!(PartitionWalker::<i32>::new(u32::MAX, u32::MAX, geom).is_none());
+        assert!(PartitionWalker::new(u32::MAX, u32::MAX, geom).is_none());
     }
 
     /// `take_blocks` drains and resets the internal buffer.
@@ -46088,7 +48091,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 1];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 1, true).unwrap();
@@ -46133,7 +48136,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -46160,12 +48163,12 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Force every Skip ctx row to select symbol 0.
         let rigged = force_binary_cdf(0);
-        for ctx_idx in 0..SKIP_CONTEXTS {
-            cdfs.skip[ctx_idx] = rigged;
+        for slot in cdfs.skip.iter_mut().take(SKIP_CONTEXTS) {
+            *slot = rigged;
         }
         let bytes = [0u8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -46186,11 +48189,11 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let rigged = force_binary_cdf(1);
-        for ctx_idx in 0..SKIP_CONTEXTS {
-            cdfs.skip[ctx_idx] = rigged;
+        for slot in cdfs.skip.iter_mut().take(SKIP_CONTEXTS) {
+            *slot = rigged;
         }
         let bytes = [0u8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -46226,7 +48229,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 1];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 1, true).unwrap();
@@ -46258,7 +48261,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         cdfs.skip[0] = force_binary_cdf(1);
         cdfs.skip[1] = force_binary_cdf(0);
@@ -46287,7 +48290,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // First fill the two BLOCK_8X8 neighbour cells with skip = 1
         // via the seg short-circuit (so no symbol bits are consumed
@@ -46330,7 +48333,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -46366,7 +48369,7 @@ mod tests {
             mi_col_start: 8,
             mi_col_end: 24,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Seed the global-grid neighbour at (7, 8) and (8, 7) so a
         // mistaken "use the global mi grid" implementation would
@@ -46404,7 +48407,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -46429,7 +48432,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 4];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 4, true).unwrap();
@@ -46458,7 +48461,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let walker = PartitionWalker::new(16, 16, geom).unwrap();
         assert_eq!(walker.skips().len(), 16 * 16);
         assert!(walker.skips().iter().all(|&v| v == 0));
     }
@@ -46489,7 +48492,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -46516,7 +48519,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -46539,7 +48542,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -46562,7 +48565,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -46584,11 +48587,11 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let rigged = force_skip_mode_cdf(0);
-        for ctx_idx in 0..SKIP_MODE_CONTEXTS {
-            cdfs.skip_mode[ctx_idx] = rigged;
+        for slot in cdfs.skip_mode.iter_mut().take(SKIP_MODE_CONTEXTS) {
+            *slot = rigged;
         }
         let bytes = [0u8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -46610,11 +48613,11 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let rigged = force_skip_mode_cdf(1);
-        for ctx_idx in 0..SKIP_MODE_CONTEXTS {
-            cdfs.skip_mode[ctx_idx] = rigged;
+        for slot in cdfs.skip_mode.iter_mut().take(SKIP_MODE_CONTEXTS) {
+            *slot = rigged;
         }
         let bytes = [0u8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -46650,7 +48653,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Only ctx 0 forces symbol 1; ctxs 1 and 2 force symbol 0.
         cdfs.skip_mode[0] = force_skip_mode_cdf(1);
@@ -46675,7 +48678,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Force a BLOCK_8X8 (bw4 = bh4 = 2) above-left at (0,0) to
         // stamp SkipModes[0..2][0..2] = 1.
@@ -46725,7 +48728,7 @@ mod tests {
             mi_col_start: 4,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Pre-stamp SkipModes[3][4] = SkipModes[4][3] = 1 to prove
         // the tile origin ignores them.
@@ -46753,11 +48756,11 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let rigged = force_skip_mode_cdf(1);
-        for ctx_idx in 0..SKIP_MODE_CONTEXTS {
-            cdfs.skip_mode[ctx_idx] = rigged;
+        for slot in cdfs.skip_mode.iter_mut().take(SKIP_MODE_CONTEXTS) {
+            *slot = rigged;
         }
         let bytes = [0u8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -46784,7 +48787,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 4];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 4, true).unwrap();
@@ -46812,7 +48815,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let walker = PartitionWalker::new(16, 16, geom).unwrap();
         assert_eq!(walker.skip_modes().len(), 16 * 16);
         assert!(walker.skip_modes().iter().all(|&v| v == 0));
     }
@@ -46870,7 +48873,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         walker.set_current_q_index(120);
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 8];
@@ -46904,7 +48907,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 64,
         };
-        let mut walker = PartitionWalker::<i32>::new(64, 64, geom).unwrap();
+        let mut walker = PartitionWalker::new(64, 64, geom).unwrap();
         walker.set_current_q_index(64);
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 8];
@@ -46956,7 +48959,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         walker.set_current_q_index(100);
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
@@ -46990,7 +48993,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         walker.set_current_q_index(80);
         let mut cdfs = TileCdfContext::new_from_defaults();
         cdfs.delta_q = force_delta_q_cdf(0);
@@ -47012,7 +49015,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         walker.set_current_q_index(100);
         let mut cdfs = TileCdfContext::new_from_defaults();
         cdfs.delta_q = force_delta_q_cdf(1);
@@ -47037,7 +49040,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         walker.set_current_q_index(50);
         let mut cdfs = TileCdfContext::new_from_defaults();
         cdfs.delta_q = force_delta_q_cdf(1);
@@ -47088,7 +49091,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         walker.set_current_q_index(i32::MIN + 1);
         let mut cdfs = TileCdfContext::new_from_defaults();
         cdfs.delta_q = force_delta_q_cdf(1);
@@ -47110,7 +49113,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         walker.set_current_q_index(250);
         let mut cdfs = TileCdfContext::new_from_defaults();
         cdfs.delta_q = force_delta_q_cdf(2);
@@ -47136,7 +49139,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         walker.set_current_q_index(100);
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Force the symbol read to yield DELTA_Q_SMALL = 3.
@@ -47170,7 +49173,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         walker.set_current_q_index(200);
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Force the S() result to DELTA_Q_SMALL via a CDF that lands
@@ -47200,7 +49203,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         walker.set_current_q_index(100);
         let mut cdfs = TileCdfContext::new_from_defaults();
         cdfs.delta_q = force_delta_q_cdf(1);
@@ -47226,7 +49229,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let walker = PartitionWalker::new(16, 16, geom).unwrap();
         assert_eq!(walker.current_q_index(), 0);
     }
 
@@ -47241,7 +49244,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 4];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 4, true).unwrap();
@@ -47315,7 +49318,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -47350,7 +49353,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 64,
         };
-        let mut walker = PartitionWalker::<i32>::new(64, 64, geom).unwrap();
+        let mut walker = PartitionWalker::new(64, 64, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -47385,7 +49388,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -47420,7 +49423,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -47456,7 +49459,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         cdfs.delta_lf = force_delta_lf_cdf(1);
         let bytes = [0u8; 8];
@@ -47496,10 +49499,10 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
-        for i in 0..FRAME_LF_COUNT {
-            cdfs.delta_lf_multi[i] = force_delta_lf_cdf(1);
+        for slot in cdfs.delta_lf_multi.iter_mut().take(FRAME_LF_COUNT) {
+            *slot = force_delta_lf_cdf(1);
         }
         let bytes = [0u8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -47535,10 +49538,10 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
-        for i in 0..FRAME_LF_COUNT {
-            cdfs.delta_lf_multi[i] = force_delta_lf_cdf(1);
+        for slot in cdfs.delta_lf_multi.iter_mut().take(FRAME_LF_COUNT) {
+            *slot = force_delta_lf_cdf(1);
         }
         let bytes = [0u8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -47599,10 +49602,10 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
-        for i in 0..FRAME_LF_COUNT {
-            cdfs.delta_lf_multi[i] = force_delta_lf_cdf(1);
+        for slot in cdfs.delta_lf_multi.iter_mut().take(FRAME_LF_COUNT) {
+            *slot = force_delta_lf_cdf(1);
         }
         let bytes = [0u8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -47636,7 +49639,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         cdfs.delta_lf = force_delta_lf_cdf(0);
         let bytes = [0u8; 8];
@@ -47670,7 +49673,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         cdfs.delta_lf = force_delta_lf_cdf(1);
         let bytes = [0u8; 8];
@@ -47705,7 +49708,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         // Seed the accumulator near the upper bound. Single-LF only
         // writes slot 0 so we can pre-fill it.
         walker.current_delta_lf[0] = 60;
@@ -47748,7 +49751,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         walker.current_delta_lf[0] = i32::MIN + 1;
         let mut cdfs = TileCdfContext::new_from_defaults();
         cdfs.delta_lf = force_delta_lf_cdf(1);
@@ -47789,7 +49792,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         cdfs.delta_lf = force_delta_lf_cdf(DELTA_LF_SMALL as u8);
         let bytes = [0u8; 16];
@@ -47823,7 +49826,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         cdfs.delta_lf = force_delta_lf_cdf(1);
         let bytes = [0u8; 16];
@@ -47876,7 +49879,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
         assert_eq!(walker.current_delta_lf(), &[0; FRAME_LF_COUNT]);
         // Apply a small +1 single-LF update.
         let mut cdfs = TileCdfContext::new_from_defaults();
@@ -47917,7 +49920,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let walker = PartitionWalker::new(32, 32, geom).unwrap();
         assert!(walker.cdef_idx().iter().all(|&v| v == -1));
     }
 
@@ -47931,7 +49934,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         // Pre-stamp a non-sentinel so clear is observable.
         walker.cdef_idx[5 * 32 + 7] = 4;
         walker.clear_cdef(5, 7, false);
@@ -47949,7 +49952,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 64,
         };
-        let mut walker = PartitionWalker::<i32>::new(64, 64, geom).unwrap();
+        let mut walker = PartitionWalker::new(64, 64, geom).unwrap();
         // Pre-stamp all four anchors so clear is observable.
         let stamps: [(u32, u32); 4] = [(0, 0), (0, 16), (16, 0), (16, 16)];
         for &(r, c) in &stamps {
@@ -47974,7 +49977,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 24,
         };
-        let mut walker = PartitionWalker::<i32>::new(24, 24, geom).unwrap();
+        let mut walker = PartitionWalker::new(24, 24, geom).unwrap();
         // Anchor at (16, 16) is in-grid; the (16, 32) / (32, 16) /
         // (32, 32) anchors are out-of-grid (24 < 32) and must be
         // silently skipped without panic.
@@ -47992,7 +49995,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
         let pos_before = dec.position();
@@ -48022,7 +50025,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
         let pos_before = dec.position();
@@ -48044,7 +50047,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
         let pos_before = dec.position();
@@ -48074,7 +50077,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
         let pos_before = dec.position();
@@ -48109,7 +50112,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut bytes = [0u8; 8];
         bytes[0] = 0b1100_0000;
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -48138,7 +50141,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut bytes = [0u8; 8];
         bytes[0] = 0b1100_0000;
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -48172,7 +50175,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
         let pos_before = dec.position();
@@ -48194,7 +50197,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut bytes = [0u8; 8];
         bytes[0] = 0b1110_0000;
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -48216,7 +50219,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut bytes = [0u8; 8];
         bytes[0] = 0b1000_0000;
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -48247,7 +50250,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let bytes = [0xA5u8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
         let v = walker
@@ -48280,7 +50283,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 24,
         };
-        let mut walker = PartitionWalker::<i32>::new(24, 24, geom).unwrap();
+        let mut walker = PartitionWalker::new(24, 24, geom).unwrap();
         let bytes = [0xA5u8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
         let v = walker
@@ -48306,7 +50309,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut bytes = [0u8; 8];
         bytes[0] = 0b1100_0000;
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -48332,7 +50335,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut bytes = [0u8; 8];
         bytes[0] = 0b1100_0000;
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -48357,7 +50360,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let walker = PartitionWalker::new(16, 16, geom).unwrap();
         // CurrFrame: a 64×64 luma ramp so a real filter would visibly
         // change it; the sentinel grid must leave it untouched.
         let (rows, cols) = (64u32, 64u32);
@@ -48394,7 +50397,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
         // Stamp the (0,0) 64×64 anchor with cdef_idx = 0 and leave the
         // whole 8×8 block non-skip (skips already 0 from construction).
         walker.cdef_idx[0] = 0;
@@ -48443,11 +50446,7 @@ mod tests {
                 subsampling_y: 0,
                 cdef_params: &params,
                 cdef_idx: &|r, c| {
-                    if r == 0 && c == 0 {
-                        0
-                    } else {
-                        -1
-                    }
+                    if r == 0 && c == 0 { 0 } else { -1 }
                 },
                 skip: &|_, _| false,
             };
@@ -48483,7 +50482,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
         walker.cdef_idx[0] = 0;
         // Mark every 4×4 cell of the top-left 8×8 anchor as skip.
         for &(r, c) in &[(0u32, 0u32), (1, 0), (0, 1), (1, 1)] {
@@ -48528,7 +50527,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let walker = PartitionWalker::new(16, 16, geom).unwrap();
         let (y_rows, y_cols) = (64u32, 64u32);
         let (c_rows, c_cols) = (32u32, 32u32); // 4:2:0
         let y_src: Vec<i32> = (0..(y_rows * y_cols)).map(|i| (i % 200) as i32).collect();
@@ -48589,7 +50588,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
         let bytes = [0u8; 4];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 4, true).unwrap();
         assert_eq!(
@@ -48619,7 +50618,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 4];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 4, true).unwrap();
@@ -48703,7 +50702,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let walker = PartitionWalker::new(16, 16, geom).unwrap();
         assert_eq!(walker.is_inters().len(), 16 * 16);
         assert!(walker.is_inters().iter().all(|&v| v == 0));
     }
@@ -48720,7 +50719,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -48759,7 +50758,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -48794,7 +50793,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -48826,7 +50825,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -48862,7 +50861,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -48898,7 +50897,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -48928,11 +50927,11 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let rigged = force_is_inter_cdf(0);
-        for ctx_idx in 0..IS_INTER_CONTEXTS {
-            cdfs.is_inter[ctx_idx] = rigged;
+        for slot in cdfs.is_inter.iter_mut().take(IS_INTER_CONTEXTS) {
+            *slot = rigged;
         }
         let bytes = [0u8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -48964,11 +50963,11 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let rigged = force_is_inter_cdf(1);
-        for ctx_idx in 0..IS_INTER_CONTEXTS {
-            cdfs.is_inter[ctx_idx] = rigged;
+        for slot in cdfs.is_inter.iter_mut().take(IS_INTER_CONTEXTS) {
+            *slot = rigged;
         }
         let bytes = [0u8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -49015,12 +51014,12 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // ctx 0 drives symbol 1. ctx 1, 2, 3 would drive symbol 0.
         cdfs.is_inter[0] = force_is_inter_cdf(1);
-        for ctx_idx in 1..IS_INTER_CONTEXTS {
-            cdfs.is_inter[ctx_idx] = force_is_inter_cdf(0);
+        for slot in cdfs.is_inter.iter_mut().take(IS_INTER_CONTEXTS).skip(1) {
+            *slot = force_is_inter_cdf(0);
         }
         let bytes = [0u8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -49056,7 +51055,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Force is_inter = 0 (intra) for the seed blocks via Arm 2.
         let seed_bytes = [0xFFu8; 8];
@@ -49103,8 +51102,8 @@ mod tests {
         // Therefore ctx at (3, 5) = 3.
         let rigged_3 = force_is_inter_cdf(1);
         let rigged_others = force_is_inter_cdf(0);
-        for ctx_idx in 0..IS_INTER_CONTEXTS {
-            cdfs.is_inter[ctx_idx] = if ctx_idx == 3 {
+        for (ctx_idx, slot) in cdfs.is_inter.iter_mut().enumerate() {
+            *slot = if ctx_idx == 3 {
                 rigged_3
             } else {
                 rigged_others
@@ -49134,7 +51133,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let seed_bytes = [0u8; 8];
         let mut seed_dec = SymbolDecoder::init_symbol(&seed_bytes, 8, true).unwrap();
@@ -49175,8 +51174,8 @@ mod tests {
         //     = 1
         let rigged_1 = force_is_inter_cdf(1);
         let rigged_others = force_is_inter_cdf(0);
-        for ctx_idx in 0..IS_INTER_CONTEXTS {
-            cdfs.is_inter[ctx_idx] = if ctx_idx == 1 {
+        for (ctx_idx, slot) in cdfs.is_inter.iter_mut().enumerate() {
+            *slot = if ctx_idx == 1 {
                 rigged_1
             } else {
                 rigged_others
@@ -49219,7 +51218,7 @@ mod tests {
             mi_col_start: 4,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let seed_bytes = [0u8; 8];
         let mut seed_dec = SymbolDecoder::init_symbol(&seed_bytes, 8, true).unwrap();
@@ -49247,8 +51246,8 @@ mod tests {
         // = 2.
         let rigged_2 = force_is_inter_cdf(1);
         let rigged_others = force_is_inter_cdf(0);
-        for ctx_idx in 0..IS_INTER_CONTEXTS {
-            cdfs.is_inter[ctx_idx] = if ctx_idx == 2 {
+        for (ctx_idx, slot) in cdfs.is_inter.iter_mut().enumerate() {
+            *slot = if ctx_idx == 2 {
                 rigged_2
             } else {
                 rigged_others
@@ -49288,11 +51287,11 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let rigged = force_is_inter_cdf(1);
-        for ctx_idx in 0..IS_INTER_CONTEXTS {
-            cdfs.is_inter[ctx_idx] = rigged;
+        for slot in cdfs.is_inter.iter_mut().take(IS_INTER_CONTEXTS) {
+            *slot = rigged;
         }
         let bytes = [0u8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -49334,7 +51333,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 4];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 4, true).unwrap();
@@ -49397,7 +51396,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let walker = PartitionWalker::new(16, 16, geom).unwrap();
         for &cell in walker.segment_ids() {
             assert_eq!(cell, -1, "fresh-walker segment_ids[] = -1 sentinel");
         }
@@ -49415,7 +51414,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -49455,13 +51454,13 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Rig every ctx row to force symbol 5; the prior call is the
         // non-skip path so we need a CDF that delivers diff = 5.
         let rigged = force_segment_id_cdf(5);
-        for ctx_idx in 0..SEGMENT_ID_CONTEXTS {
-            cdfs.segment_id[ctx_idx] = rigged;
+        for slot in cdfs.segment_id.iter_mut().take(SEGMENT_ID_CONTEXTS) {
+            *slot = rigged;
         }
         let bytes = [0u8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -49497,12 +51496,12 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Rig every ctx row to force symbol 3.
         let rigged = force_segment_id_cdf(3);
-        for ctx_idx in 0..SEGMENT_ID_CONTEXTS {
-            cdfs.segment_id[ctx_idx] = rigged;
+        for slot in cdfs.segment_id.iter_mut().take(SEGMENT_ID_CONTEXTS) {
+            *slot = rigged;
         }
         let bytes = [0u8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -49537,13 +51536,13 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Rig every ctx row to force symbol 5 while the frame's
         // §5.9.14 derivation says LastActiveSegId = 4.
         let rigged = force_segment_id_cdf(5);
-        for ctx_idx in 0..SEGMENT_ID_CONTEXTS {
-            cdfs.segment_id[ctx_idx] = rigged;
+        for slot in cdfs.segment_id.iter_mut().take(SEGMENT_ID_CONTEXTS) {
+            *slot = rigged;
         }
         let bytes = [0u8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -49562,10 +51561,10 @@ mod tests {
         // Boundary sanity: the same rigged symbol with
         // last_active_seg_id = 5 is conformant and decodes
         // (pred = 0 at the origin ⇒ neg_deinterleave(5, 0, 6) = 5).
-        let mut walker2 = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let mut walker2 = PartitionWalker::new(16, 16, geom).unwrap();
         let mut cdfs2 = TileCdfContext::new_from_defaults();
-        for ctx_idx in 0..SEGMENT_ID_CONTEXTS {
-            cdfs2.segment_id[ctx_idx] = rigged;
+        for slot in cdfs2.segment_id.iter_mut().take(SEGMENT_ID_CONTEXTS) {
+            *slot = rigged;
         }
         let mut dec2 = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
         let sid = walker2
@@ -49730,7 +51729,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         cdfs.segment_id[0] = force_segment_id_cdf(1);
         cdfs.segment_id[1] = force_segment_id_cdf(0);
@@ -49759,7 +51758,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Two BLOCK_8X8 skip stamps to seed sid = 4 into the
         // top-left 4x4 cells without touching the bitstream.
@@ -49767,8 +51766,8 @@ mod tests {
         // sid = 0 — that doesn't work for our "all neighbours = 4"
         // setup. Use the non-skip path with rigged CDF.
         let rigged4 = force_segment_id_cdf(4);
-        for ctx_idx in 0..SEGMENT_ID_CONTEXTS {
-            cdfs.segment_id[ctx_idx] = rigged4;
+        for slot in cdfs.segment_id.iter_mut().take(SEGMENT_ID_CONTEXTS) {
+            *slot = rigged4;
         }
         let bytes = [0u8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -49816,11 +51815,11 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let rigged = force_segment_id_cdf(2);
-        for ctx_idx in 0..SEGMENT_ID_CONTEXTS {
-            cdfs.segment_id[ctx_idx] = rigged;
+        for slot in cdfs.segment_id.iter_mut().take(SEGMENT_ID_CONTEXTS) {
+            *slot = rigged;
         }
         let bytes = [0u8; 4];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 4, true).unwrap();
@@ -49851,7 +51850,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 4];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 4, true).unwrap();
@@ -49892,7 +51891,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -49943,7 +51942,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -49980,7 +51979,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -50030,11 +52029,11 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let rigged = force_segment_id_cdf(3);
-        for ctx_idx in 0..SEGMENT_ID_CONTEXTS {
-            cdfs.segment_id[ctx_idx] = rigged;
+        for slot in cdfs.segment_id.iter_mut().take(SEGMENT_ID_CONTEXTS) {
+            *slot = rigged;
         }
         let bytes = [0u8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -50075,11 +52074,11 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let rigged = force_segment_id_cdf(5);
-        for ctx_idx in 0..SEGMENT_ID_CONTEXTS {
-            cdfs.segment_id[ctx_idx] = rigged;
+        for slot in cdfs.segment_id.iter_mut().take(SEGMENT_ID_CONTEXTS) {
+            *slot = rigged;
         }
         let bytes = [0u8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -50114,7 +52113,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 4];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 4, true).unwrap();
@@ -50160,7 +52159,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 4];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 4, true).unwrap();
@@ -50261,15 +52260,15 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
 
         // Rig only the §5.11.11 skip cdf — every other inner method
         // short-circuits via its caller-passed gates and reads zero
         // bits. Forcing symbol 0 means `skip = 0`.
         let rigged_skip = force_binary_cdf(0);
-        for ctx_idx in 0..SKIP_CONTEXTS {
-            cdfs.skip[ctx_idx] = rigged_skip;
+        for slot in cdfs.skip.iter_mut().take(SKIP_CONTEXTS) {
+            *slot = rigged_skip;
         }
 
         let bytes = [0u8; 16];
@@ -50346,19 +52345,19 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
 
         // Rig the §5.11.9 segment_id cdf to force diff = 2 on every
         // ctx; pred = 0 at frame origin ⇒ segment_id = 2.
         let rigged_seg = force_segment_id_cdf(2);
-        for ctx_idx in 0..SEGMENT_ID_CONTEXTS {
-            cdfs.segment_id[ctx_idx] = rigged_seg;
+        for slot in cdfs.segment_id.iter_mut().take(SEGMENT_ID_CONTEXTS) {
+            *slot = rigged_seg;
         }
         // Rig §5.11.11 skip cdf to force symbol 1 (skip = 1).
         let rigged_skip = force_binary_cdf(1);
-        for ctx_idx in 0..SKIP_CONTEXTS {
-            cdfs.skip[ctx_idx] = rigged_skip;
+        for slot in cdfs.skip.iter_mut().take(SKIP_CONTEXTS) {
+            *slot = rigged_skip;
         }
 
         let bytes = [0u8; 16];
@@ -50419,13 +52418,13 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
 
         // Rig §5.11.11 skip cdf to force symbol 1.
         let rigged_skip = force_binary_cdf(1);
-        for ctx_idx in 0..SKIP_CONTEXTS {
-            cdfs.skip[ctx_idx] = rigged_skip;
+        for slot in cdfs.skip.iter_mut().take(SKIP_CONTEXTS) {
+            *slot = rigged_skip;
         }
 
         let bytes = [0u8; 16];
@@ -50483,7 +52482,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let lossless_array = [false; MAX_SEGMENTS];
 
@@ -50520,7 +52519,7 @@ mod tests {
             .unwrap();
         let pos_with_skip_bit = dec_ref.position();
 
-        let mut walker2 = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let mut walker2 = PartitionWalker::new(16, 16, geom).unwrap();
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
         let prefix = walker2
             .decode_intra_frame_mode_info_prefix(
@@ -50574,7 +52573,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
 
         let bytes = [0xFFu8; 8];
@@ -50625,15 +52624,15 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
 
         // Rig skip cdf to force 0 (so delta_q / delta_lf paths fire;
         // sub_size != sbSize anyway so they would too, but this
         // keeps the path explicit).
         let rigged_skip = force_binary_cdf(0);
-        for ctx_idx in 0..SKIP_CONTEXTS {
-            cdfs.skip[ctx_idx] = rigged_skip;
+        for slot in cdfs.skip.iter_mut().take(SKIP_CONTEXTS) {
+            *slot = rigged_skip;
         }
         // Rig delta_q cdf to force symbol 0 (no escape, no sign bit
         // ⇒ delta_q_abs = 0 ⇒ CurrentQIndex unchanged).
@@ -50702,7 +52701,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 4];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 4, true).unwrap();
@@ -50786,8 +52785,8 @@ mod tests {
         let mut cdfs = TileCdfContext::new_from_defaults();
 
         let rigged_skip = force_binary_cdf(0);
-        for ctx_idx in 0..SKIP_CONTEXTS {
-            cdfs.skip[ctx_idx] = rigged_skip;
+        for slot in cdfs.skip.iter_mut().take(SKIP_CONTEXTS) {
+            *slot = rigged_skip;
         }
         let bytes = [0u8; 8];
         let lossless_array = [false; MAX_SEGMENTS];
@@ -50797,7 +52796,7 @@ mod tests {
         // `decode_skip_mode`. SkipModes[] grid stays at its
         // construction default.
         for &pre_skip in &[true, false] {
-            let mut walker_local = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+            let mut walker_local = PartitionWalker::new(16, 16, geom).unwrap();
             let mut dec_local = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
             let prefix = walker_local
                 .decode_intra_frame_mode_info_prefix(
@@ -50845,7 +52844,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -50879,7 +52878,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         cdfs.intrabc = force_binary_cdf(0);
         let bytes = [0u8; 8];
@@ -50907,7 +52906,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         cdfs.intrabc = force_binary_cdf(1);
         let bytes = [0u8; 8];
@@ -50937,7 +52936,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 4];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 4, true).unwrap();
@@ -50972,7 +52971,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         cdfs.intrabc = force_binary_cdf(1);
 
@@ -51024,7 +53023,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let walker = PartitionWalker::new(16, 16, geom).unwrap();
         assert_eq!(walker.y_modes().len(), 16 * 16);
         for &v in walker.y_modes() {
             assert_eq!(v, 0, "fresh YModes[] = DC_PRED (== 0)");
@@ -51064,7 +53063,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -51100,13 +53099,13 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Force every (abovemode, leftmode) ctx pair to select symbol 0.
         let rigged = force_intra_frame_y_mode_cdf(0);
-        for a in 0..INTRA_MODE_CONTEXTS {
-            for l in 0..INTRA_MODE_CONTEXTS {
-                cdfs.intra_frame_y_mode[a][l] = rigged;
+        for row in cdfs.intra_frame_y_mode.iter_mut().take(INTRA_MODE_CONTEXTS) {
+            for slot in row.iter_mut().take(INTRA_MODE_CONTEXTS) {
+                *slot = rigged;
             }
         }
         let bytes = [0u8; 8];
@@ -51143,12 +53142,12 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let rigged = force_intra_frame_y_mode_cdf(12);
-        for a in 0..INTRA_MODE_CONTEXTS {
-            for l in 0..INTRA_MODE_CONTEXTS {
-                cdfs.intra_frame_y_mode[a][l] = rigged;
+        for row in cdfs.intra_frame_y_mode.iter_mut().take(INTRA_MODE_CONTEXTS) {
+            for slot in row.iter_mut().take(INTRA_MODE_CONTEXTS) {
+                *slot = rigged;
             }
         }
         let bytes = [0u8; 8];
@@ -51191,7 +53190,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Rig only the [0][0] row to return symbol 7 (SMOOTH_PRED);
         // every other row keeps the §9.4 default. If the corner truly
@@ -51221,7 +53220,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // First call at (0,0), BLOCK_8X8 (2x2 footprint), force YMode=1.
         cdfs.intra_frame_y_mode[0][0] = force_intra_frame_y_mode_cdf(1);
@@ -51260,7 +53259,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // First block at (0,0), BLOCK_4X4, force YMode=4 (D203_PRED).
         cdfs.intra_frame_y_mode[0][0] = force_intra_frame_y_mode_cdf(4);
@@ -51298,7 +53297,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         cdfs.intrabc = force_binary_cdf(1);
         let bytes = [0u8; 8];
@@ -51335,7 +53334,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let walker = PartitionWalker::new(16, 16, geom).unwrap();
         assert_eq!(walker.above_seg_pred_context().len(), 16);
         assert_eq!(walker.left_seg_pred_context().len(), 16);
         for &slot in walker.above_seg_pred_context() {
@@ -51357,7 +53356,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -51414,7 +53413,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -51467,7 +53466,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -51522,7 +53521,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Poison the context arrays so the explicit `seg_id_predicted
         // = 0` write is observable (otherwise the initial-zero state
@@ -51584,12 +53583,16 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Rig every ctx row to force `seg_id_predicted = 1`.
         let rigged = force_binary_cdf(1);
-        for ctx_idx in 0..SEGMENT_ID_PREDICTED_CONTEXTS {
-            cdfs.segment_id_predicted[ctx_idx] = rigged;
+        for slot in cdfs
+            .segment_id_predicted
+            .iter_mut()
+            .take(SEGMENT_ID_PREDICTED_CONTEXTS)
+        {
+            *slot = rigged;
         }
         let bytes = [0u8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -51649,12 +53652,16 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Rig seg_id_predicted to `0`.
         let rigged_pred = force_binary_cdf(0);
-        for ctx_idx in 0..SEGMENT_ID_PREDICTED_CONTEXTS {
-            cdfs.segment_id_predicted[ctx_idx] = rigged_pred;
+        for slot in cdfs
+            .segment_id_predicted
+            .iter_mut()
+            .take(SEGMENT_ID_PREDICTED_CONTEXTS)
+        {
+            *slot = rigged_pred;
         }
         // Poison context arrays so the explicit `0` write is visible.
         for slot in walker.above_seg_pred_context.iter_mut() {
@@ -51723,11 +53730,11 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let rigged = force_segment_id_cdf(2);
-        for ctx_idx in 0..SEGMENT_ID_CONTEXTS {
-            cdfs.segment_id[ctx_idx] = rigged;
+        for slot in cdfs.segment_id.iter_mut().take(SEGMENT_ID_CONTEXTS) {
+            *slot = rigged;
         }
         // Poison context arrays — should remain poisoned (no spec
         // write on this arm).
@@ -51782,7 +53789,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 4];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 4, true).unwrap();
@@ -51896,8 +53903,8 @@ mod tests {
     #[test]
     fn default_segment_id_predicted_cdf_layout() {
         let ctx = TileCdfContext::new_from_defaults();
-        for ctx_idx in 0..SEGMENT_ID_PREDICTED_CONTEXTS {
-            assert_eq!(ctx.segment_id_predicted[ctx_idx], [16384, 32768, 0]);
+        for cdf in ctx.segment_id_predicted.iter() {
+            assert_eq!(*cdf, [16384, 32768, 0]);
         }
     }
 
@@ -51911,8 +53918,8 @@ mod tests {
             let row = ctx.segment_id_predicted_cdf(i);
             row[0] = (10_000u16 + i as u16).wrapping_add(0);
         }
-        for i in 0..SEGMENT_ID_PREDICTED_CONTEXTS {
-            assert_eq!(ctx.segment_id_predicted[i][0], 10_000u16 + i as u16);
+        for (i, cdf) in ctx.segment_id_predicted.iter().enumerate() {
+            assert_eq!(cdf[0], 10_000u16 + i as u16);
         }
     }
 
@@ -52106,7 +54113,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: mi_cols,
         };
-        let mut walker = PartitionWalker::<i32>::new(mi_rows, mi_cols, geometry).unwrap();
+        let mut walker = PartitionWalker::new(mi_rows, mi_cols, geometry).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Hostile buffer the function must NOT touch on this arm.
         let buf = [0xFFu8; 4];
@@ -52162,7 +54169,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let walker = PartitionWalker::new(32, 32, geom).unwrap();
         let cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 32];
         (walker, cdfs, bytes)
@@ -52743,7 +54750,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cache = [0u16; 2 * PALETTE_COLORS];
         for plane in 0..3 {
             // Even at non-superblock-top mi_row, an unwritten neighbour
@@ -52851,7 +54858,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let walker = PartitionWalker::new(32, 32, geom).unwrap();
         let bytes = [0u8; 32];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 32, true).unwrap();
         let entries = read_palette_entries_y(&mut dec, 8, 2, &walker, 0, 0).unwrap();
@@ -52881,7 +54888,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let walker = PartitionWalker::new(32, 32, geom).unwrap();
         let bytes = [0u8; 32];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 32, true).unwrap();
         let (u, v) = read_palette_entries_uv(&mut dec, 8, 2, &walker, 0, 0).unwrap();
@@ -52905,7 +54912,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         // Hand-stamp a luma palette into (0, 0): size 3, entries [10,
         // 50, 200]. We use the public read-only accessors to verify
         // and the private fields via tests-internal access.
@@ -52954,7 +54961,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mi_cols = walker.mi_cols() as usize;
         // Stamp above palette at (mi_row=0, mi_col=1) so that when we
         // read at (mi_row=1, mi_col=1), the above neighbour is (0, 1)
@@ -52994,7 +55001,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         // (mi_row=0, mi_col=0) ⇒ flat index 0.
         let cell: usize = 0;
         walker.palette_sizes[cell] = 2;
@@ -53023,7 +55030,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 64,
         };
-        let walker = PartitionWalker::<i32>::new(64, 64, geom).unwrap();
+        let walker = PartitionWalker::new(64, 64, geom).unwrap();
         let mut cache = [0u16; 2 * PALETTE_COLORS];
         // mi_row = 16: 16 * MI_SIZE (= 4) = 64 → 64 % 64 = 0 → gated.
         let n_gated = walker.get_palette_cache(0, 16, 8, &mut cache);
@@ -53059,7 +55066,7 @@ mod tests {
         assert!(is_samedir_ref_pair(5, 7)); // BWDREF+ALTREF — both bwd
         assert!(!is_samedir_ref_pair(1, 7)); // LAST+ALTREF — mixed
         assert!(!is_samedir_ref_pair(4, 5)); // GOLDEN+BWDREF — mixed
-                                             // INTRA (0) counts as forward (0 < 5).
+        // INTRA (0) counts as forward (0 < 5).
         assert!(is_samedir_ref_pair(0, 1));
         // NONE (-1) counts as forward too.
         assert!(is_samedir_ref_pair(-1, 0));
@@ -53139,7 +55146,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -53368,7 +55375,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 32]; // hostile buffer the reader must not touch
         let mut dec = SymbolDecoder::init_symbol(&bytes, 32, true).unwrap();
@@ -53412,7 +55419,10 @@ mod tests {
             /* enable_dual_filter = */ false,
             &mfmvs,
         );
-        assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
+        assert!(
+            r.is_ok(),
+            "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}"
+        );
         assert_eq!(
             dec.position(),
             pos_before,
@@ -53453,7 +55463,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 32];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 32, true).unwrap();
@@ -53497,7 +55507,10 @@ mod tests {
             /* enable_dual_filter = */ false,
             &mfmvs,
         );
-        assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
+        assert!(
+            r.is_ok(),
+            "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}"
+        );
         // §5.11.25 itself reads 0 bits on the seg_ref_frame_active arm;
         // the §5.11.23 Arm 4 single-pred cascade then reads at least the
         // `new_mv` symbol.
@@ -53520,7 +55533,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -53564,14 +55577,17 @@ mod tests {
             /* enable_dual_filter = */ false,
             &mfmvs,
         );
-        assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
+        assert!(
+            r.is_ok(),
+            "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}"
+        );
         assert_eq!(dec.position(), pos_before);
         // RefFrames[0][0] = [LAST_FRAME = 1, NONE = -1].
         assert_eq!(walker.ref_frames()[0], 1);
         assert_eq!(walker.ref_frames()[1], -1);
 
         // Same outcome with globalmv-active path on a fresh walker.
-        let mut walker2 = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
+        let mut walker2 = PartitionWalker::new(4, 4, geom).unwrap();
         let mut cdfs2 = TileCdfContext::new_from_defaults();
         let mut dec2 = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
         let pos_before = dec2.position();
@@ -53613,7 +55629,10 @@ mod tests {
             /* enable_dual_filter = */ false,
             &mfmvs,
         );
-        assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
+        assert!(
+            r.is_ok(),
+            "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}"
+        );
         assert_eq!(dec2.position(), pos_before);
         assert_eq!(walker2.ref_frames()[0], 1);
         assert_eq!(walker2.ref_frames()[1], -1);
@@ -53633,7 +55652,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -53677,7 +55696,10 @@ mod tests {
             /* enable_dual_filter = */ false,
             &mfmvs,
         );
-        assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
+        assert!(
+            r.is_ok(),
+            "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}"
+        );
         // The single-ref cascade reads at least the single_ref_p1
         // symbol, which is a conformant binary S() against the §9.4
         // default CDF — at minimum one bit gets consumed (the §8.2.6
@@ -53711,7 +55733,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -53754,7 +55776,10 @@ mod tests {
             /* enable_dual_filter = */ false,
             &mfmvs,
         );
-        assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
+        assert!(
+            r.is_ok(),
+            "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}"
+        );
         let r0 = walker.ref_frames()[0];
         let r1 = walker.ref_frames()[1];
         // Either single-pred (r0 in 1..=7, r1 = NONE = -1) or compound
@@ -53789,7 +55814,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -53892,7 +55917,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -53935,7 +55960,10 @@ mod tests {
             /* enable_dual_filter = */ false,
             &mfmvs,
         );
-        assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
+        assert!(
+            r.is_ok(),
+            "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}"
+        );
         // Small-block gate forces single-pred → RefFrame[1] = NONE.
         assert_eq!(
             walker.ref_frames()[1],
@@ -54056,7 +56084,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::new(8, 8, geom).unwrap();
         // Pre-fill identity: every cell starts at [INTRA_FRAME, NONE].
         assert_eq!(walker.ref_frame_at(0, 0, 0), 0);
         assert_eq!(walker.ref_frame_at(0, 0, 1), -1);
@@ -54088,7 +56116,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 32]; // hostile — Arm 1 must not touch it.
         let mut dec = SymbolDecoder::init_symbol(&bytes, 32, true).unwrap();
@@ -54132,7 +56160,10 @@ mod tests {
             /* enable_dual_filter = */ false,
             &mfmvs,
         );
-        assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
+        assert!(
+            r.is_ok(),
+            "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}"
+        );
         assert_eq!(
             dec.position(),
             pos_before,
@@ -54153,7 +56184,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -54197,7 +56228,10 @@ mod tests {
             /* enable_dual_filter = */ false,
             &mfmvs,
         );
-        assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
+        assert!(
+            r.is_ok(),
+            "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}"
+        );
         assert_eq!(
             dec.position(),
             pos_before,
@@ -54225,7 +56259,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Rig §5.11.25 default arm: comp_mode = COMPOUND_REFERENCE (1).
         for row in cdfs.comp_mode.iter_mut() {
@@ -54281,7 +56315,10 @@ mod tests {
             /* enable_dual_filter = */ false,
             &mfmvs,
         );
-        assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
+        assert!(
+            r.is_ok(),
+            "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}"
+        );
         assert!(
             dec.position() > pos_before,
             "Arm 3 ⇒ compound_mode S() must consume bits"
@@ -54306,7 +56343,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Rig new_mv ⇒ symbol 0 ⇒ YMode = NEWMV.
         for row in cdfs.new_mv.iter_mut() {
@@ -54361,7 +56398,10 @@ mod tests {
             /* enable_dual_filter = */ false,
             &mfmvs,
         );
-        assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
+        assert!(
+            r.is_ok(),
+            "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}"
+        );
         assert!(
             dec.position() > pos_before,
             "Arm 4 ⇒ new_mv + single_ref cascade must consume bits"
@@ -54381,7 +56421,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // new_mv ⇒ 1 (NEWMV not chosen).
         for row in cdfs.new_mv.iter_mut() {
@@ -54438,7 +56478,10 @@ mod tests {
             /* enable_dual_filter = */ false,
             &mfmvs,
         );
-        assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
+        assert!(
+            r.is_ok(),
+            "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}"
+        );
         assert!(dec.position() > pos_before);
     }
 
@@ -54453,7 +56496,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         for row in cdfs.new_mv.iter_mut() {
             *row = [1 << 15, 1 << 15, 0];
@@ -54511,7 +56554,10 @@ mod tests {
             /* enable_dual_filter = */ false,
             &mfmvs,
         );
-        assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
+        assert!(
+            r.is_ok(),
+            "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}"
+        );
     }
 
     /// §5.11.23 drl_mode short-circuit: `NumMvFound = 0` on a fresh
@@ -54527,7 +56573,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // new_mv ⇒ 0 ⇒ NEWMV (triggers drl_mode loop guard).
         for row in cdfs.new_mv.iter_mut() {
@@ -54586,7 +56632,10 @@ mod tests {
             /* enable_dual_filter = */ false,
             &mfmvs,
         );
-        assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
+        assert!(
+            r.is_ok(),
+            "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}"
+        );
         // drl_mode CDFs must NOT have adapted (no read fired).
         for row in &cdfs.drl_mode {
             assert_eq!(
@@ -54630,7 +56679,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -54690,7 +56739,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -54828,7 +56877,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 32];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 32, true).unwrap();
@@ -54872,7 +56921,10 @@ mod tests {
             /* enable_dual_filter = */ false,
             &mfmvs,
         );
-        assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
+        assert!(
+            r.is_ok(),
+            "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}"
+        );
         assert_eq!(
             dec.position(),
             pos_before,
@@ -54906,7 +56958,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -54950,7 +57002,10 @@ mod tests {
             /* enable_dual_filter = */ false,
             &mfmvs,
         );
-        assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
+        assert!(
+            r.is_ok(),
+            "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}"
+        );
         assert_eq!(
             dec.position(),
             pos_before,
@@ -54983,7 +57038,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Rig §5.11.23 Arm 4 single-pred for YMode = NEWMV.
         for row in cdfs.new_mv.iter_mut() {
@@ -55045,7 +57100,10 @@ mod tests {
             /* enable_dual_filter = */ false,
             &mfmvs,
         );
-        assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
+        assert!(
+            r.is_ok(),
+            "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}"
+        );
         // Mvs grid: identity-GM PredMv = [0, 0], MV_JOINT_ZERO diff =
         // [0, 0], so final Mv[0] = [0, 0].
         assert_eq!(walker.mvs()[0], 0);
@@ -55087,7 +57145,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // YMode = NEWMV ⇒ assign_mv invokes read_mv ⇒ read_mv_component.
         for row in cdfs.new_mv.iter_mut() {
@@ -55139,7 +57197,10 @@ mod tests {
             /* enable_dual_filter = */ false,
             &mfmvs,
         );
-        assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
+        assert!(
+            r.is_ok(),
+            "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}"
+        );
         // §6.10.25 `is_mv_valid`: |Mv[i][c]| < (1 << 14) = 16384.
         for list in 0..2 {
             for comp in 0..2 {
@@ -55171,7 +57232,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Force every symbol read to 0.
         for row in cdfs.mv_sign.iter_mut() {
@@ -55222,7 +57283,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         for row in cdfs.mv_sign.iter_mut() {
             for slot in row.iter_mut() {
@@ -55279,7 +57340,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // mv_sign is the FIRST read; rig to symbol 1 via the
         // fresh-state-only `[0, 1<<15, 0]` pattern (matches
@@ -55332,7 +57393,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         for row in cdfs.mv_sign.iter_mut() {
             for slot in row.iter_mut() {
@@ -55384,7 +57445,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -55601,7 +57662,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let walker = PartitionWalker::new(16, 16, geom).unwrap();
         let (gm_type, gm_params) = identity_gm();
         let mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
         let res = walker
@@ -55644,7 +57705,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let walker = PartitionWalker::new(16, 16, geom).unwrap();
         let (gm_type, gm_params) = identity_gm();
         let mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
         let res = walker
@@ -55687,7 +57748,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::new(8, 8, geom).unwrap();
         let (gm_type, gm_params) = identity_gm();
         let mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
 
@@ -55799,7 +57860,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::new(8, 8, geom).unwrap();
         let (gm_type, gm_params) = identity_gm();
         let mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
         let r_opt_in = walker
@@ -55966,7 +58027,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::new(8, 8, geom).unwrap();
         let (gm_type, gm_params) = identity_gm();
         // mi_rows = mi_cols = 8 ⇒ h8 = w8 = 4. Stamp at (y8=1, x8=1).
         let mut mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
@@ -56012,7 +58073,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::new(8, 8, geom).unwrap();
         let (gm_type, gm_params) = identity_gm();
         let mut mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
         // Only ref 1 stamped; ref 7 stays sentinel.
@@ -56036,11 +58097,11 @@ mod tests {
         // §7.10.2.12 extra-search compound fill still emits the two
         // global-MV slots. The temporal sample dropped its candidate
         // because slot 1's grid cell carries the sentinel.
-        for idx in 0..res.num_mv_found as usize {
+        for slot in res.ref_stack_mv.iter().take(res.num_mv_found as usize) {
             // No temporal candidate (which would have been [40, -32]
             // on slot [0]); only the global-MV fill (= [0, 0] in the
             // identity-warp test fixture).
-            assert_ne!(res.ref_stack_mv[idx][0], [40, -32]);
+            assert_ne!(slot[0], [40, -32]);
         }
     }
 
@@ -56059,7 +58120,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
         // Stamp a BLOCK_8X8 inter-block at (mi_row=2, mi_col=4) that
         // uses RefFrame[0] = LAST_FRAME = 1, with NEWMV mode and a
         // distinctive MV [32, 64].
@@ -56115,7 +58176,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
         walker.stamp_inter_neighbour(
             4,
             2,
@@ -56162,7 +58223,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
         walker.stamp_inter_neighbour(2, 4, BLOCK_8X8, [1, -1], MODE_NEARESTMV, [[10, 0], [0, 0]]);
         walker.stamp_inter_neighbour(4, 2, BLOCK_8X8, [1, -1], MODE_NEWMV, [[20, 0], [0, 0]]);
         let (gm_type, gm_params) = identity_gm();
@@ -56213,7 +58274,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
         // Neighbour uses GOLDEN_FRAME (= 4); block wants LAST_FRAME
         // (= 1).
         walker.stamp_inter_neighbour(2, 4, BLOCK_8X8, [4, -1], MODE_NEWMV, [[42, 42], [0, 0]]);
@@ -56262,7 +58323,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
         // Above and left both have the same RefFrame and MV.
         walker.stamp_inter_neighbour(2, 4, BLOCK_8X8, [1, -1], MODE_NEARESTMV, [[7, 7], [0, 0]]);
         walker.stamp_inter_neighbour(4, 2, BLOCK_8X8, [1, -1], MODE_NEARESTMV, [[7, 7], [0, 0]]);
@@ -56305,7 +58366,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
         walker.stamp_inter_neighbour(2, 4, BLOCK_8X8, [1, -1], MODE_NEARESTMV, [[5, 5], [0, 0]]);
         let (gm_type, gm_params) = identity_gm();
         let mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
@@ -56404,7 +58465,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
         walker.stamp_inter_neighbour(2, 4, BLOCK_8X8, [1, -1], MODE_NEARESTMV, [[1, 0], [0, 0]]);
         let (gm_type, gm_params) = identity_gm();
         let mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
@@ -56488,7 +58549,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::new(8, 8, geom).unwrap();
         // Block at (2, 2) sees no inter neighbours.
         assert!(!walker.has_overlappable_candidates(2, 2, BLOCK_8X8));
         // Block at (0, 0) has no above / left neighbours at all.
@@ -56505,7 +58566,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
         // Stamp an inter block at (0, 0..=1): RefFrames[0][1][0] =
         // LAST_FRAME > INTRA_FRAME, so the §7.10.3 above-walk for the
         // block at (2, 0) BLOCK_8X8 hits the (MiRow - 1 = 1, x4 | 1 =
@@ -56524,7 +58585,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
         // Stamp an inter block at (0, 0..=1) — the block at (0, 2) of
         // BLOCK_8X8 sees (y4 | 1 = 1, MiCol - 1 = 1) as an inter
         // neighbour.
@@ -56543,7 +58604,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::new(8, 8, geom).unwrap();
         let ns = walker.find_warp_samples(2, 2, BLOCK_8X8, 1, [[0, 0], [0, 0]]);
         assert_eq!(ns, 0);
     }
@@ -56558,7 +58619,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
         // Stamp a same-ref inter neighbour above the block at (2, 0).
         // BLOCK_8X8 = 2x2 cells; the above-walk fires
         // `add_sample(-1, 0)`. With MV = (1, 1) on neighbour and (1, 1)
@@ -56582,7 +58643,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
         // Neighbour ref_frame[0] = 2 (LAST2_FRAME); query with
         // ref_frame_0 = 1 (LAST_FRAME) — `add_sample` short-circuits.
         walker.stamp_inter_neighbour(0, 0, BLOCK_8X8, [2, -1], MODE_NEARESTMV, [[0, 0], [0, 0]]);
@@ -56600,7 +58661,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -56638,7 +58699,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -56676,7 +58737,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -56716,7 +58777,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -56757,7 +58818,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -56797,7 +58858,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -56844,7 +58905,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
         walker.stamp_inter_neighbour(1, 0, BLOCK_8X8, [1, -1], MODE_NEARESTMV, [[0, 0], [0, 0]]);
 
         let mut cdfs = TileCdfContext::new_from_defaults();
@@ -56905,7 +58966,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
         walker.stamp_inter_neighbour(1, 0, BLOCK_8X8, [1, -1], MODE_NEARESTMV, [[0, 0], [0, 0]]);
 
         let mut cdfs = TileCdfContext::new_from_defaults();
@@ -56960,7 +59021,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
         walker.stamp_inter_neighbour(1, 0, BLOCK_8X8, [1, -1], MODE_NEARESTMV, [[0, 0], [0, 0]]);
 
         let mut cdfs = TileCdfContext::new_from_defaults();
@@ -57013,7 +59074,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -57089,7 +59150,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -57121,7 +59182,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -57150,7 +59211,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -57179,7 +59240,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -57201,7 +59262,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let walker = PartitionWalker::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -57223,7 +59284,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Force interintra S() ⇒ 0 for the ctx = Size_Group[BLOCK_16X16]
         // - 1 = 2 - 1 = 1 row.
@@ -57265,7 +59326,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let ctx = interintra_ctx(BLOCK_16X16).unwrap();
         // Force interintra S() ⇒ 1 ⇒ enter inner arm.
@@ -57320,7 +59381,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let ctx = interintra_ctx(BLOCK_16X16).unwrap();
         // Bias both rows toward 1; CDF adaptation will keep them there.
@@ -57402,7 +59463,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
+        let walker = PartitionWalker::new(4, 4, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -57426,7 +59487,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -57506,7 +59567,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let ctx = interintra_ctx(BLOCK_16X16).unwrap();
         let inter_intra_before = cdfs.inter_intra[ctx];
@@ -57766,7 +59827,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -57812,7 +59873,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -57856,7 +59917,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -57899,7 +59960,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -57942,7 +60003,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -57987,7 +60048,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // §8.3.2 `comp_group_idx_ctx` with all-zero neighbours = 0.
         let ctx = 0usize;
@@ -58045,7 +60106,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let ctx = 0usize;
         cdfs.comp_group_idx[ctx] = force_binary_cdf(1);
@@ -58111,7 +60172,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let ctx = 0usize;
         cdfs.comp_group_idx[ctx] = force_binary_cdf(1);
@@ -58168,7 +60229,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let ctx = 0usize;
         cdfs.comp_group_idx[ctx] = force_binary_cdf(1);
@@ -58204,7 +60265,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // §8.3.2 `compound_idx_ctx` with !dist_equal + closed neighbours = 0.
         let ctx = 0usize;
@@ -58250,7 +60311,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let ctx = 0usize;
         cdfs.compound_idx[ctx] = force_binary_cdf(0);
@@ -58294,7 +60355,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // dist_equal seeds ctx = 3 (no neighbour contributions on
         // closed-both arm).
@@ -58347,7 +60408,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
+        let walker = PartitionWalker::new(4, 4, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Force the comp_group_idx S() → 1 + the `compound_type` S()
         // path: with `mi_size = BLOCK_SIZES` (out of range),
@@ -58402,7 +60463,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -58502,7 +60563,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -58546,7 +60607,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -58589,7 +60650,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -58628,7 +60689,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -58692,7 +60753,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Rig every interp_filter CDF row to force symbol 1
         // (EIGHTTAP_SMOOTH).
@@ -58747,7 +60808,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         for row in cdfs.interp_filter.iter_mut() {
             *row = force_interp_filter_row(EIGHTTAP_SHARP);
@@ -58787,7 +60848,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let walker = PartitionWalker::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -58857,7 +60918,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -58932,7 +60993,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 32];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 32, true).unwrap();
@@ -59039,12 +61100,12 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Force every txb_skip ctx row to select symbol 1 (all_zero = 1).
-        for sz in 0..TX_SIZES {
-            for ctx in 0..TXB_SKIP_CONTEXTS {
-                cdfs.txb_skip[sz][ctx] = rig_cdf::<3>(1);
+        for row in cdfs.txb_skip.iter_mut().take(TX_SIZES) {
+            for slot in row.iter_mut().take(TXB_SKIP_CONTEXTS) {
+                *slot = rig_cdf::<3>(1);
             }
         }
         let bytes = [0u8; 4];
@@ -59095,12 +61156,12 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Force txb_skip to symbol 0 (first read; sym-0 wins from value=32767).
-        for sz in 0..TX_SIZES {
-            for ctx in 0..TXB_SKIP_CONTEXTS {
-                cdfs.txb_skip[sz][ctx] = rig_cdf::<3>(0);
+        for row in cdfs.txb_skip.iter_mut().take(TX_SIZES) {
+            for slot in row.iter_mut().take(TXB_SKIP_CONTEXTS) {
+                *slot = rig_cdf::<3>(0);
             }
         }
         // The remaining CDFs stay at the §9.4 defaults; the §8.2.6
@@ -59161,12 +61222,12 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Force txb_skip to symbol 0 across all rows.
-        for sz in 0..TX_SIZES {
-            for ctx in 0..TXB_SKIP_CONTEXTS {
-                cdfs.txb_skip[sz][ctx] = rig_cdf::<3>(0);
+        for row in cdfs.txb_skip.iter_mut().take(TX_SIZES) {
+            for slot in row.iter_mut().take(TXB_SKIP_CONTEXTS) {
+                *slot = rig_cdf::<3>(0);
             }
         }
         // Snapshot the row that will be consulted (TX_4X4 has txSzCtx=0,
@@ -59209,7 +61270,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -59346,13 +61407,13 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 64,
         };
-        let mut walker = PartitionWalker::<i32>::new(64, 64, geom).unwrap();
+        let mut walker = PartitionWalker::new(64, 64, geom).unwrap();
         for tx in &[TX_4X4, TX_8X8, TX_16X16, TX_32X32, TX_64X64] {
             let mut cdfs = TileCdfContext::new_from_defaults();
             // Force txb_skip to symbol 1 (gate closed — quickest path).
-            for sz in 0..TX_SIZES {
-                for ctx in 0..TXB_SKIP_CONTEXTS {
-                    cdfs.txb_skip[sz][ctx] = rig_cdf::<3>(1);
+            for row in cdfs.txb_skip.iter_mut().take(TX_SIZES) {
+                for slot in row.iter_mut().take(TXB_SKIP_CONTEXTS) {
+                    *slot = rig_cdf::<3>(1);
                 }
             }
             let bytes = [0u8; 8];
@@ -59397,7 +61458,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -59424,9 +61485,9 @@ mod tests {
         let scan_ok: Vec<u16> = (0..512u16).collect();
         let mut quant_ok = vec![0i32; 16 * 64];
         // Force all_zero to short-circuit so we don't depend on EOB tables.
-        for sz in 0..TX_SIZES {
-            for ctx in 0..TXB_SKIP_CONTEXTS {
-                cdfs.txb_skip[sz][ctx] = rig_cdf::<3>(1);
+        for row in cdfs.txb_skip.iter_mut().take(TX_SIZES) {
+            for slot in row.iter_mut().take(TXB_SKIP_CONTEXTS) {
+                *slot = rig_cdf::<3>(1);
             }
         }
         let bytes2 = [0u8; 8];
@@ -59522,7 +61583,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -59584,7 +61645,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
         // §5.11.3 reset first (the tile walk runs this before the SB).
         walker.clear_block_decoded_flags(0, 0, 16, 3, 0, 0);
         let mut cdfs = TileCdfContext::new_from_defaults();
@@ -59644,7 +61705,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
         walker.clear_block_decoded_flags(0, 0, 16, 3, 0, 0);
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 16];
@@ -59693,12 +61754,12 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Force §5.11.39 `all_zero` S() to return 1 for every TU.
-        for sz in 0..TX_SIZES {
-            for ctx in 0..TXB_SKIP_CONTEXTS {
-                cdfs.txb_skip[sz][ctx] = rig_cdf::<3>(1);
+        for row in cdfs.txb_skip.iter_mut().take(TX_SIZES) {
+            for slot in row.iter_mut().take(TXB_SKIP_CONTEXTS) {
+                *slot = rig_cdf::<3>(1);
             }
         }
         let bytes = [0u8; 16];
@@ -59751,7 +61812,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -59795,7 +61856,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -59835,7 +61896,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -59886,7 +61947,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 8];
 
@@ -60036,7 +62097,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -60090,13 +62151,13 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Force §5.11.39 `all_zero` S() to return 0 for every TU
         // (cascade fires; eob >= 1).
-        for sz in 0..TX_SIZES {
-            for ctx in 0..TXB_SKIP_CONTEXTS {
-                cdfs.txb_skip[sz][ctx] = rig_cdf::<3>(0);
+        for row in cdfs.txb_skip.iter_mut().take(TX_SIZES) {
+            for slot in row.iter_mut().take(TXB_SKIP_CONTEXTS) {
+                *slot = rig_cdf::<3>(0);
             }
         }
         let bytes = [0u8; 16];
@@ -60326,6 +62387,38 @@ mod tests {
         assert_eq!(dequant.len(), 64 * 64);
     }
 
+    /// r487 — the `dqDenom` division as a shift of the magnitude: for
+    /// every divisor (1 / 2 / 4) and both signs the result is the
+    /// truncating division `sign * ( ( |dq| & 0xFFFFFF ) / dqDenom )`,
+    /// including odd magnitudes (truncation toward zero, not floor).
+    #[test]
+    fn dequantize_step1_division_truncates_toward_zero() {
+        for (tx, denom) in [(TX_4X4, 1i64), (TX_32X32, 2), (TX_64X64, 4)] {
+            for base_q_idx in [1u8, 37, 120, 255] {
+                let q = QuantizerParams::neutral(base_q_idx, 8);
+                let (w, h) = (TX_WIDTH[tx], TX_HEIGHT[tx]);
+                let (tw, th) = (w.min(32), h.min(32));
+                let mut levels = vec![0i32; tw * th];
+                for (k, level) in levels.iter_mut().enumerate() {
+                    let mag = (k as i32 * 7 + 1) % 23;
+                    *level = if k % 2 == 0 { mag } else { -mag };
+                }
+                let dequant = dequantize_step1(&levels, tx, 0, 0, DCT_DCT, 15, &q);
+                let dc_q = i64::from(get_dc_quant(&q, 0, 0));
+                let ac_q = i64::from(get_ac_quant(&q, 0, 0));
+                for i in 0..th {
+                    for j in 0..tw {
+                        let qv = if i == 0 && j == 0 { dc_q } else { ac_q };
+                        let dq = i64::from(levels[i * tw + j]) * qv;
+                        let sign = if dq < 0 { -1 } else { 1 };
+                        let want = (sign * ((dq.abs() & 0xFF_FFFF) / denom)).clamp(-32768, 32767);
+                        assert_eq!(dequant[i * w + j], want, "tx={tx} q={base_q_idx} ({i},{j})");
+                    }
+                }
+            }
+        }
+    }
+
     /// `dequantize_step1` clip per §7.12.3 step-1 line f:
     /// `Clip3(-(1<<(7+BitDepth)), (1<<(7+BitDepth))-1, dq2)`.
     /// For 8-bit, bounds are `[-32768, 32767]`.
@@ -60457,7 +62550,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -60487,7 +62580,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 32,
         };
-        let mut walker = PartitionWalker::<i32>::new(32, 32, geom).unwrap();
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 8];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
@@ -60514,13 +62607,17 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Force the §8.3.2 intra_tx_type CDF to return symbol 0
         // (= IDTX after inversion) deterministically.
-        for sqr in 0..INTRA_TX_TYPE_SET1_SIZES {
-            for d in 0..INTRA_MODES {
-                cdfs.intra_tx_type_set1[sqr][d] = rig_cdf::<8>(0);
+        for row in cdfs
+            .intra_tx_type_set1
+            .iter_mut()
+            .take(INTRA_TX_TYPE_SET1_SIZES)
+        {
+            for slot in row.iter_mut().take(INTRA_MODES) {
+                *slot = rig_cdf::<8>(0);
             }
         }
         let bytes = [0u8; 16];
@@ -60589,7 +62686,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
         walker.stamp_tx_type(2, 3, 2, 2, ADST_ADST as u8);
         for r in 0i32..8 {
             for c in 0i32..8 {
@@ -60612,7 +62709,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
+        let walker = PartitionWalker::new(4, 4, geom).unwrap();
         assert_eq!(walker.tx_type_at(-1, 0), DCT_DCT as u8);
         assert_eq!(walker.tx_type_at(0, -1), DCT_DCT as u8);
         assert_eq!(walker.tx_type_at(4, 0), DCT_DCT as u8);
@@ -60650,11 +62747,11 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Force `all_zero == 1` for every TU at TX_4X4.
-        for ctx in 0..TXB_SKIP_CONTEXTS {
-            cdfs.txb_skip[0][ctx] = rig_cdf::<3>(1);
+        for slot in cdfs.txb_skip[0].iter_mut().take(TXB_SKIP_CONTEXTS) {
+            *slot = rig_cdf::<3>(1);
         }
         let bytes = [0u8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -60738,7 +62835,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
+        let walker = PartitionWalker::new(4, 4, geom).unwrap();
         for plane in 0..3 {
             assert!(walker.curr_frame(plane).is_none());
             assert!(walker.curr_frame_dims(plane).is_none());
@@ -60760,7 +62857,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
         // Luma: 4 mi rows × 4 mi cols × MI_SIZE = 16 × 16.
         walker.ensure_curr_frame_plane(0, 16, 16);
         assert_eq!(walker.curr_frame_dims(0), Some((16, 16)));
@@ -60773,36 +62870,6 @@ mod tests {
         let chroma_u = walker.curr_frame(1).unwrap();
         assert_eq!(chroma_u.len(), 8 * 8);
         assert!(chroma_u.iter().all(|&s| s == 0));
-    }
-
-    #[test]
-    fn curr_frame_step3_merge_interior_extremes_and_flips() {
-        let residual: Vec<i64> = (0..16).map(|i| [i64::MIN, i64::MAX, -4096, -1, 0, 1, 4096][i % 7]).collect();
-        for bit_depth in [8u8, 10, 12] {
-            let max = (1i32 << bit_depth) - 1;
-            let base: Vec<i32> = (0..256).map(|i| (i * 13) % (max + 1)).collect();
-            for tx_type in [DCT_DCT, FLIPADST_DCT, H_FLIPADST, FLIPADST_FLIPADST] {
-                let mut walker = PartitionWalker::<i32>::new(4, 4, TileGeometry {
-                    mi_row_start: 0, mi_row_end: 4, mi_col_start: 0, mi_col_end: 4,
-                }).unwrap();
-                walker.ensure_curr_frame_plane(0, 16, 16);
-                walker.curr_frame[0].as_mut().unwrap().samples.copy_from_slice(&base);
-                let mut expected = base.clone();
-                let flip_ud = matches!(tx_type, FLIPADST_DCT | FLIPADST_FLIPADST);
-                let flip_lr = matches!(tx_type, H_FLIPADST | FLIPADST_FLIPADST);
-                for y in 0..4 {
-                    for x in 0..4 {
-                        let yy = if flip_ud { 3 - y } else { y };
-                        let xx = if flip_lr { 3 - x } else { x };
-                        let index = (3 + yy) * 16 + 2 + xx;
-                        expected[index] = i64::from(expected[index]).saturating_add(residual[y * 4 + x])
-                            .clamp(0, i64::from(max)) as i32;
-                    }
-                }
-                walker.curr_frame_step3_merge(0, 2, 3, TX_4X4, tx_type, &residual, bit_depth, 0, 0);
-                assert_eq!(walker.curr_frame(0).unwrap(), expected.as_slice());
-            }
-        }
     }
 
     /// §7.12.3 step-3 merge with `PlaneTxType = DCT_DCT` (no flip):
@@ -60818,7 +62885,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
         // 4×4 residual with i*4 + j+1 in each cell (1..=16).
         let residual: Vec<i64> = (0..16).map(|k| (k + 1) as i64).collect();
         walker.curr_frame_step3_merge(
@@ -60831,7 +62898,7 @@ mod tests {
         for i in 0..4 {
             for j in 0..4 {
                 assert_eq!(
-                    buf[i * 16 + j],
+                    i32::from(buf[i * 16 + j]),
                     (i * 4 + j + 1) as i32,
                     "DCT_DCT identity write at ({i}, {j})",
                 );
@@ -60867,7 +62934,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
         walker.predict_intra_into_curr_frame(
             /* plane */ 0, /* start_x */ 0, /* start_y */ 0, TX_4X4, DC_PRED,
             /* angle_delta */ 0, /* bit_depth */ 8, /* sub_x */ 0,
@@ -60896,14 +62963,14 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
         // Allocate the plane + seed row 3 (the row above start_y = 4)
         // with samples 10, 20, 30, 40 in cols 0..4.
         walker.ensure_curr_frame_plane(0, 16, 16);
         {
             let buf = walker.curr_frame[0].as_mut().unwrap();
             for j in 0..4 {
-                buf.samples[3 * 16 + j] = (10 * (j + 1)) as i32;
+                buf.samples[3 * 16 + j] = (10 * (j + 1)) as u16;
             }
         }
         walker.predict_intra_into_curr_frame(
@@ -60914,7 +62981,7 @@ mod tests {
         for i in 0..4 {
             for j in 0..4 {
                 assert_eq!(
-                    buf[(4 + i) * 16 + j],
+                    i32::from(buf[(4 + i) * 16 + j]),
                     (10 * (j + 1)) as i32,
                     "V_PRED column copy at row {i} col {j}",
                 );
@@ -60934,12 +63001,12 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
         walker.ensure_curr_frame_plane(0, 16, 16);
         {
             let buf = walker.curr_frame[0].as_mut().unwrap();
             for i in 0..4 {
-                buf.samples[i * 16 + 3] = (10 * (i + 1)) as i32;
+                buf.samples[i * 16 + 3] = (10 * (i + 1)) as u16;
             }
         }
         walker.predict_intra_into_curr_frame(
@@ -60950,7 +63017,7 @@ mod tests {
         for i in 0..4 {
             for j in 0..4 {
                 assert_eq!(
-                    buf[i * 16 + (4 + j)],
+                    i32::from(buf[i * 16 + (4 + j)]),
                     (10 * (i + 1)) as i32,
                     "H_PRED row copy at row {i} col {j}",
                 );
@@ -61000,25 +63067,32 @@ mod tests {
         ];
         for (mode, delta, fim) in cases {
             for (tx_sz, sx, sy) in [(TX_8X8, 8u32, 8u32), (TX_16X8, 8, 16), (TX_4X16, 12, 4)] {
-                let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+                let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
                 walker.ensure_curr_frame_plane(0, 32, 32);
                 {
                     let buf = walker.curr_frame[0].as_mut().unwrap();
                     for y in 0..32usize {
                         for x in 0..32usize {
-                            buf.samples[y * 32 + x] = i32::from(fill(y, x));
+                            buf.samples[y * 32 + x] = fill(y, x);
                         }
                     }
                 }
                 walker.predict_intra_into_curr_frame(
                     0, sx, sy, tx_sz, mode, delta, 8, 0, 0, true, true, true, false, true, 1, fim,
                 );
-                let walked: Vec<i32> = walker.curr_frame(0).unwrap().to_vec();
+                let walked: Vec<i32> = walker
+                    .curr_frame(0)
+                    .unwrap()
+                    .iter()
+                    .map(|&v| i32::from(v))
+                    .collect();
 
                 let mut out = vec![0u16; 32 * 32];
                 let neigh = |y: u32, x: u32| -> u16 { fill(y as usize, x as usize) };
-                PartitionWalker::<i32>::predict_intra_into_u16_plane(&neigh, &mut out, 32, 31, 31, sx, sy, tx_sz, mode, delta, 8, true, true, true,
-                false, true, 1, fim,);
+                PartitionWalker::predict_intra_into_u16_plane(
+                    &neigh, &mut out, 32, 31, 31, sx, sy, tx_sz, mode, delta, 8, true, true, true,
+                    false, true, 1, fim,
+                );
                 let (w, h) = (TX_WIDTH[tx_sz], TX_HEIGHT[tx_sz]);
                 for i in 0..h {
                     for j in 0..w {
@@ -61047,7 +63121,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
         walker.predict_intra_into_curr_frame(
             0, 0, 0, TX_4X4, DC_PRED, 0, 8, 0, 0, false, false, false, false, false, 0, None,
         );
@@ -61073,7 +63147,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
         walker.predict_intra_into_curr_frame(
             0,
             0,
@@ -61110,7 +63184,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
         // First TU: DC_PRED (128) + residual +50 = 178 across the 4×4.
         walker.predict_intra_into_curr_frame(
             0, 0, 0, TX_4X4, DC_PRED, 0, 8, 0, 0, false, false, false, false, false, 0, None,
@@ -61148,12 +63222,14 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
         // Luma block at (MiRow = 1, MiCol = 1). Above neighbour is
         // (0, 1), left neighbour is (1, 0). Both default to DC_PRED
         // (= 0), so get_filter_type is 0 even with avail flags set.
         assert_eq!(
-            walker.get_filter_type(0, 1, 1, /* avail_u */ true, /* avail_l */ true, 0, 0),
+            walker.get_filter_type(
+                0, 1, 1, /* avail_u */ true, /* avail_l */ true, 0, 0
+            ),
             0,
             "DC_PRED neighbours ⇒ filterType 0",
         );
@@ -61171,7 +63247,9 @@ mod tests {
         // though its grid cell is smooth — get_filter_type falls back
         // to the (DC_PRED) left neighbour ⇒ 0.
         assert_eq!(
-            walker.get_filter_type(0, 1, 1, /* avail_u */ false, /* avail_l */ true, 0, 0),
+            walker.get_filter_type(
+                0, 1, 1, /* avail_u */ false, /* avail_l */ true, 0, 0
+            ),
             0,
             "AvailU == 0 masks the smooth above neighbour",
         );
@@ -61190,7 +63268,7 @@ mod tests {
         // `c = MiCol = 2`; `subX && !(MiCol & 1)` is true (MiCol 2 even)
         // so `c++` ⇒ (1, 3). Stamp SMOOTH_V_PRED there and assert the
         // chroma filterType flips to 1.
-        let mut walker2 = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
+        let mut walker2 = PartitionWalker::new(4, 4, geom).unwrap();
         // No smooth UV neighbour yet.
         assert_eq!(
             walker2.get_filter_type(1, 2, 2, true, true, 1, 1),
@@ -61244,7 +63322,7 @@ mod tests {
                 buf.samples[3 * 32 + j] = if j % 2 == 0 { 0 } else { 255 };
             }
         };
-        let mut walker_off = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let mut walker_off = PartitionWalker::new(8, 8, geom).unwrap();
         seed_above(&mut walker_off);
         walker_off.predict_intra_into_curr_frame(
             0, 0, 4, TX_16X16, D45_PRED, 0, 8, 0, 0, /* have_above */ true,
@@ -61253,7 +63331,7 @@ mod tests {
             /* filter_type */ 0, /* filter_intra_mode */ None,
         );
 
-        let mut walker_on = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let mut walker_on = PartitionWalker::new(8, 8, geom).unwrap();
         seed_above(&mut walker_on);
         walker_on.predict_intra_into_curr_frame(
             0, 0, 4, TX_16X16, D45_PRED, 0, 8, 0, 0, /* have_above */ true,
@@ -61313,10 +63391,10 @@ mod tests {
             // 0..8 (w + h = 8) with a rising ramp the 2x upsample's
             // 4-tap interpolation visibly re-samples.
             for j in 0..8usize {
-                buf.samples[3 * 16 + j] = (30 * j) as i32;
+                buf.samples[3 * 16 + j] = (30 * j) as u16;
             }
         };
-        let mut walker_off = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
+        let mut walker_off = PartitionWalker::new(4, 4, geom).unwrap();
         seed_above(&mut walker_off);
         walker_off.predict_intra_into_curr_frame(
             0, 0, 4, TX_4X4, D67_PRED, 0, 8, 0, 0, /* have_above */ true,
@@ -61325,7 +63403,7 @@ mod tests {
             /* filter_type */ 0, /* filter_intra_mode */ None,
         );
 
-        let mut walker_on = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
+        let mut walker_on = PartitionWalker::new(4, 4, geom).unwrap();
         seed_above(&mut walker_on);
         walker_on.predict_intra_into_curr_frame(
             0, 0, 4, TX_4X4, D67_PRED, 0, 8, 0, 0, /* have_above */ true,
@@ -61368,7 +63446,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
         // Allocate then pre-fill the (0, 0) cell with 200 — simulating
         // an upstream §7.11.x prediction sample already in the buffer.
         walker.ensure_curr_frame_plane(0, 16, 16);
@@ -61397,7 +63475,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
         walker.ensure_curr_frame_plane(0, 16, 16);
         walker.curr_frame[0].as_mut().unwrap().samples[0] = 800;
         let mut residual = vec![0i64; 16];
@@ -61421,7 +63499,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
         // Residual: row i carries value 10 + i (constant across the
         // row). Source rows 0..3 → values 10, 11, 12, 13.
         let mut residual = vec![0i64; 16];
@@ -61438,7 +63516,7 @@ mod tests {
             for c in 0..4 {
                 let expected = (10 + (3 - r)) as i32;
                 assert_eq!(
-                    buf[r * 16 + c],
+                    i32::from(buf[r * 16 + c]),
                     expected,
                     "FLIPADST_DCT row-flip at dst ({r}, {c}): expect src row {} = {expected}",
                     3 - r,
@@ -61459,7 +63537,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
         // Residual: col j carries value 10 + j (constant down the
         // col). Source cols 0..3 → values 10, 11, 12, 13.
         let mut residual = vec![0i64; 16];
@@ -61474,7 +63552,7 @@ mod tests {
             for c in 0..4 {
                 let expected = (10 + (3 - c)) as i32;
                 assert_eq!(
-                    buf[r * 16 + c],
+                    i32::from(buf[r * 16 + c]),
                     expected,
                     "H_FLIPADST col-flip at dst ({r}, {c}): expect src col {} = {expected}",
                     3 - c,
@@ -61497,7 +63575,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
         let residual: Vec<i64> = (0..16).map(|k| k as i64).collect();
         walker.curr_frame_step3_merge(0, 0, 0, TX_4X4, FLIPADST_FLIPADST, &residual, 8, 0, 0);
         let buf = walker.curr_frame(0).unwrap();
@@ -61507,7 +63585,7 @@ mod tests {
             for c in 0..4 {
                 let expected = (15 - 4 * r - c) as i32;
                 assert_eq!(
-                    buf[r * 16 + c],
+                    i32::from(buf[r * 16 + c]),
                     expected,
                     "FLIPADST_FLIPADST 180° at ({r}, {c})"
                 );
@@ -61528,7 +63606,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
         let residual = vec![7i64; 16]; // 4×4, all 7s.
         walker.curr_frame_step3_merge(
             0, /* start_x = */ 8, /* start_y = */ 4, TX_4X4, DCT_DCT, &residual, 8, 0, 0,
@@ -61558,7 +63636,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
         let residual = vec![3i64; 16];
         walker.curr_frame_step3_merge(0, 0, 0, TX_4X4, DCT_DCT, &residual, 8, 0, 0);
         walker.curr_frame_step3_merge(0, 0, 0, TX_4X4, DCT_DCT, &residual, 8, 0, 0);
@@ -61583,7 +63661,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
         let residual = vec![5i64; 16];
         walker.curr_frame_step3_merge(
             0, /* start_x = */ 14, /* start_y = */ 0, TX_4X4, DCT_DCT, &residual, 8, 0, 0,
@@ -61607,7 +63685,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
         let residual = vec![1i64; 16];
         walker.curr_frame_step3_merge(3, 0, 0, TX_4X4, DCT_DCT, &residual, 8, 0, 0);
         for plane in 0..3 {
@@ -61625,7 +63703,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
         // TX_4X4 expects w*h = 16; pass 8.
         let residual = vec![1i64; 8];
         walker.curr_frame_step3_merge(0, 0, 0, TX_4X4, DCT_DCT, &residual, 8, 0, 0);
@@ -61643,7 +63721,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
         let residual = vec![2i64; 16];
         walker.curr_frame_step3_merge(
             /* plane = */ 1, 0, 0, TX_4X4, DCT_DCT, &residual, 8, /* sub_x = */ 1,
@@ -61679,12 +63757,12 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         // Force §5.11.39 `all_zero` S() = 1 ⇒ eob = 0 per TU.
-        for sz in 0..TX_SIZES {
-            for ctx in 0..TXB_SKIP_CONTEXTS {
-                cdfs.txb_skip[sz][ctx] = rig_cdf::<3>(1);
+        for row in cdfs.txb_skip.iter_mut().take(TX_SIZES) {
+            for slot in row.iter_mut().take(TXB_SKIP_CONTEXTS) {
+                *slot = rig_cdf::<3>(1);
             }
         }
         let bytes = [0u8; 16];
@@ -61748,7 +63826,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 16,
         };
-        let mut walker = PartitionWalker::<i32>::new(16, 16, geom).unwrap();
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
@@ -62225,7 +64303,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: mi_cols,
         };
-        PartitionWalker::<i32>::new(mi_rows, mi_cols, geom).unwrap()
+        PartitionWalker::new(mi_rows, mi_cols, geom).unwrap()
     }
 
     /// §8.3.2 luma `all_zero` ladder (av1-spec p.370-371) — every arm,
@@ -62391,8 +64469,8 @@ mod tests {
     fn r303_walker_reconstructs_inter_intra_block_pixels() {
         use crate::inter_pred::{EIGHTTAP, II_H_PRED};
         use crate::{
-            reconstruct_inter_block_interintra, InterIntraLeaf, InterIntraModeInfo, PlaneRefSpec,
-            RefFrameStoreEntry,
+            InterIntraLeaf, InterIntraModeInfo, PlaneRefSpec, RefFrameStoreEntry,
+            reconstruct_inter_block_interintra,
         };
 
         // §7.11.3.3 reference frame (one plane, 16×16) — caller-owned
@@ -62498,7 +64576,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 2,
         };
-        let mut walker = PartitionWalker::<i32>::new(2, 2, geom).unwrap();
+        let mut walker = PartitionWalker::new(2, 2, geom).unwrap();
         // Seed CurrFrame[0] with the intra half (what the §7.12.3
         // step-3 merge writes before the blend). Buffer is i32.
         walker.ensure_curr_frame_plane(0, curr_h as u32, curr_w as u32);
@@ -62506,7 +64584,7 @@ mod tests {
             let cp = walker.curr_frame[0].as_mut().unwrap();
             assert_eq!(cp.samples.len(), curr_w * curr_h);
             for (dst, &src) in cp.samples.iter_mut().zip(seed.iter()) {
-                *dst = src as i32;
+                *dst = src;
             }
         }
 
@@ -62532,12 +64610,7 @@ mod tests {
         // The walker's CurrFrame[0] now holds the §7.11.3.14-blended
         // result, matching the per-block oracle, and differing from the
         // seed (the blend actually modified the plane).
-        let got: Vec<u16> = walker
-            .curr_frame(0)
-            .unwrap()
-            .iter()
-            .map(|&s| s as u16)
-            .collect();
+        let got: Vec<u16> = walker.curr_frame(0).unwrap().to_vec();
         assert_eq!(
             got, oracle,
             "the walker bridge must reconstruct inter-intra pixels identically to the per-block driver"
@@ -62602,7 +64675,7 @@ mod tests {
         };
 
         // Empty plane_refs.
-        let mut w = PartitionWalker::<i32>::new(2, 2, geom).unwrap();
+        let mut w = PartitionWalker::new(2, 2, geom).unwrap();
         w.ensure_curr_frame_plane(0, 8, 8);
         assert!(matches!(
             w.reconstruct_inter_intra_into_curr_frame(&readout, &leaf, &ref_frame_idx, 8, &[]),
@@ -62631,7 +64704,7 @@ mod tests {
 
         // Plane with no tracked buffer (intra half not written): a
         // fresh walker has no allocated curr_frame[0].
-        let mut w2 = PartitionWalker::<i32>::new(2, 2, geom).unwrap();
+        let mut w2 = PartitionWalker::new(2, 2, geom).unwrap();
         let plane_refs = [PlaneRefSpec {
             plane: 0,
             subsampling_x: 0,
@@ -62665,7 +64738,7 @@ mod tests {
     #[test]
     fn r304_walker_reconstructs_single_ref_inter_block_pixels() {
         use crate::inter_pred::EIGHTTAP;
-        use crate::{reconstruct_inter_block, InterModeInfo, PlaneRefSpec, RefFrameStoreEntry};
+        use crate::{InterModeInfo, PlaneRefSpec, RefFrameStoreEntry, reconstruct_inter_block};
 
         // §7.11.3.3 reference frame (one plane, 16×16) — caller-owned
         // decoder state the parser doesn't track.
@@ -62730,7 +64803,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 2,
         };
-        let mut walker = PartitionWalker::<i32>::new(2, 2, geom).unwrap();
+        let mut walker = PartitionWalker::new(2, 2, geom).unwrap();
         // Fresh walker: curr_frame[0] is unallocated. The single-ref
         // bridge must allocate it (no intra-half prerequisite).
         assert!(walker.curr_frame(0).is_none());
@@ -62763,12 +64836,7 @@ mod tests {
         // stitch, matching the per-block oracle over the 8×8 footprint.
         let (rows, cols) = walker.curr_frame_dims(0).unwrap();
         assert_eq!((rows, cols), (curr_h as u32, curr_w as u32));
-        let got: Vec<u16> = walker
-            .curr_frame(0)
-            .unwrap()
-            .iter()
-            .map(|&s| s as u16)
-            .collect();
+        let got: Vec<u16> = walker.curr_frame(0).unwrap().to_vec();
         assert_eq!(
             got, oracle,
             "the walker bridge must reconstruct single-ref pixels identically to the per-block driver"
@@ -62794,7 +64862,7 @@ mod tests {
     #[test]
     fn r346_walker_reconstructs_inter_frame_from_grids() {
         use crate::inter_pred::EIGHTTAP;
-        use crate::{reconstruct_inter_block, InterModeInfo, PlaneRefSpec, RefFrameStoreEntry};
+        use crate::{InterModeInfo, PlaneRefSpec, RefFrameStoreEntry, reconstruct_inter_block};
 
         // §7.11.3.3 reference frame (one plane, 16×16).
         let ref_w: usize = 16;
@@ -62856,7 +64924,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 2,
         };
-        let mut walker = PartitionWalker::<i32>::new(2, 2, geom).unwrap();
+        let mut walker = PartitionWalker::new(2, 2, geom).unwrap();
         // Stamp the §5.11 grids as the inter-syntax cascade would for a
         // single-ref translational BLOCK_8X8 leaf at (0, 0).
         walker.stamp_encoder_block_syntax(&EncoderBlockSyntaxStamp {
@@ -62913,12 +64981,7 @@ mod tests {
 
         let (rows, cols) = walker.curr_frame_dims(0).unwrap();
         assert_eq!((rows, cols), (curr_h as u32, curr_w as u32));
-        let got: Vec<u16> = walker
-            .curr_frame(0)
-            .unwrap()
-            .iter()
-            .map(|&s| s as u16)
-            .collect();
+        let got: Vec<u16> = walker.curr_frame(0).unwrap().to_vec();
         assert_eq!(
             got, oracle,
             "the frame bridge must reconstruct the single-ref inter leaf's pixels \
@@ -62946,7 +65009,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 8,
         };
-        let mut walker = PartitionWalker::<i32>::new(8, 8, geom).unwrap();
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
         // A committed inter neighbour ABOVE the trial rect (row 0-1)
         // so find_mv_stack has a real §7.10.2.2 row-scan candidate.
         walker.stamp_encoder_block_syntax(&EncoderBlockSyntaxStamp {
@@ -63141,7 +65204,7 @@ mod tests {
     #[test]
     fn r346_walker_reconstructs_multi_leaf_subpel_inter_frame() {
         use crate::inter_pred::EIGHTTAP;
-        use crate::{reconstruct_inter_block, InterModeInfo, PlaneRefSpec, RefFrameStoreEntry};
+        use crate::{InterModeInfo, PlaneRefSpec, RefFrameStoreEntry, reconstruct_inter_block};
 
         // Reference frame large enough for both leaves' sub-pel taps.
         let ref_w: usize = 24;
@@ -63227,7 +65290,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::<i32>::new(2, 4, geom).unwrap();
+        let mut walker = PartitionWalker::new(2, 4, geom).unwrap();
         for (mi_col, mv) in [(0u32, mv_a), (2u32, mv_b)] {
             walker.stamp_encoder_block_syntax(&EncoderBlockSyntaxStamp {
                 mi_row: 0,
@@ -63278,12 +65341,7 @@ mod tests {
 
         let (rows, cols) = walker.curr_frame_dims(0).unwrap();
         assert_eq!((rows, cols), (frame_h as u32, frame_w as u32));
-        let got: Vec<u16> = walker
-            .curr_frame(0)
-            .unwrap()
-            .iter()
-            .map(|&s| s as u16)
-            .collect();
+        let got: Vec<u16> = walker.curr_frame(0).unwrap().to_vec();
         assert_eq!(
             got, oracle,
             "the frame bridge must reconstruct each leaf with its own decoded sub-pel MV, \
@@ -63342,7 +65400,7 @@ mod tests {
         ];
 
         let build = |force_simple: bool| -> Vec<u16> {
-            let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
+            let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
             for &(mr, mc, mv, mm) in &leaves {
                 let mode = if force_simple { MOTION_MODE_SIMPLE } else { mm };
                 walker.stamp_encoder_block_syntax(&EncoderBlockSyntaxStamp {
@@ -63390,12 +65448,7 @@ mod tests {
             walker
                 .reconstruct_inter_frame_into_curr_frame(&ref_frame_idx, 8, &[ref_spec])
                 .expect("frame-scope OBMC reconstruction");
-            walker
-                .curr_frame(0)
-                .unwrap()
-                .iter()
-                .map(|&s| s as u16)
-                .collect()
+            walker.curr_frame(0).unwrap().to_vec()
         };
 
         let got_obmc = build(false);
@@ -63455,14 +65508,14 @@ mod tests {
         };
 
         // Empty plane_refs.
-        let mut w0 = PartitionWalker::<i32>::new(2, 2, geom).unwrap();
+        let mut w0 = PartitionWalker::new(2, 2, geom).unwrap();
         assert!(matches!(
             w0.reconstruct_inter_frame_into_curr_frame(&ref_frame_idx, 8, &[]),
             Err(crate::Error::PartitionWalkOutOfRange)
         ));
 
         // Out-of-range plane.
-        let mut w1 = PartitionWalker::<i32>::new(2, 2, geom).unwrap();
+        let mut w1 = PartitionWalker::new(2, 2, geom).unwrap();
         let bad_plane = PlaneRefSpec {
             plane: 3,
             subsampling_x: 0,
@@ -63478,7 +65531,7 @@ mod tests {
 
         // Inter leaf with INTRA_FRAME RefFrame[0] — rejected by the
         // downstream §7.11.3.1 driver.
-        let mut w2 = PartitionWalker::<i32>::new(2, 2, geom).unwrap();
+        let mut w2 = PartitionWalker::new(2, 2, geom).unwrap();
         w2.stamp_encoder_block_syntax(&EncoderBlockSyntaxStamp {
             mi_row: 0,
             mi_col: 0,
@@ -63560,7 +65613,7 @@ mod tests {
         };
 
         // Out-of-range plane.
-        let mut w = PartitionWalker::<i32>::new(2, 2, geom).unwrap();
+        let mut w = PartitionWalker::new(2, 2, geom).unwrap();
         let bad_plane = PlaneRefSpec {
             plane: 3,
             subsampling_x: 0,
@@ -63595,7 +65648,7 @@ mod tests {
         };
 
         // Negative origin (rejected by reconstruct_inter_block).
-        let mut w2 = PartitionWalker::<i32>::new(2, 2, geom).unwrap();
+        let mut w2 = PartitionWalker::new(2, 2, geom).unwrap();
         assert!(matches!(
             w2.reconstruct_inter_block_into_curr_frame(
                 good_mode,
@@ -63613,7 +65666,7 @@ mod tests {
         ));
 
         // INTRA_FRAME RefFrame[0] (0): not an inter reference.
-        let mut w3 = PartitionWalker::<i32>::new(2, 2, geom).unwrap();
+        let mut w3 = PartitionWalker::new(2, 2, geom).unwrap();
         let intra_mode = InterModeInfo {
             ref_frame: 0,
             mv: [0, 0],
@@ -63646,8 +65699,8 @@ mod tests {
     fn r338_walker_reconstructs_warped_causal_block_pixels() {
         use crate::inter_pred::EIGHTTAP;
         use crate::{
-            reconstruct_inter_block, reconstruct_inter_block_warp, InterModeInfo, PlaneRefSpec,
-            RefFrameStoreEntry, WarpDriverParams,
+            InterModeInfo, PlaneRefSpec, RefFrameStoreEntry, WarpDriverParams,
+            reconstruct_inter_block, reconstruct_inter_block_warp,
         };
 
         // High-frequency reference so a sub-pel warp shift diverges from
@@ -63747,7 +65800,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 2,
         };
-        let mut walker = PartitionWalker::<i32>::new(2, 2, geom).unwrap();
+        let mut walker = PartitionWalker::new(2, 2, geom).unwrap();
         assert!(walker.curr_frame(0).is_none());
         let ref_spec = PlaneRefSpec {
             plane: 0,
@@ -63776,12 +65829,7 @@ mod tests {
 
         let (rows, cols) = walker.curr_frame_dims(0).unwrap();
         assert_eq!((rows, cols), (curr_h as u32, curr_w as u32));
-        let got: Vec<u16> = walker
-            .curr_frame(0)
-            .unwrap()
-            .iter()
-            .map(|&s| s as u16)
-            .collect();
+        let got: Vec<u16> = walker.curr_frame(0).unwrap().to_vec();
         assert_eq!(
             got, oracle,
             "the walker warp bridge must reconstruct warped pixels identically to the per-block driver"
@@ -63833,7 +65881,7 @@ mod tests {
         };
 
         // Out-of-range plane.
-        let mut w = PartitionWalker::<i32>::new(2, 2, geom).unwrap();
+        let mut w = PartitionWalker::new(2, 2, geom).unwrap();
         let bad_plane = PlaneRefSpec {
             plane: 3,
             subsampling_x: 0,
@@ -63860,7 +65908,7 @@ mod tests {
         ));
 
         // Negative origin.
-        let mut w2 = PartitionWalker::<i32>::new(2, 2, geom).unwrap();
+        let mut w2 = PartitionWalker::new(2, 2, geom).unwrap();
         let good_plane = PlaneRefSpec {
             plane: 0,
             subsampling_x: 0,
@@ -63897,10 +65945,10 @@ mod tests {
     /// overlap blend actually fired).
     #[test]
     fn r355_walker_reconstructs_obmc_block_pixels() {
-        use crate::inter_pred::{ObmcNeighbour, ObmcParams, PredictInterRef, EIGHTTAP};
+        use crate::inter_pred::{EIGHTTAP, ObmcNeighbour, ObmcParams, PredictInterRef};
         use crate::{
-            reconstruct_inter_block, reconstruct_inter_block_obmc, InterModeInfo, PlaneRefSpec,
-            RefFrameStoreEntry,
+            InterModeInfo, PlaneRefSpec, RefFrameStoreEntry, reconstruct_inter_block,
+            reconstruct_inter_block_obmc,
         };
 
         // High-frequency reference so a neighbour's shifted MV diverges
@@ -64033,7 +66081,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
         assert!(walker.curr_frame(0).is_none());
         let ref_spec = PlaneRefSpec {
             plane: 0,
@@ -64068,7 +66116,7 @@ mod tests {
         let mut got = vec![0u16; curr_w * curr_h];
         for i in 0..curr_h {
             for j in 0..curr_w {
-                got[i * curr_w + j] = plane[(8 + i) * cols as usize + (8 + j)] as u16;
+                got[i * curr_w + j] = plane[(8 + i) * cols as usize + (8 + j)];
             }
         }
         assert_eq!(
@@ -64086,7 +66134,7 @@ mod tests {
     /// [`crate::Error::PartitionWalkOutOfRange`].
     #[test]
     fn r355_walker_obmc_bridge_guards() {
-        use crate::inter_pred::{ObmcParams, EIGHTTAP};
+        use crate::inter_pred::{EIGHTTAP, ObmcParams};
         use crate::{InterModeInfo, PlaneRefSpec, RefFrameStoreEntry};
 
         let refp = vec![3u16; 16 * 16];
@@ -64127,7 +66175,7 @@ mod tests {
         };
 
         // Out-of-range plane.
-        let mut w = PartitionWalker::<i32>::new(2, 2, geom).unwrap();
+        let mut w = PartitionWalker::new(2, 2, geom).unwrap();
         let bad_plane = PlaneRefSpec {
             plane: 3,
             subsampling_x: 0,
@@ -64154,7 +66202,7 @@ mod tests {
         ));
 
         // Negative origin.
-        let mut w2 = PartitionWalker::<i32>::new(2, 2, geom).unwrap();
+        let mut w2 = PartitionWalker::new(2, 2, geom).unwrap();
         let good_plane = PlaneRefSpec {
             plane: 0,
             subsampling_x: 0,
@@ -64189,10 +66237,10 @@ mod tests {
     /// the translational SIMPLE fallback.
     #[test]
     fn r355_walker_obmc_left_pass_bridge() {
-        use crate::inter_pred::{ObmcNeighbour, ObmcParams, PredictInterRef, EIGHTTAP};
+        use crate::inter_pred::{EIGHTTAP, ObmcNeighbour, ObmcParams, PredictInterRef};
         use crate::{
-            reconstruct_inter_block, reconstruct_inter_block_obmc, InterModeInfo, PlaneRefSpec,
-            RefFrameStoreEntry,
+            InterModeInfo, PlaneRefSpec, RefFrameStoreEntry, reconstruct_inter_block,
+            reconstruct_inter_block_obmc,
         };
 
         let ref_w: usize = 48;
@@ -64311,7 +66359,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
         let ref_spec = PlaneRefSpec {
             plane: 0,
             subsampling_x: 0,
@@ -64341,7 +66389,7 @@ mod tests {
         let mut got = vec![0u16; curr_w * curr_h];
         for i in 0..curr_h {
             for j in 0..curr_w {
-                got[i * curr_w + j] = plane[(8 + i) * cols as usize + (8 + j)] as u16;
+                got[i * curr_w + j] = plane[(8 + i) * cols as usize + (8 + j)];
             }
         }
         assert_eq!(
@@ -64361,9 +66409,9 @@ mod tests {
     /// (half-extent) chroma `CurrFrame[1]` buffer.
     #[test]
     fn r355_walker_obmc_chroma_plane_bridge() {
-        use crate::inter_pred::{ObmcNeighbour, ObmcParams, PredictInterRef, EIGHTTAP};
+        use crate::inter_pred::{EIGHTTAP, ObmcNeighbour, ObmcParams, PredictInterRef};
         use crate::{
-            reconstruct_inter_block_obmc, InterModeInfo, PlaneRefSpec, RefFrameStoreEntry,
+            InterModeInfo, PlaneRefSpec, RefFrameStoreEntry, reconstruct_inter_block_obmc,
         };
 
         // Chroma reference plane (already subsampled — the bundle carries
@@ -64465,7 +66513,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
         let ref_spec = PlaneRefSpec {
             plane: 1,
             subsampling_x: 1,
@@ -64496,7 +66544,7 @@ mod tests {
         let mut got = vec![0u16; cw * ch];
         for i in 0..ch {
             for j in 0..cw {
-                got[i * cw + j] = plane[(4 + i) * cols as usize + (4 + j)] as u16;
+                got[i * cw + j] = plane[(4 + i) * cols as usize + (4 + j)];
             }
         }
         assert_eq!(
@@ -64518,10 +66566,10 @@ mod tests {
     #[test]
     fn r305_walker_reconstructs_compound_average_inter_block_pixels() {
         use crate::inter_pred::{
-            reconstruct_inter_block_compound, CompoundInterModeInfo, CompoundOrderHintContext,
-            EIGHTTAP,
+            CompoundInterModeInfo, CompoundOrderHintContext, EIGHTTAP,
+            reconstruct_inter_block_compound,
         };
-        use crate::{PlaneRefSpec, RefFrameStoreEntry, COMPOUND_AVERAGE};
+        use crate::{COMPOUND_AVERAGE, PlaneRefSpec, RefFrameStoreEntry};
 
         // Two §7.11.3.3 reference frames (one plane each, 16×16) with
         // distinct content so the two predictions genuinely differ.
@@ -64607,7 +66655,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 2,
         };
-        let mut walker = PartitionWalker::<i32>::new(2, 2, geom).unwrap();
+        let mut walker = PartitionWalker::new(2, 2, geom).unwrap();
         // Fresh walker: curr_frame[0] is unallocated. The compound bridge
         // must allocate it (no intra-half prerequisite).
         assert!(walker.curr_frame(0).is_none());
@@ -64639,12 +66687,7 @@ mod tests {
 
         let (rows, cols) = walker.curr_frame_dims(0).unwrap();
         assert_eq!((rows, cols), (curr_h as u32, curr_w as u32));
-        let got: Vec<u16> = walker
-            .curr_frame(0)
-            .unwrap()
-            .iter()
-            .map(|&s| s as u16)
-            .collect();
+        let got: Vec<u16> = walker.curr_frame(0).unwrap().to_vec();
         assert_eq!(
             got, oracle,
             "the walker bridge must reconstruct compound pixels identically to the per-block driver"
@@ -64659,7 +66702,7 @@ mod tests {
     #[test]
     fn r305_walker_compound_bridge_guards() {
         use crate::inter_pred::{CompoundInterModeInfo, CompoundOrderHintContext, EIGHTTAP};
-        use crate::{PlaneRefSpec, RefFrameStoreEntry, COMPOUND_AVERAGE};
+        use crate::{COMPOUND_AVERAGE, PlaneRefSpec, RefFrameStoreEntry};
 
         let refp = vec![0u16; 16 * 16];
         let entry = RefFrameStoreEntry {
@@ -64697,7 +66740,7 @@ mod tests {
         };
 
         // Out-of-range plane.
-        let mut w = PartitionWalker::<i32>::new(2, 2, geom).unwrap();
+        let mut w = PartitionWalker::new(2, 2, geom).unwrap();
         let bad_plane = PlaneRefSpec {
             plane: 3,
             subsampling_x: 0,
@@ -64733,7 +66776,7 @@ mod tests {
         };
 
         // Negative origin (rejected by reconstruct_inter_block_compound).
-        let mut w2 = PartitionWalker::<i32>::new(2, 2, geom).unwrap();
+        let mut w2 = PartitionWalker::new(2, 2, geom).unwrap();
         assert!(matches!(
             w2.reconstruct_inter_block_compound_into_curr_frame(
                 good_mode,
@@ -64752,7 +66795,7 @@ mod tests {
         ));
 
         // INTRA_FRAME RefFrame[1] (0): not a compound inter reference.
-        let mut w3 = PartitionWalker::<i32>::new(2, 2, geom).unwrap();
+        let mut w3 = PartitionWalker::new(2, 2, geom).unwrap();
         let intra_ref1 = CompoundInterModeInfo {
             ref_frame_0: last,
             ref_frame_1: 0,
@@ -64793,11 +66836,11 @@ mod tests {
     #[test]
     fn r306_walker_reconstructs_diffwtd_compound_block_multiplane() {
         use crate::inter_pred::{
-            reconstruct_inter_block_compound, CompoundInterModeInfo, CompoundOrderHintContext,
-            EIGHTTAP,
+            CompoundInterModeInfo, CompoundOrderHintContext, EIGHTTAP,
+            reconstruct_inter_block_compound,
         };
         use crate::{
-            block_height, block_width, PlaneRefSpec, RefFrameStoreEntry, COMPOUND_DIFFWTD,
+            COMPOUND_DIFFWTD, PlaneRefSpec, RefFrameStoreEntry, block_height, block_width,
         };
 
         // 4:2:0 reference planes: luma 16×16, chroma 8×8. Two distinct
@@ -64958,7 +67001,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 2,
         };
-        let mut walker = PartitionWalker::<i32>::new(2, 2, geom).unwrap();
+        let mut walker = PartitionWalker::new(2, 2, geom).unwrap();
         assert!(walker.curr_frame(0).is_none());
 
         let spec_y = PlaneRefSpec {
@@ -65003,24 +67046,9 @@ mod tests {
             )
             .expect("walker multi-plane compound reconstruction");
 
-        let got_y: Vec<u16> = walker
-            .curr_frame(0)
-            .unwrap()
-            .iter()
-            .map(|&s| s as u16)
-            .collect();
-        let got_cb: Vec<u16> = walker
-            .curr_frame(1)
-            .unwrap()
-            .iter()
-            .map(|&s| s as u16)
-            .collect();
-        let got_cr: Vec<u16> = walker
-            .curr_frame(2)
-            .unwrap()
-            .iter()
-            .map(|&s| s as u16)
-            .collect();
+        let got_y: Vec<u16> = walker.curr_frame(0).unwrap().to_vec();
+        let got_cb: Vec<u16> = walker.curr_frame(1).unwrap().to_vec();
+        let got_cr: Vec<u16> = walker.curr_frame(2).unwrap().to_vec();
         assert_eq!(got_y, oy, "Y plane must match the shared-mask oracle");
         assert_eq!(got_cb, ocb, "Cb plane must match the shared-mask oracle");
         assert_eq!(got_cr, ocr, "Cr plane must match the shared-mask oracle");
@@ -65069,7 +67097,7 @@ mod tests {
     #[test]
     fn r306_walker_compound_multiplane_bridge_guards() {
         use crate::inter_pred::{CompoundInterModeInfo, CompoundOrderHintContext, EIGHTTAP};
-        use crate::{PlaneRefSpec, RefFrameStoreEntry, COMPOUND_AVERAGE};
+        use crate::{COMPOUND_AVERAGE, PlaneRefSpec, RefFrameStoreEntry};
 
         let refp = vec![0u16; 16 * 16];
         let entry = RefFrameStoreEntry {
@@ -65129,7 +67157,7 @@ mod tests {
         ];
 
         // Invalid num_planes (2).
-        let mut w = PartitionWalker::<i32>::new(2, 2, geom).unwrap();
+        let mut w = PartitionWalker::new(2, 2, geom).unwrap();
         assert!(matches!(
             w.reconstruct_inter_block_compound_multiplane_into_curr_frame(
                 good_mode,
@@ -65148,7 +67176,7 @@ mod tests {
         ));
 
         // Out-of-range mi_size.
-        let mut w2 = PartitionWalker::<i32>::new(2, 2, geom).unwrap();
+        let mut w2 = PartitionWalker::new(2, 2, geom).unwrap();
         assert!(matches!(
             w2.reconstruct_inter_block_compound_multiplane_into_curr_frame(
                 good_mode,
@@ -65167,7 +67195,7 @@ mod tests {
         ));
 
         // plane_specs too short for num_planes (1 spec, num_planes 3).
-        let mut w3 = PartitionWalker::<i32>::new(2, 2, geom).unwrap();
+        let mut w3 = PartitionWalker::new(2, 2, geom).unwrap();
         let one_spec = [PlaneRefSpec { plane: 0, ..spec }];
         assert!(matches!(
             w3.reconstruct_inter_block_compound_multiplane_into_curr_frame(
@@ -65187,7 +67215,7 @@ mod tests {
         ));
 
         // INTRA_FRAME RefFrame[1] (driver rejects on the first plane).
-        let mut w4 = PartitionWalker::<i32>::new(2, 2, geom).unwrap();
+        let mut w4 = PartitionWalker::new(2, 2, geom).unwrap();
         let intra_ref1 = CompoundInterModeInfo {
             ref_frame_1: 0,
             ..good_mode
@@ -65220,7 +67248,7 @@ mod tests {
     #[test]
     fn r307_walker_reconstructs_single_ref_block_multiplane() {
         use crate::inter_pred::EIGHTTAP;
-        use crate::{block_height, block_width, InterModeInfo, PlaneRefSpec, RefFrameStoreEntry};
+        use crate::{InterModeInfo, PlaneRefSpec, RefFrameStoreEntry, block_height, block_width};
 
         // 4:2:0 reference planes: luma 16×16, chroma 8×8.
         let build_plane = |w: usize, h: usize, a: usize, b: usize, c: usize| -> Vec<u16> {
@@ -65339,7 +67367,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 2,
         };
-        let mut walker = PartitionWalker::<i32>::new(2, 2, geom).unwrap();
+        let mut walker = PartitionWalker::new(2, 2, geom).unwrap();
         assert!(walker.curr_frame(0).is_none());
 
         let spec_y = PlaneRefSpec {
@@ -65383,30 +67411,15 @@ mod tests {
             )
             .expect("walker multi-plane single-ref reconstruction");
 
-        let got_y: Vec<u16> = walker
-            .curr_frame(0)
-            .unwrap()
-            .iter()
-            .map(|&s| s as u16)
-            .collect();
-        let got_cb: Vec<u16> = walker
-            .curr_frame(1)
-            .unwrap()
-            .iter()
-            .map(|&s| s as u16)
-            .collect();
-        let got_cr: Vec<u16> = walker
-            .curr_frame(2)
-            .unwrap()
-            .iter()
-            .map(|&s| s as u16)
-            .collect();
+        let got_y: Vec<u16> = walker.curr_frame(0).unwrap().to_vec();
+        let got_cb: Vec<u16> = walker.curr_frame(1).unwrap().to_vec();
+        let got_cr: Vec<u16> = walker.curr_frame(2).unwrap().to_vec();
         assert_eq!(got_y, oy, "Y plane must match the per-block oracle");
         assert_eq!(got_cb, ocb, "Cb plane must match the per-block oracle");
         assert_eq!(got_cr, ocr, "Cr plane must match the per-block oracle");
 
         // num_planes == 1 reconstructs only luma; chroma untouched.
-        let mut wluma = PartitionWalker::<i32>::new(2, 2, geom).unwrap();
+        let mut wluma = PartitionWalker::new(2, 2, geom).unwrap();
         wluma
             .reconstruct_inter_block_multiplane_into_curr_frame(
                 mode_info,
@@ -65421,12 +67434,7 @@ mod tests {
                 EIGHTTAP,
             )
             .expect("luma-only multi-plane single-ref reconstruction");
-        let luma_only: Vec<u16> = wluma
-            .curr_frame(0)
-            .unwrap()
-            .iter()
-            .map(|&s| s as u16)
-            .collect();
+        let luma_only: Vec<u16> = wluma.curr_frame(0).unwrap().to_vec();
         assert_eq!(luma_only, oy, "luma-only Y plane must match the oracle");
         assert!(
             wluma.curr_frame(1).is_none(),
@@ -65489,7 +67497,7 @@ mod tests {
         ];
 
         // Invalid num_planes (2).
-        let mut w = PartitionWalker::<i32>::new(2, 2, geom).unwrap();
+        let mut w = PartitionWalker::new(2, 2, geom).unwrap();
         assert!(matches!(
             w.reconstruct_inter_block_multiplane_into_curr_frame(
                 good_mode,
@@ -65507,7 +67515,7 @@ mod tests {
         ));
 
         // Out-of-range mi_size.
-        let mut w2 = PartitionWalker::<i32>::new(2, 2, geom).unwrap();
+        let mut w2 = PartitionWalker::new(2, 2, geom).unwrap();
         assert!(matches!(
             w2.reconstruct_inter_block_multiplane_into_curr_frame(
                 good_mode,
@@ -65525,7 +67533,7 @@ mod tests {
         ));
 
         // plane_specs too short for num_planes (1 spec, num_planes 3).
-        let mut w3 = PartitionWalker::<i32>::new(2, 2, geom).unwrap();
+        let mut w3 = PartitionWalker::new(2, 2, geom).unwrap();
         let one_spec = [PlaneRefSpec { plane: 0, ..spec }];
         assert!(matches!(
             w3.reconstruct_inter_block_multiplane_into_curr_frame(
@@ -65544,7 +67552,7 @@ mod tests {
         ));
 
         // INTRA_FRAME RefFrame[0] (driver rejects on the first plane).
-        let mut w4 = PartitionWalker::<i32>::new(2, 2, geom).unwrap();
+        let mut w4 = PartitionWalker::new(2, 2, geom).unwrap();
         let intra_ref0 = InterModeInfo {
             ref_frame: 0,
             ..good_mode
@@ -65705,7 +67713,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
         // §5.11.46 palette stamped at the block anchor (0, 0): 3 colours.
         walker
             .stamp_palette_for_test(0, 0, 0, &[11, 22, 33])
@@ -65731,7 +67739,11 @@ mod tests {
         for i in 0..4usize {
             for j in 0..4usize {
                 let idx = map.data[i * 4 + j] as usize;
-                assert_eq!(cf[i * cols + j], pal[idx], "({i},{j}) must be palette[map]");
+                assert_eq!(
+                    i32::from(cf[i * cols + j]),
+                    pal[idx],
+                    "({i},{j}) must be palette[map]"
+                );
             }
         }
         // Samples outside the 4×4 block stay zero.
@@ -65750,7 +67762,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
         walker
             .stamp_palette_for_test(0, 0, 0, &[7, 70, 140])
             .unwrap();
@@ -65779,7 +67791,7 @@ mod tests {
             for j in 0..8usize {
                 let idx = map.data[i * map.stride + j] as usize;
                 assert_eq!(
-                    cf[i * cols + j],
+                    i32::from(cf[i * cols + j]),
                     pal[idx],
                     "({i},{j}) palette sample after 2×2 TU tiling"
                 );
@@ -65798,7 +67810,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
         // V plane (plane 2) palette at (0, 0).
         walker.stamp_palette_for_test(2, 0, 0, &[3, 9]).unwrap();
         let map = DecodedPaletteMap {
@@ -65820,7 +67832,7 @@ mod tests {
         for i in 0..4usize {
             for j in 0..4usize {
                 let idx = map.data[i * 4 + j] as usize;
-                assert_eq!(cf[i * cols as usize + j], pal[idx]);
+                assert_eq!(i32::from(cf[i * cols as usize + j]), pal[idx]);
             }
         }
     }
@@ -65836,7 +67848,7 @@ mod tests {
             mi_col_start: 0,
             mi_col_end: 4,
         };
-        let mut walker = PartitionWalker::<i32>::new(4, 4, geom).unwrap();
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
         let map = DecodedPaletteMap {
             data: vec![0u8; 16],
             stride: 4,

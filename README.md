@@ -7,39 +7,62 @@ built from the public AV1 Bitstream & Decoding Process Specification.
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework.
 
-## WebAssembly SIMD128
+## Explicit SIMD kernels
 
-`wasm32` builds with `+simd128` select explicit SIMD kernels for CDEF,
-motion-compensation convolution, clipped prediction/compound averaging,
-motion-field destination projection, Wiener restoration, and inverse transforms.
-Other architectures keep their existing dispatch. Transform rotations split
-signed inputs into a high quotient and a nonnegative 12-bit remainder; this
-preserves the scalar widened multiply/round exactly without expensive SIMD i64
-multiplication. Differential tests also cover full-i32 split-product extrema.
+Four stages run in explicit 128-bit lanes on top of the portable kernels,
+which stay in place as the fallback and as the reference the lanes are tested
+against (`src/*/simd_tests.rs`):
 
-Run the library tests with Node's WASI preview1 host (Node 22 or newer):
+- **CDEF (§7.15)** — the interior filter rows (eight signed 16-bit lanes,
+  straight from 8- or 16-bit sample storage) and the direction search's
+  projection sums. NEON and SIMD128.
+- **Deblocking (§7.14.6)** — the four columns of a horizontal edge at once:
+  masks, the narrow filter and both wide filters, loading and storing only the
+  rows the filter size reaches. NEON and SIMD128.
+- **Inter prediction (§7.11.3)** — the horizontal pass of the 8-tap convolution
+  for blocks 8 samples wide and up (widening 16-bit multiply-accumulates
+  straight from the 16-bit reference rows), and the final `Clip1` of a single
+  prediction and of the rounded average of two. NEON.
+- **Inverse transform (§7.13.3)** — four rows, then four columns, of a lossy
+  block per 1-D transform (DCT, ADST and identity; 32-bit lanes, 64-bit
+  products), the DCT replaying the butterfly schedule recorded for the portable
+  lane kernels. NEON. A DC-only `DCT_DCT` block takes a closed form on every
+  target.
+
+`aarch64` uses NEON (`src/*/neon.rs`): each entry point checks for the feature
+at run time — a constant on the AArch64 targets, where NEON is baseline — and
+falls back to the portable kernel. `wasm32` built with `+simd128` uses SIMD128
+(`src/*/wasm.rs`) for the two in-loop stages; WebAssembly has no run-time
+detection, so that choice is made at compile time. Every other target runs the
+portable kernels. Output is byte-identical in all three configurations.
+
+The registry decoder also implements `Decoder::output_video_dimensions`, a
+method of the `oxideav-core` revision the embedding application pins. Build the
+crate standalone with the same dependency patch, for example:
+
+```sh
+cargo test --release \
+  --config 'patch.crates-io.oxideav-core.git="https://github.com/ayooooo123/oxideav-core"' \
+  --config 'patch.crates-io.oxideav-core.rev="<the revision the application pins>"'
+```
+
+Run the library tests on WebAssembly with Node's WASI preview1 host (Node 22
+or newer), adding the same `--config` pair. The target has no threads, so the
+two unit tests that start one are skipped:
 
 ```sh
 export RUSTFLAGS="-C target-feature=+simd128"
 export CARGO_TARGET_WASM32_WASIP1_RUNNER="node $PWD/run-wasi.mjs"
-cargo test --release --target wasm32-wasip1 --lib -- --test-threads=1
-```
-
-Use the same `oxideav-core` dependency patch as the embedding application when
-building the fork standalone. For PearTube this is:
-
-```sh
-cargo test --release --target wasm32-wasip1 --lib \
-  --config 'patch.crates-io.oxideav-core.git="https://github.com/ayooooo123/oxideav-core"' \
-  --config 'patch.crates-io.oxideav-core.rev="979d7e32865f1cbd028171637922423da595d15e"' \
-  -- --test-threads=1
+cargo test --release --target wasm32-wasip1 --lib -- --test-threads=1 \
+  --skip decoder::ref_planes::tests::dropped_writer_fails_waiters \
+  --skip decoder::ref_planes::tests::threaded_rows_arrive_in_order
 ```
 
 `examples/hash_ivf.rs` and `hash-wasi.mjs` hash every decoded picture with SHA-256,
 including every byte of 10/12-bit planes, before display conversion. Build the
 example for `wasm32-wasip1`, once with `RUSTFLAGS="-C target-feature=-simd128"`
 and once with `RUSTFLAGS="-C target-feature=+simd128"`; save the scalar executable
-before the second build. Pass the same dependency patch to both builds:
+before the second build:
 
 ```sh
 cargo build --release --target wasm32-wasip1 --example hash_ivf
@@ -51,15 +74,8 @@ cmp /tmp/scalar-pictures.json /tmp/simd-pictures.json
 
 The JSON records contain each picture's full-plane byte count and hash in
 display order. Matroska inputs can be remuxed to IVF with `ffmpeg -c copy`;
-no pixel conversion or re-encoding is needed.
-
-Native frame workers share one bounded worker grant with independent deblock,
-CDEF and restoration bands. Idle frame capacity is borrowed only for the duration
-of a filter pass, then returned with a channel notification so ready frames can
-start without polling. `hash_ivf input.ivf N` selects a native thread budget for
-per-picture comparisons; omitting `N` retains the single-threaded hash path.
-
-
+no pixel conversion or re-encoding is needed. Natively, `hash_ivf input.ivf N`
+decodes under a budget of `N` workers; omitting `N` decodes serially.
 
 ## Status
 
@@ -1966,16 +1982,148 @@ deblock trials. The threaded walk runs each tile on tile-sized state
 coefficient storage in the committed trees (69 MiB dense before),
 lazy local-warp grid, stripe-boundary rows instead of a pre-CDEF
 frame copy, band-sampled deblock trials. Every stream decodes to the
-encoder's reconstruction sample for sample. Decoder reconstruction and
-in-loop filtering now use monomorphized native planes: `u8` at 8 bits,
-`u16` at 10/12 bits. Immutable reference snapshots use the same storage,
-and inter prediction borrows the destination directly without a full-frame
-representation mirror. Sequence headers select the specialization once;
-frame workers retain that selection with their immutable sequence snapshot.
-At 1080p 4:2:0, one cropped plane set holds 3,110,400 bytes at 8 bits or
-6,220,800 bytes at 10/12 bits, instead of 12,441,600 working bytes before.
-Transform and interpolation intermediates retain their specification widths.
-Owned output byte planes move into core frames without an additional copy.
+encoder's reconstruction sample for sample; the decoder's resident
+set is three frame-sized `i32` in-loop buffers plus the mirror
+(`PlaneBuffer<i32>` kernels — a `u16` pipeline is the next step
+towards the 120 MiB target).
+
+#### Still-picture memory (r479) — the resident set is a window, not the picture
+
+Measured with `examples/encode_bench` (a counting allocator samples
+its live bytes, its high-water mark since the previous boundary and
+the process RSS at every boundary the encoder's stage probe fires —
+`encoder::stage_probe`, doc-hidden; `--trace N` prints every
+allocation of at least `N` MiB with its stage, `--sample N` buckets
+every `N`-th allocation by call site) on the same 4032 × 3024 device
+sample the AVIF crate measures (`docs/image/heif/device-samples/
+iphone_13_pro_max.HEIC` decoded by a black-box tool to 8-bit 4:2:0,
+10-bit 4:2:0 and 8-bit 4:4:4), `base_q_idx = 102` (`quality = 60`),
+`Fast`, one item; `/usr/bin/time -l` peak RSS around a process that
+holds the raw bytes plus the `u16` frame (52 MiB at 8-bit 4:2:0 —
+the two copies the AVIF registry bench holds too) and nothing else.
+The 0.1.21 encoder measured 448 / 563 / 573 MiB at 1 / 4 / 8 workers
+here, which reconciles the two earlier figures: the AVIF crate's
+465 / 553 / 607 MiB (r478, `quality = 60`, 0.1.21) and the r464 table
+above (378 / 474 / 489 MiB at `base_q_idx = 128` on 0.1.19 — the
+quantiser moves the committed trees, and 0.1.21 at `q = 128` measures
+431 MiB on one worker).
+
+**Where the bytes were** (0.1.21, 8-bit 4:2:0, peak of the live
+allocation during each stage; the harness's 52 MiB included):
+
+| Stage | 1 worker | 4 workers | 8 workers | Owner |
+|---|---|---|---|---|
+| frame state | 126 | 126 | 126 | `u16` reconstruction 36 MiB + the syntax mirror (`PartitionWalker`, 53 bytes per mi) 37 MiB — allocated before the search on every path |
+| tile search | 230 | 343 | 343 | per worker: the source cropped to the tile, a tile reconstruction, a tile mirror, the rate twin's clone of it (one picture's worth of each across the workers) + the committed trees (47 MiB: boxed `SyntaxBlock`s + 8 bytes per non-zero coefficient, over-capacity vectors) |
+| §7.14 deblock election | 268 | 268 | 268 | a frame-sized `i32` copy of the luma plane (46 MiB) + a `u16` result (23 MiB) per trial, eight trials |
+| §7.15 CDEF election + apply | 268 | 268 | 268 | the replay's second frame-scope mirror (37 MiB) + every unit's filtered rectangles held as `i32` (70 MiB) before the first write-back |
+| §7.17 restoration election + apply | 249 | 242 | 239 | the replay's mirror again + a frame-sized `u16` copy of each plane under restoration |
+
+**What moved** (every change byte-identical: eleven configurations
+pinned against 0.1.21 — 8-bit 4:2:0 at 1 / 4 / 8 workers `Fast` and
+1 / 8 `Balanced`, 10-bit 4:2:0 and 8-bit 4:4:4 at 1 / 4 / 8):
+
+* The §7.14 election runs its trials and its final filter on ROW
+  WINDOWS (`lf_elect`): the sampled probe keeps the r464 semantics
+  (both passes over the band's edges, the rows around the band
+  unfiltered, `i32` for one band plus 16-row skirts); the exact
+  frame process is a rolling window — pass 0 (vertical edges) is
+  applied to rows as they enter, pass 1 (horizontal edges) band by
+  band in §7.14.1 order, and a row leaves once no later edge reaches
+  it (an edge at row `e` reads `e - 7 ..= e + 6` and writes
+  `e - 6 ..= e + 5`, §7.14.6.2 / §7.14.6.4). Applied in place.
+* The §7.15 apply writes a superblock row back once the next row's
+  windows are built (§7.15 reads unfiltered samples up to 8 luma rows
+  past a unit); the §7.17 apply parks one stripe's outputs (a
+  rectangle reaches `LOCAL_MARGIN = 4` rows into the neighbouring
+  stripes).
+* The committed trees ride a compact form (`encoder::committed_tree`):
+  a pre-order shape string, a 32-byte record per leaf, one arena of
+  transform-unit headers and one of `(raster index, value)` pairs at
+  4 bytes each (values outside `i16` escape to a side table), a full
+  `SyntaxBlock` only for palette / intra-block-copy / inter /
+  variable-transform / delta-lf leaves; the CDEF and restoration
+  re-emissions expand one superblock at a time. 47 → 16 MiB.
+* `PartitionWalker` materialises `Mvs[]`, `InterpFilters[]`, the
+  §5.11.27-29 side-data grids, `DeltaLFs[]` and `LocalValid[]` lazily
+  — only an inter or intra-block-copy leaf stamps them, every reader
+  treats the empty grid as its pre-fill, and the encoder's snapshot /
+  restore / tile-import paths skip them while they are absent. 53 →
+  32 bytes per mi on an intra walker; the encoder keeps up to four
+  alive (frame, tile, twin, replay), the decoder one.
+* The threaded tile-local walk builds the frame-scope reconstruction
+  and mirror AFTER the search (they are only stitched into); each
+  re-emission receives the previous mirror by value and drops it
+  before building its own.
+* The search reads the source through `SourceView` (window-local
+  coordinates over the frame's planes) and copies each superblock's
+  samples into contiguous per-worker scratch (`SbSource`, 12 KiB)
+  before its RD search — no per-tile crop, and no 8 KiB-stride reads
+  from eight workers (that alone cost the threaded walk 10 %).
+
+**After** (same harness; the rows the AVIF crate's table carries, re-
+measured on 0.1.21 and on this round, interleaved on the same machine
+under the same load; wall = best of two):
+
+| Layout | Workers | Wall 0.1.21 → r479 | Peak live r479 (search / deblock / CDEF / LR stage) | Peak RSS 0.1.21 → r479 | Bytes |
+|---|---|---|---|---|---|
+| 8-bit 4:2:0 | 1 | 7.71 → 7.42 s | 153 (153 / 127 / 129 / 151) | 448 → 221 MiB | 1 953 597 |
+| 8-bit 4:2:0 | 4 | 3.02 → 2.96 s | 180 (180 / 129 / 141 / 144) | 563 → 247 MiB | 1 964 984 |
+| 8-bit 4:2:0 | 8 | 3.02 → 3.00 s | 181 (181 / 130 / 141 / 151) | 573 → 259 MiB | 1 982 434 |
+| 8-bit 4:2:0 `Balanced` | 1 | 19.0 → 17.8 s | 151 | 462 → 237 MiB | 1 804 505 |
+| 8-bit 4:2:0 `Balanced` | 8 | 6.2 → 6.0 s | 179 | 574 → 270 MiB | 1 820 873 |
+| 10-bit 4:2:0 | 1 | 7.61 → 7.21 s | 170 | 440 → 229 MiB | 1 986 994 |
+| 10-bit 4:2:0 | 4 | 3.07 → 3.02 s | 198 | — → 264 MiB | 1 998 342 |
+| 10-bit 4:2:0 | 8 | 2.73 → 2.70 s | 198 | 601 → 276 MiB | 2 015 980 |
+| 8-bit 4:4:4 | 1 | 11.15 → 10.88 s | 249 | 666 → 309 MiB | 2 186 191 |
+| 8-bit 4:4:4 | 4 | 4.11 → 4.11 s | 304 | — → 382 MiB | 2 200 731 |
+| 8-bit 4:4:4 | 8 | 3.82 → 3.78 s | 304 | 895 → 388 MiB | 2 222 521 |
+
+(The harness holds 70 MiB of the 10-bit rows and 105 MiB of the 4:4:4
+rows. This machine was shared with other builds during the round, so
+the 4-worker and 8-worker walls do not reach the r464 table's idle-
+machine figures; the before / after pairs ran back to back.)
+
+**What stays, and why.** The resident set at 8 workers on 8-bit 4:2:0
+is now 52 (harness) + 36 (frame `u16` reconstruction) + 23 (frame
+mirror) + 36 (eight tile reconstructions) + 23 + 23 (eight tile
+mirrors and their rate twins) + 16 (trees) MiB during the search:
+
+* The frame-scope reconstruction has to exist in full before the
+  §7.4 in-loop chain: §7.14 reads reconstructed samples across tile
+  boundaries, §7.15 reads deblocked samples 8 rows past a unit, §7.17
+  reads CDEF output across unit boundaries and pre-CDEF samples at
+  stripe skirts — each stage consumes the previous stage's complete
+  output, so the planes cannot be windowed below one frame without
+  changing the order the samples are produced in (the elections then
+  measure different distortions).
+* The committed trees must be retained until the last re-emission:
+  the §8.2 arithmetic coder's state is continuous across a tile, so
+  stamping the §5.11.56 `cdef_idx` literals or interleaving the
+  §5.11.57 `write_lr` symbols means re-running the writer from the
+  tile's first symbol.
+* A worker's tile reconstruction and mirror are the tile's §5.11
+  state; eight tiles in flight on eight workers are one picture's
+  worth of each by construction. The rate twin needs its own mirror
+  because it commits and restores trial subtrees.
+* Samples are `u16` at every bit depth (`ReconState`, the recon the
+  API returns, the mirrors' plane views): an 8-bit storage path for
+  8-bit layouts would take 18 MiB off the frame reconstruction and 18
+  off the tile reconstructions at 8 workers — the next step, left
+  for a round that can touch every sample access in the search.
+* On this platform freed memory stays in the allocator's zones
+  (medium-size chunks are retained per thread and only reused by
+  same-sized requests), so peak RSS runs 40–80 MiB above the peak
+  live allocation; the gap is the eight workers' freed tile state
+  plus the per-unit scratch of the threaded elections.
+
+For the AVIF crate: a single 12 MP item now costs 259 MiB at 8
+workers against its 512-pixel grid's 162 MiB (+2.8 % bytes), and a
+1024-pixel 4 × 3 grid's 299 MiB — the `auto` threshold could rise from
+1 MP to the point where the single item and the grid meet (about
+4 MP at 8 workers: the single item's resident set is ~95 MiB plus the
+per-worker tile state, the grid's is per tile), and the 1024-pixel
+grid is no longer cheaper than the single item.
 
 **Any extent** (r460): a picture whose width / height is not a
 multiple of 8 — 257×131, 7×3, 1×1 — is replicated out to the §5.9.5
@@ -1983,7 +2131,22 @@ mi grid internally (the decoder reconstructs every mi block in full,
 so the encoder's reconstruction and neighbour mirror span the padded
 extent), coded under its TRUE `frame_size` / sequence maximum / §7.17
 restoration geometry, and the returned reconstruction is cropped back
-(chroma at the rounded-up `(w + ss_x) >> ss_x` extent). The per-axis
+(chroma at the rounded-up `(w + ss_x) >> ss_x` extent). r487: the
+same holds on every multi-frame entry — the plain GOP, the B-pyramid
+and adaptive mini-GOP drivers, the temporal ladder, spatial layers
+with and without inter-layer prediction and the spatial × temporal
+product (layers may mix on-grid and off-grid extents) — where each
+reference plane is additionally replicated out from its TRUE extent
+(§7.11.3.3 clamps every reference fetch to the reference's last
+column / row; the §7.11.3.3 scale factors and the §6.8.2 bounds use
+the true extents), and on the framework (registry) encoder, whose
+construction-time probe used to demand multiples of 8 the encode never
+needed. `tests/off_grid_extents.rs` runs odd / ×2 / ×4 / one-axis /
+sub-mi-block extents × 8- and 10-bit 4:2:0 / 4:4:4 (plus 4:2:2 and
+monochrome on the plain GOP) through this crate's decoder and a
+black-box decoder. The §5.9.8 superres elections and the
+exactness-demand rectangles stay on-grid arms (an off-grid GOP simply
+does not arm them). The per-axis
 ceiling is `KEY_FRAME_MAX_DIM = 16384` (Annex A level 6.x
 `MaxHSize`). Odd-extent stills decode byte-identical through two
 independent black-box reference decoders, and wrapped into AVIF by a
@@ -2039,6 +2202,414 @@ session before the first packet, so an `av01` item / sample whose
 payload omits the sequence header still decodes (a payload that
 repeats it simply re-caches it). Item payloads with or without a
 leading temporal delimiter decode alike.
+
+**Mid-stream shape changes** (r482, oxideav-core 0.1.43): the
+framework decoder states its output at the stream level
+(`output_params()`: the planes' size `UpscaledWidth × FrameHeight`,
+the pixel layout, the colour signal, the §5.5.3 picture rate) and
+announces every later change in band: `receive_frame` returns one
+`Frame::StreamParams` event — payload equal to `output_params()`,
+`output_params_generation()` already moved — immediately before the
+first frame of the new shape. That covers a new sequence header
+(bit depth, subsampling, monochrome, colour, rate) and a new frame
+size inside one sequence (§5.9.5 `frame_size_override_flag`, §5.9.7
+`frame_size_with_refs`, superres on a resized frame, a §7.21
+`show_existing_frame` of a slot at another size). Superres alone is
+not a change: the emitted size is the upscaled one. The §5.9.6 render
+size is not the emitted size. Frames are queued in output order, so
+every old-shape frame (still decoding on a worker or not) comes out
+first, at every worker budget and while draining after `flush()`; no
+event for the first shape or a constant stream; after `reset()` the
+next frame is compared against the last shape announced. Pinned on the
+corpus (every stream through the registry decoder at 1 / 2 / 3 / 8
+workers: the eight streams with size changes get one event per change,
+the rest none, frames byte-identical) and on five black-box `aomenc` /
+`SvtAv1EncApp` resize / superres streams in `tests/stream_params.rs`
+(byte-identical to two independent reference decoders). The encoder
+rejects the event with `Error::Unsupported` (its coded size and
+sequence header are fixed at construction).
+
+#### Still-image decode budgets (r475)
+
+Measured on a 4032×3024 (12 MP) 8-bit 4:2:0 single-frame AV1 stream
+from a third-party encoder (`cpu-used 6`, `cq-level 32`, deblock +
+CDEF + loop restoration on, one tile), release build, Apple M4 Max.
+`examples/decode_bench` prints the wall per §7.4 stage through the
+direct session (`SpecDecodeSession::last_stage_timings`) and the
+end-to-end wall through the registry decoder (the path a HEIF / AVIF
+consumer takes) with a digest of the output planes; peak RSS is
+`/usr/bin/time -l` on the registry path alone (`mode=registry`; the
+harness holds 0.2 MiB of source). Every row decodes byte-identical to
+the previous one and to two black-box reference decoders.
+
+| Step | Threads | Wall | Peak RSS | Stage split (ms) |
+|---|---|---|---|---|
+| r474 (0.1.20) | 1 | 0.640 s | 320 MiB | parse 0 · tiles 190 · deblock 164 · CDEF 225 · LR 55 · store 1 · output 1 |
+| hot loops: interior CDEF kernel, sliding-window wide filter, stack DCT scratch | 1 | 0.361 s | 320 MiB | tiles 128 · deblock 81 · CDEF 82 · LR 51 |
+| buffers: in-place CDEF (rolling window) + in-place LR (stripe copy + boundary rows), walker released before output, no output clone, still-header store skip | 1 | 0.344 s | 188 MiB (AVIF `reduced_still_picture_header`: 179 MiB, peak live 156 MiB) | tiles 129 · deblock 83 · CDEF 72 · LR 42 |
+| threads: tile-parallel intra walk + band-parallel deblock / CDEF / LR (tiled AVIF payload, 4 tiles) | 1 | 0.312 s | 181 MiB (peak live 156 MiB) | tiles 143 · deblock 101 · CDEF 49 |
+| | 2 | 0.186 s | peak live 202 MiB | tiles 88 · deblock 52 · CDEF 27 |
+| | 4 | 0.122 s | peak live 236 MiB | tiles 61 · deblock 27 · CDEF 15 |
+| | 8 | 0.097 s | 321 MiB (peak live 270 MiB) | tiles 51 · deblock 16 · CDEF 10 |
+| same, 8-tile IVF still with loop restoration | 1 / 2 / 4 / 8 | 0.328 / 0.187 / 0.119 / 0.092 s | peak live 160 / 204 / 240 / 289 MiB | 8 workers: tiles 41 · deblock 13 · CDEF 13 · LR 5 |
+
+The worker budget is the core `ExecutionContext` the caller grants
+through `set_execution_context` (`SpecDecodeSession::set_threads` on
+the direct API); the bytes equal the serial decode for any budget
+(`tests/decode_threads.rs`), the allocation budget is pinned by
+`tests/decode_alloc_budget.rs`. Where the time goes at one thread
+now: the §5.11 tile walk ~45 % (symbol decoding, inverse transforms,
+intra prediction, reconstruction merge), §7.14 deblocking ~30 %,
+§7.15 CDEF ~16 %, §7.17 restoration ~10 %. Still open: the per-mi
+grids (~45 MiB at 12 MP; `palette_colors` is 35 MiB of them whenever
+palette is enabled) and the `i32` `CurrFrame` (73 MiB; a `u16`
+pipeline would halve it), the per-tile state of the parallel walk
+(one tile-sized walker per worker in flight), and NEON / AVX2
+kernels for CDEF and deblocking.
+
+#### Frame-parallel video decode (r480)
+
+Under a worker budget every frame decodes on a worker thread as soon
+as its tiles are in. The split that makes this exact: everything a
+later frame's HEADER reads from a reference slot — the §5.9.2 order
+hints, frame sizes and `RefFrameType`, §7.20 `SavedGmParams`, the
+saved loop-filter deltas and segmentation parameters — is derived
+from the storing frame's own header, so the session updates its
+`RefInfo` as each header is parsed and the parse never waits for a
+decode. The §7.20 payload (planes, §7.19 motion field, CDFs, segment
+ids, grain state) lives in a per-slot cell the decode fills in later;
+a worker waits for exactly the slots its frame reads (the seven
+`ref_frame_idx` entries, which cover the primary reference, and a
+predicted film-grain source) and then decodes from the same inputs as
+the serial decode. A `show_existing_frame` output waits on its slot's
+cell. At most `4 × threads` frames are in flight and at most
+`threads` decode at once — a frame waiting on its references holds no
+worker — so the independent branches of a hierarchical group and the
+next group's anchor decode together. Inside each frame the r475
+tile-parallel walk and band-parallel deblock / CDEF / restoration
+still run on the same budget (forcing them serial under frame
+parallelism costs 15–35 %). A failed or panicking worker marks its
+slot failed (readers error instead of hanging), the panic is
+re-raised to the caller, and a hidden frame's error surfaces at the
+next frame the session admits.
+
+`SpecDecodeSession::decode_temporal_unit_pipelined` returns the shown
+frames as `PendingSpecFrame`s (`into_frame` waits); the registry
+decoder queues them in output order and answers `NeedMore` while the
+head is still decoding (until `flush`). `decode_temporal_unit` and the
+serial budget decode in line as before.
+
+1920×1080 8-bit 4:2:0, 120 frames, SVT-AV1 preset 8 (one tile,
+16-frame hierarchical groups), release build, Apple M4-class, one
+temporal unit per packet (`examples/decode_bench … stream=1`), best
+of two; every frame byte-identical to `dav1d` at every budget:
+
+| Step | 1 worker | 2 | 4 | 8 | Peak live (1 / 8) |
+|---|---|---|---|---|---|
+| 0.1.21 | 28.7 fps | | | 28.6 fps | 95 MiB |
+| #27 interior taps + `i32` sums, #28 phase-0 paths, #30 row-slice mirror | 48.4 fps | | | 51 fps | |
+| #31 non-reference frames on workers | 50 fps | 79 | | 84 | |
+| #32 every frame on a worker | 50 fps | 83 | 132 | 170 | 95 / 373 MiB |
+
+The 8-worker run keeps about four cores busy: a frame starts only
+when its references have finished every in-loop pass, so the
+hierarchical chain sets the pace and faster per-frame decode raises
+the threaded rate in proportion. A 1080p libaom stream with two tile
+columns goes 33 → 87 fps at 8 workers.
+
+#### Row-granular frame-parallel decode (r481)
+
+Under a worker budget a frame that later frames read is decoded in two
+walks. The first is syntax only (every symbol read and every
+mode-info / context grid stamped exactly as in the full walk — AV1
+parsing never reads a sample — but nothing predicted or reconstructed);
+it stores the frame's §7.20 payload (frame-end CDFs, §7.19 motion
+field, segment ids, grain state) at once, so the next frame's walk
+waits for this frame's parse rather than its whole decode. The full
+walk then runs the §7.4 in-loop passes behind itself in 8-row units
+(`decoder::inloop_pipeline`: deblocking pass 0 once a unit is 4 rows
+above the walk, pass 1 once pass 0 covers its edges' reach, the
+§7.17.6 boundary rows captured once deblocked for good, CDEF once 8
+rows below are deblocked, restoration stripe by stripe) and publishes
+each row into the slot's planes (`decoder::ref_planes`, a published
+prefix readable by any thread) as soon as it is final — about 40 rows
+behind the walk. A later frame's walk waits, per inter leaf, for the
+rows its references' motion vectors reach (plus the §7.11.3.4 taps;
+the whole frame for warped or scaled prediction) and predicts from
+that prefix. Multi-tile inter syntax walks parse their tiles
+concurrently. The serial and still-picture paths are unchanged, and
+every corpus stream decodes byte-identical at 2 / 3 / 8 workers
+(`tests/fixture_conformance.rs`).
+
+1920×1080, 300 frames (10 s at 30 fps), one temporal unit per packet
+through the registry decoder (`examples/decode_bench … stream=1`),
+Apple M5-class on a shared host, release build, best of two; every
+frame byte-identical to `dav1d` at every budget. Seconds per clip
+before (0.1.21 + r480) → after, peak RSS after:
+
+| Clip | 1 worker | 4 | 8 | 16 | Peak RSS 1 / 8 / 16 |
+|---|---|---|---|---|---|
+| SVT-AV1 preset 8, 8-bit, one tile | 4.78 → 3.77 s | 1.48 → 1.19 s | 1.37 → 0.77 s | 1.24 → 0.54 s | 113 / 561 / 1021 MiB |
+| SVT-AV1 preset 8, 10-bit | 6.05 → 4.50 s | 1.75 → 1.38 s | 1.61 → 0.85 s | 1.46 → 0.59 s | 114 / 645 / 1162 MiB |
+| libaom `cpu-used 8`, 2×2 tiles, row-mt | 9.12 → 5.27 s | 6.26 → 2.25 s | 5.98 → 1.88 s | 6.03 → 1.65 s | 115 / 613 / 921 MiB |
+| libaom `cpu-used 8`, one tile | 8.80 → 5.14 s | 5.98 → 2.00 s | 5.71 → 1.78 s | 5.66 → 1.65 s | 120 / 524 / 688 MiB |
+
+Where the time goes now. One worker: the tile walk (symbol decoding,
+coefficient contexts, inter prediction, inverse transforms) is ~60 %,
+deblocking 10–30 % (content dependent), CDEF ~10 %. Many workers:
+the syntax walks form the serial chain — each frame's parse needs its
+primary reference's frame-end CDFs — at ~4–5 ms per 1080p frame
+(libaom one tile: ~150 fps), and a multi-column frame's full walk
+publishes rows only as its last tile column passes them. The resident
+set grows with the workers (one frame-sized walker and `i32`
+`CurrFrame` per running frame).
+
+#### Threading model at a glance
+
+All three levels are in and run together on one budget: tiles of a
+frame (§5.11 walks in parallel, intra and inter), the in-loop filters
+(deblocking / CDEF / restoration by row band on stills, in 8-row units
+behind the walk on video) and frames (each frame on a worker, waiting
+per inter leaf only for the reference rows its motion vectors reach).
+Threads are plain `std::thread` (no thread-pool dependency); the
+budget is the core `ExecutionContext` (`Decoder::set_execution_context`)
+or `SpecDecodeSession::set_threads`, serial by default, and every
+budget is byte-identical to the serial decode. On targets that cannot
+start a thread (bare WebAssembly) every budget runs serial.
+
+r484, Apple M5 Max (18 cores), release build, one temporal unit per
+packet through the registry decoder (`examples/decode_bench …
+stream=1`), synthetic `testsrc2` content; every output byte-identical
+to `dav1d` (MD5 of all planes) at 16 workers:
+
+| Clip | 1 worker | 2 | 4 | 8 | 16 | Peak RSS 1 / 16 |
+|---|---|---|---|---|---|---|
+| 1080p, 300 frames, SVT-AV1 preset 8, one tile | 75 fps | 139 | 215 | 366 | 504 fps | 146 / 969 MiB |
+| 1080p, 300 frames, libaom `cpu-used 8`, 2×2 tiles | 55 fps | | 129 | 156 | 178 fps | 135 / 1026 MiB |
+| 2160p, 120 frames, SVT-AV1 preset 8 | 21 fps | | | 96 | 134 fps | 464 / 2790 MiB |
+
+#### Entropy coding and kernel throughput (r487)
+
+Byte-identical work only: every coded byte of the encoder and every
+decoded sample equal 0.1.23 (the digests of each row below agree
+before and after; the conformance corpus pins are unchanged).
+
+What changed, each derived from the spec's process description:
+
+- **§8.2 symbol decoder** — `SymbolValue` and the unread partition
+  bits share one 64-bit register. §8.2.6 step 6, `SymbolValue =
+  paddedData ^ ( ( ( SymbolValue + 1 ) << bits ) - 1 )`, is `(
+  SymbolValue << bits ) | ~paddedData` over the low `bits` bits, so
+  with the partition bits held inverted beneath the value a
+  renormalisation is one shift, the search compares the top 16 bits and
+  `SymbolValue -= cur` subtracts `cur << 48`; the register refills up
+  to seven bytes at a time. CDFs of length 3 / 4 / 5 (the coefficient
+  alphabets) are read at a compile-time length: `cur` strictly
+  decreases with the candidate index, so the search COUNTS the
+  candidates above `SymbolValue` instead of branching, and the §8.3
+  adaptation is a fixed-length select between its two arms.
+- **Symbol writer** — `low` is a byte vector plus a 64-bit window with
+  carry propagation (the earlier form kept one `bool` per bit and
+  rippled every offset through it).
+- **§5.11.39 coefficients** — the writer keeps the running levels in
+  the decoder's padded `u8` layout, so the §8.3.2 neighbour sums need
+  no in-block test and one `coeff_br` context serves a coefficient.
+- **§7.13.2.3 inverse DCT** — the butterfly schedule is recorded once
+  per size and replayed over eight rows, then eight columns, at a time
+  in fixed-width lanes. A magnitude bound propagated through the
+  recorded schedule gives the largest input for which nothing can
+  leave 32 bits; groups under it run in 32-bit lanes, the rest in
+  64-bit lanes, both computing the same integers.
+- **Forward DCT** — the inverse transform's response matrix has
+  mirror-symmetric even columns (equal, on their first half, to the
+  half-size matrix) and antisymmetric odd ones, so the transpose inner
+  products fold: a third of the multiplies at 64 points, the same
+  exact sums.
+- **§7.15 CDEF** — interior filter rows and the direction search in
+  16-bit lanes (every quantity of the sample process fits).
+- **§7.17 restoration** — Wiener passes tap by tap across a row; the
+  self-guided `a2` from a table, the never-read `A` / `B` rows of the
+  first pass not computed.
+- **§5.11.50 palette context** — resolved once per neighbour triple
+  (729 entries) and looked up.
+- **§7.11.2.4 directional prediction** — `base` advances by a fixed
+  step along a row (or a column) and `shift` is constant along it, so
+  each row / column is one blend over a run of the edge.
+- Residual merge and intra prediction store row slices and allocate
+  nothing per block.
+
+Each rewrite is pinned by a test against the form it replaces (the
+bit-serial writer, the scalar transform kernels, the dense forward
+inner products, the per-sample CDEF process, the literal palette
+process over every neighbour triple, the per-sample directional
+predictor over every size, angle and upsampling flag).
+
+One 4032×3024 (12 MP) photograph, `speed = fast` (the default and the
+fastest preset), `base_q_idx = 120` (the default) and `0` (lossless),
+release build, Apple M5 Max (18 cores) on a host shared with other
+jobs (load average 5–7 during the runs). "Before" (0.1.23) and
+"after" ran interleaved; every figure is the MEDIAN of 3 (encode), 5
+(still decode) or 4 (video) runs. Decode is through the registry
+decoder on the 8-tile streams the 8-thread encodes produced; peak RSS
+is the whole process (`/usr/bin/time -l`; the encoder's includes
+52 MiB of source the harness holds).
+
+| Operation | Workers | Wall before → after | Ratio | Peak RSS before → after |
+|---|---|---|---|---|
+| Encode, 8-bit lossy | 1 | 11.52 → 7.72 s | 1.49× | 225 → 222 MiB |
+| | 8 | 2.76 → 2.25 s | 1.23× | 318 → 306 MiB |
+| Encode, 8-bit lossless | 1 | 2.36 → 1.39 s | 1.70× | 385 → 331 MiB |
+| | 8 | 0.78 → 0.68 s | 1.15× | 456 → 402 MiB |
+| Encode, 10-bit lossy | 1 | 4.50 → 3.79 s | 1.19× | 173 → 171 MiB |
+| | 8 | 1.42 → 1.30 s | 1.09× | 244 → 234 MiB |
+| Encode, 10-bit lossless | 1 | 3.04 → 1.52 s | 1.99× | 409 → 321 MiB |
+| | 8 | 0.79 → 0.64 s | 1.23× | 478 → 370 MiB |
+| Decode, 8-bit lossy | 1 | 0.241 → 0.181 s | 1.33× | 160 → 160 MiB |
+| | 8 | 0.062 → 0.051 s | 1.22× | 278 → 276 MiB |
+| Decode, 8-bit lossless | 1 | 0.785 → 0.568 s | 1.38× | 178 → 178 MiB |
+| | 8 | 0.197 → 0.099 s | 1.99× | 296 → 294 MiB |
+| Decode, 10-bit lossy | 1 | 0.253 → 0.188 s | 1.35× | 137 → 137 MiB |
+| | 8 | 0.065 → 0.054 s | 1.20× | 238 → 230 MiB |
+| Decode, 10-bit lossless | 1 | 1.044 → 0.791 s | 1.32× | 172 → 172 MiB |
+| | 8 | 0.221 → 0.137 s | 1.61× | 263 → 256 MiB |
+
+1080p 8-bit 4:2:0 inter decode, one temporal unit per packet through
+the registry decoder (`examples/decode_bench … stream=1`), synthetic
+`testsrc2` content, same host and method:
+
+| Clip | Workers | Before → after | Ratio | Peak RSS before → after |
+|---|---|---|---|---|
+| 300 frames, one tile, hierarchical groups (third-party encoder A) | 1 | 75.0 → 93.6 fps | 1.25× | 121 → 128 MiB |
+| | 8 | 365 → 471 fps | 1.29× | 579 → 539 MiB |
+| 120 frames, 2×2 tiles (third-party encoder B) | 1 | 53.1 → 56.2 fps | 1.06× | 105 → 121 MiB |
+| | 8 | 145 → 154 fps | 1.06× | 567 → 626 MiB |
+
+The resident set is unchanged by design (the sample planes are still
+`i32`); the encoder's lossless peak drops because the symbol writer no
+longer holds one byte per coded bit. The video figures vary by about
+±20 MiB between identical runs (allocator reuse and, when threaded,
+how many frames happen to be in flight).
+
+Where the remaining time goes (sampled, one worker):
+
+- **Lossless decode** — still the §5.11.39 walk: the coefficient loop
+  itself 25 % (scan and level bookkeeping, two passes per 4×4 block),
+  symbol reads and renormalisation 30 %, the §8.3.2 base context 8 %,
+  WHT + dequantisation 15 %, intra prediction 5 %.
+- **Lossy decode** — CDEF 30 % (the filter rows narrow each `i32`
+  sample run to 16 bits before they can use the lanes), deblocking
+  17 % (the per-edge table walk more than the filters), inverse
+  transforms 11 %, restoration 4 %, coefficients + symbols 10 %.
+- **Lossy 8-bit encode** — no single kernel any more: symbol pricing
+  14 % (the counting writer, its CDF adaptation and the palette
+  colour-map pricing — every palette candidate is priced by writing
+  its whole map, a search-side cost; 10-bit pictures, where the
+  palette election is closed, encode twice as fast), intra prediction
+  and mode screening 15 %, the restoration election 10 %, forward
+  transforms 9 %, price-scope snapshots 5 %, the CDEF election 4 %.
+- **Lossless encode** — the coefficient writer 21 %, symbol writes
+  21 %, directional intra prediction 8 %, per-block allocation 6 %.
+- **1080p inter decode** — the §7.11.3.4 convolution 15 %, inverse
+  transforms 7 %, CDEF 9 %, coefficients + symbols 20 %.
+
+(The `i32` sample planes this section ends on were replaced in r488,
+below.)
+
+#### 16-bit sample planes (r488)
+
+Byte-identical work only: every decoded sample and every coded byte
+equal 0.1.24 (the digests of each row below agree before and after;
+the conformance corpus pins are unchanged).
+
+- **`CurrFrame` is 16 bits per sample.** A stored sample is always
+  post-`Clip1` (`0 ..= (1 << BitDepth) - 1`, at most 4095), so the
+  frame being decoded no longer needs `i32` cells: the block walk
+  (prediction, the §7.12.3 residual merge, palette, CfL), the tile
+  merge, every in-loop stage, the film-grain copy and the §7.3
+  tile-list output run on `u16` planes, and the §7.20 reference store
+  (already `u16`) is a plain row copy. Wider values exist only inside
+  the kernels that compute them.
+- **In-loop kernels generic over the storage type.** `loop_filter`,
+  `cdef`, `loop_restoration`, `superres` and `film_grain` take
+  `PlaneBuffer<'_, S>` with `S: Sample` (`u8`, `u16`, `i32`): load
+  widens to the `i32` the spec's process computes with, store narrows
+  the clipped result. The CDEF filter rows and the direction search
+  fill their 16-bit lanes straight from the plane (no per-run
+  narrowing), the deblocking edge kernel gathers its taps once, and
+  the restoration kernels read through the stripe source as before.
+  The encoder's elections keep calling the same kernels on their own
+  planes.
+- **No prediction scratch.** Inter prediction used to mirror each
+  leaf into a second full-frame `u16` copy of every plane and back;
+  with a 16-bit `CurrFrame` the §7.11.3 process writes its leaf in
+  place.
+- **Encoder price scopes** reuse the previous scope's buffers
+  (30.7 M → 25.8 M allocations on the 12 MP lossy encode below; the
+  wall clock is within the noise).
+
+Same pictures, clips, host and method as the r487 tables (Apple M5
+Max, release build, "before" = 0.1.24 and "after" interleaved on a
+host shared with other jobs; MEDIAN of 5 still decodes, 3 video
+decodes, 3 encodes; peak RSS is the whole process). The wall-clock
+columns moved with the host load between the two rounds — compare
+within a row.
+
+| Operation | Workers | Wall before → after | Peak RSS before → after |
+|---|---|---|---|
+| Decode 12 MP, 8-bit lossy | 1 | 0.197 → 0.180 s | 160 → 124 MiB |
+| | 8 | 0.076 → 0.065 s | 281 → 205 MiB |
+| Decode 12 MP, 8-bit lossless | 1 | 0.846 → 0.851 s | 178 → 143 MiB |
+| | 8 | 0.179 → 0.187 s | 287 → 219 MiB |
+| Decode 12 MP, 10-bit lossy | 1 | 0.201 → 0.188 s | 137 → 100 MiB |
+| | 8 | 0.086 → 0.065 s | 248 → 162 MiB |
+| Decode 12 MP, 10-bit lossless | 1 | 1.065 → 1.139 s | 172 → 137 MiB |
+| | 8 | 0.273 → 0.266 s | 260 → 189 MiB |
+| 1080p, 300 frames, one tile | 1 | 55.3 → 58.7 fps | 133 → 120 MiB |
+| | 8 | 205 → 216 fps | 570 → 385 MiB |
+| | 16 | 458 → 485 fps | 917 → 711 MiB |
+| 1080p, 120 frames, 2×2 tiles | 1 | 57.5 → 63.2 fps | 100 → 94 MiB |
+| | 8 | 123 → 125 fps | 510 → 365 MiB |
+| | 16 | 130 → 135 fps | 757 → 546 MiB |
+| Encode 12 MP, 8-bit lossy | 1 | 9.82 → 9.66 s | 222 → 220 MiB |
+| | 8 | 3.30 → 2.31 s | 317 → 318 MiB |
+| Encode 12 MP, 8-bit lossless | 1 | 2.09 → 2.11 s | 343 → 340 MiB |
+| | 8 | 0.93 → 0.85 s | 403 → 408 MiB |
+| Encode 12 MP, 10-bit lossy | 1 | 4.66 → 4.69 s | 184 → 181 MiB |
+| | 8 | 1.51 → 1.50 s | 239 → 236 MiB |
+| Encode 12 MP, 10-bit lossless | 1 | 1.82 → 1.67 s | 323 → 330 MiB |
+| | 8 | 1.00 → 0.99 s | 383 → 382 MiB |
+
+The decoder's own high-water mark (counting allocator) on the
+one-tile clip at 16 workers went from 736 to 543 MiB. The encoder is
+unchanged in time and memory this round (its planes were already
+16-bit; the 8-worker lossy row is host noise), and so is lossless
+decode time (bound by the coefficient walk, not by sample storage).
+
+Where the time goes now (sampled, one worker; the encoder sampled
+before the price-scope change): 12 MP lossy still —
+CDEF filter 28 %, deblocking 13 %, inverse transforms 10 %, symbol
+reads 9 %; 1080p inter (2×2-tile clip) — deblocking 18 % plus 4 % for
+its edge table, the §7.11.3.4 convolution 18 %, coefficients +
+symbols 14 %, CDEF 5 %; 12 MP lossy encode — symbol pricing 22 %
+(counting writer + CDF adaptation), palette colour-map pricing 11 %,
+forward DCT 11 %, price-scope snapshot / restore 8 %.
+
+Still open: 8-bit storage for 8-bit streams (the kernels already
+accept `u8`; the walker and the reference store are fixed at 16
+bits), a deblocking pass that decides filter lengths per edge run
+before filtering, the encoder's per-candidate CDF-context copy and
+per-mode prediction buffers, and the frame-parallel residue of the
+2×2-tile clip (8 → 16 workers gains 8 %).
+
+## WebAssembly
+
+The decoder and encoder run on `wasm32-unknown-unknown` (no clock, no
+threads): the per-stage decode timings read zero there and every
+worker budget runs serial, with output byte-identical to the native
+build. CI checks the library for that target and runs `wasm-probe/`
+— a resize + superres decode through the registry decoder and a still
+encode, both under a multi-thread budget — under Node, comparing its
+digest with the native one.
 
 ## Module layout
 
