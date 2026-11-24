@@ -33322,7 +33322,7 @@ impl PartitionWalker {
             // reads only already-decoded neighbour rows (never the
             // current leaf's own cells), so re-running it here is
             // bit-identical to the §5.11.27 read site.
-            if inter_block.motion_mode == MOTION_MODE_WARPED_CAUSAL {
+            if !self.parse_only && inter_block.motion_mode == MOTION_MODE_WARPED_CAUSAL {
                 let mut cands: Vec<crate::inter_pred::WarpSampleCand> = Vec::new();
                 self.find_warp_samples_list(
                     mi_row,

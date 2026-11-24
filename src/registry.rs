@@ -326,6 +326,13 @@ impl std::fmt::Debug for Av1Decoder {
 /// packet from a raw temporal-unit packet.
 const IVF_MAGIC: &[u8; 4] = b"DKIF";
 
+impl Drop for Av1Decoder {
+    fn drop(&mut self) {
+        self.session.cancel_pending();
+        self.queue.clear();
+    }
+}
+
 impl Decoder for Av1Decoder {
     fn codec_id(&self) -> &CodecId {
         &self.codec_id
@@ -382,9 +389,11 @@ impl Decoder for Av1Decoder {
             return Ok(CoreFrame::Video(frame));
         }
         // A frame still decoding holds back the queue until the caller
-        // flushes (then it is waited for).
+        // flushes or the bounded lookahead window is full (then the head
+        // frame is waited for so the output queue cannot grow unboundedly).
+        let limit = self.session.max_lookahead();
         let ready = match self.queue.front() {
-            Some((f, _, _)) => self.eof || f.is_ready(),
+            Some((f, _, _)) => self.eof || f.is_ready() || self.queue.len() >= limit,
             None => false,
         };
         if !ready {
@@ -440,9 +449,9 @@ impl Decoder for Av1Decoder {
         // A frame held behind its `StreamParams` event is dropped too:
         // the event was returned, so `shown` (the shape the next
         // frame is compared against) stays the announced one.
+        self.session.reset_references();
         self.queue.clear();
         self.held = None;
-        self.session.reset_references();
         self.eof = false;
         Ok(())
     }
@@ -1466,5 +1475,72 @@ mod tests {
             num_ticks_per_picture_minus_1: None,
         });
         assert_eq!(SeqShape::of(&seq).frame_rate, None);
+    }
+
+    #[test]
+    fn multithread_decode_matches_serial_and_handles_reset_and_drop() {
+        let mut frames = Vec::new();
+        for idx in 0..8u8 {
+            let fill = u16::from(idx.wrapping_mul(23).wrapping_add(16));
+            let yuv = YuvFrame::filled(64, 64, 8, ChromaFormat::Yuv420, fill);
+            let encoded = encode_still_yuv(&yuv, &StillOptions::default()).unwrap();
+            frames.push(encoded.temporal_unit_bytes);
+        }
+
+        let decode_all = |threads: usize| -> Vec<Vec<Vec<u8>>> {
+            let params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+            let mut dec = make_decoder(&params).unwrap();
+            dec.set_execution_context(&ExecutionContext::with_threads(threads));
+            let mut out = Vec::new();
+            for payload in &frames {
+                dec.send_packet(&Packet::new(0, TimeBase::new(1, 30), payload.clone()))
+                    .unwrap();
+                while let Ok(frame) = dec.receive_frame() {
+                    if let CoreFrame::Video(v) = frame {
+                        out.push(v.planes.into_iter().map(|p| p.data).collect());
+                    }
+                }
+            }
+            dec.flush().unwrap();
+            while let Ok(frame) = dec.receive_frame() {
+                if let CoreFrame::Video(v) = frame {
+                    out.push(v.planes.into_iter().map(|p| p.data).collect());
+                }
+            }
+            out
+        };
+
+        let serial = decode_all(1);
+        let parallel = decode_all(4);
+        assert_eq!(serial.len(), frames.len());
+        assert_eq!(parallel, serial);
+
+        // Reset mid-stream while packets are queued and verify clean recovery.
+        let params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+        let mut dec = make_decoder(&params).unwrap();
+        dec.set_execution_context(&ExecutionContext::with_threads(4));
+        for payload in frames.iter().take(4) {
+            dec.send_packet(&Packet::new(0, TimeBase::new(1, 30), payload.clone()))
+                .unwrap();
+        }
+        dec.reset().unwrap();
+        dec.send_packet(&Packet::new(0, TimeBase::new(1, 30), frames[0].clone()))
+            .unwrap();
+        dec.flush().unwrap();
+        let after_reset = match dec.receive_frame().unwrap() {
+            CoreFrame::Video(v) => v.planes.into_iter().map(|p| p.data).collect::<Vec<_>>(),
+            other => panic!("expected video frame after reset, got {other:?}"),
+        };
+        assert_eq!(after_reset, serial[0]);
+
+        // Dropping with pending queued packets cancels cleanly without hanging.
+        let mut drop_dec = make_decoder(&params).unwrap();
+        drop_dec.set_execution_context(&ExecutionContext::with_threads(4));
+        for payload in &frames {
+            drop_dec
+                .send_packet(&Packet::new(0, TimeBase::new(1, 30), payload.clone()))
+                .unwrap();
+        }
+        drop(drop_dec);
     }
 }

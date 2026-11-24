@@ -59,6 +59,7 @@ use crate::uncompressed_header_tail::{
     ALTREF_FRAME, LAST_FRAME, MAX_SEGMENTS, SEG_LVL_ALT_Q, SEG_LVL_SKIP, SegmentationParams,
 };
 use crate::{PlaneRefSpec, RefFrameStoreEntry};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -324,50 +325,72 @@ fn slots_read(fh: &FrameHeader) -> u8 {
     mask
 }
 
-/// A counter with a ceiling: [`Gate::enter`] waits while `limit`
-/// holders are inside.
+/// A FIFO counter with a ceiling: [`Gate::enter`] admits holders in
+/// arrival order while fewer than `limit` holders are inside.
 #[derive(Debug, Default)]
 struct Gate {
-    inside: Mutex<usize>,
+    state: Mutex<GateState>,
     changed: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct GateState {
+    inside: usize,
+    next_ticket: u64,
+    serving_ticket: u64,
 }
 
 impl Gate {
     fn enter(&self, limit: usize) {
-        let mut n = self.inside.lock().unwrap_or_else(|e| e.into_inner());
-        while *n >= limit.max(1) {
-            n = self.changed.wait(n).unwrap_or_else(|e| e.into_inner());
+        let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let ticket = g.next_ticket;
+        g.next_ticket += 1;
+        while g.serving_ticket != ticket || g.inside >= limit.max(1) {
+            g = self.changed.wait(g).unwrap_or_else(|e| e.into_inner());
         }
-        *n += 1;
+        g.serving_ticket += 1;
+        g.inside += 1;
+        self.changed.notify_all();
     }
 
     fn leave(&self) {
-        let mut n = self.inside.lock().unwrap_or_else(|e| e.into_inner());
-        *n -= 1;
+        let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        g.inside -= 1;
         self.changed.notify_all();
     }
 }
 
-/// How many frames a pipelined session lets past their header parse
-/// before the oldest finishes, per worker: frames waiting on their
-/// references hold no worker, so the window runs ahead of the budget
-/// to find frames that can decode now (a hierarchical group's next
-/// branch, the next group's anchor).
-const FRAME_WINDOW_PER_WORKER: usize = 4;
+/// Target luma-sample budget for concurrently reconstructing frames so
+/// 4K/8K streams keep working-set memory bounded while HD and below run
+/// at full thread parallelism.
+const MAX_RECON_SAMPLES: u64 = 34_000_000;
 
-/// The worker threads of a pipelined session. At most
-/// `FRAME_WINDOW_PER_WORKER * threads` frames are in flight, and at
-/// most `threads` of them decode at once (a frame takes its turn once
-/// its references are decoded). The handles of frames nobody waits on
-/// (hidden frames) are kept so that a worker panic is re-raised and a
-/// decode error surfaces from the session — at the next frame it
-/// admits, where the serial decode would have returned it from the
-/// hidden frame's own temporal unit — rather than only through the
-/// frames that read the failed slot.
+/// Compute `(recon_limit, window_limit)` for a frame of `samples` luma
+/// pixels under `threads` worker budget.
+fn pipeline_limits(threads: usize, samples: u64) -> (usize, usize) {
+    let threads = threads.max(1);
+    if threads <= 1 {
+        return (1, 1);
+    }
+    let recon = MAX_RECON_SAMPLES
+        .checked_div(samples)
+        .map_or(threads, |n| (n as usize).clamp(1, threads));
+    let window = (recon * 4).clamp(recon + 2, threads * 2);
+    (recon, window)
+}
+
+/// The worker threads of a pipelined session. At most `window_limit`
+/// frames are in flight, at most one frame runs syntax-only lookahead
+/// parsing at a time, and at most `recon_limit` frames reconstruct at
+/// once (FIFO order so the oldest shown frame is never starved). The
+/// handles of hidden frames are kept so worker panics and decode errors
+/// still surface from the session.
 #[derive(Debug, Default)]
 struct FrameJobs {
     window: Arc<Gate>,
+    parsing: Arc<Gate>,
     running: Arc<Gate>,
+    cancelled: Arc<AtomicBool>,
     hidden: Vec<std::thread::JoinHandle<Result<(), Error>>>,
 }
 
@@ -392,12 +415,20 @@ impl Drop for JobGuard {
     }
 }
 
+struct ParseGuard(Arc<Gate>);
+
+impl Drop for ParseGuard {
+    fn drop(&mut self) {
+        self.0.leave();
+    }
+}
+
 impl FrameJobs {
     /// Wait for room in the window, re-raising the panic of any
     /// finished hidden frame and returning the error of one whose
     /// decode failed (its slot is already marked failed, so the frames
     /// that read it fail too).
-    fn admit(&mut self, threads: usize) -> Result<JobGuard, Error> {
+    fn admit(&mut self, window_limit: usize) -> Result<JobGuard, Error> {
         let mut i = 0;
         while i < self.hidden.len() {
             if self.hidden[i].is_finished() {
@@ -410,25 +441,31 @@ impl FrameJobs {
                 i += 1;
             }
         }
-        self.window.enter(FRAME_WINDOW_PER_WORKER * threads);
+        self.window.enter(window_limit);
         Ok(JobGuard {
             window: Arc::clone(&self.window),
             running: None,
             cell: None,
         })
     }
+
+    /// Signal in-flight workers to bail out before starting new work.
+    fn cancel(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
 }
 
 impl JobGuard {
-    /// Take a worker turn (waits while `threads` frames decode).
-    fn run(&mut self, gate: &Arc<Gate>, threads: usize) {
-        gate.enter(threads);
+    /// Take a worker turn (waits while `limit` frames reconstruct).
+    fn run(&mut self, gate: &Arc<Gate>, limit: usize) {
+        gate.enter(limit);
         self.running = Some(Arc::clone(gate));
     }
 }
 
 impl Drop for FrameJobs {
     fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
         for h in self.hidden.drain(..) {
             let _ = h.join();
         }
@@ -527,8 +564,13 @@ fn decode_or_defer(
     jobs: Option<&mut FrameJobs>,
 ) -> Result<(), Error> {
     let mask = slots_read(&fh);
-    if let Some(jobs) = jobs.filter(|_| threads > 1) {
-        let mut guard = jobs.admit(threads)?;
+    let frame_samples = fh
+        .frame_size
+        .as_ref()
+        .map_or(0u64, |fs| u64::from(fs.upscaled_width) * u64::from(fs.frame_height));
+    let (recon_limit, window_limit) = pipeline_limits(threads, frame_samples);
+    if let Some(jobs) = jobs.filter(|_| threads > 1 && recon_limit > 1) {
+        let mut guard = jobs.admit(window_limit)?;
         // What the frame reads, as it stands before the frame's own
         // reference update.
         let mut reads = SessionRefs {
@@ -551,49 +593,62 @@ fn decode_or_defer(
             .as_ref()
             .map_or((0, 0), |fs| (fs.upscaled_width, fs.frame_height));
         let seq = s.clone();
+        let parsing = Arc::clone(&jobs.parsing);
         let running = Arc::clone(&jobs.running);
+        let cancelled = Arc::clone(&jobs.cancelled);
         let job = move || -> Result<SpecFrame, Error> {
             let mut guard = guard;
-            let result = reads.resolve(mask).and_then(|snapshot| {
+            let resolved = reads.resolve(mask);
+            drop(reads);
+            let result = resolved.and_then(|snapshot| {
+                if cancelled.load(Ordering::Acquire) {
+                    return Err(Error::PartitionWalkOutOfRange);
+                }
                 let mut st = DecodeStageTimings::default();
                 let cell = guard
                     .cell
                     .clone()
                     .filter(|_| !seq.reduced_still_picture_header);
                 let Some(cell) = cell else {
-                    guard.run(&running, threads);
+                    guard.run(&running, recon_limit);
+                    if cancelled.load(Ordering::Acquire) {
+                        return Err(Error::PartitionWalkOutOfRange);
+                    }
                     return decode_frame_spec_tiles(
                         &seq,
                         &fh,
                         &tiles,
                         Some(&snapshot),
                         &mut st,
-                        threads,
+                        recon_limit,
                         FrameMode::Full,
                     );
                 };
                 // r481 — the slot is stored as soon as the frame's
                 // syntax is known (a later frame's walk needs only
                 // that), its planes fill in while the frame
-                // reconstructs. A still picture has no later frame to
-                // hurry, so it stores the slot at the end of its walk;
-                // every other referenced frame walks its syntax first.
+                // reconstructs. Allocate `RefPlanes` only after
+                // acquiring a reconstruction turn so queued frames do
+                // not pin full-frame reference buffers ahead of time.
                 let dims = stored_plane_dims(&seq, &fh)?;
-                let (planes, writer) =
-                    RefPlanes::with_writer(dims, u32::from(seq.color_config.subsampling_y));
                 let bit_depth = seq.color_config.bit_depth;
-                let mut publish = |meta: FrameMeta| {
-                    cell.fulfil(Ok(slot_payload(&fh, Arc::clone(&planes), meta, bit_depth)));
-                };
                 if seq.still_picture {
-                    guard.run(&running, threads);
+                    guard.run(&running, recon_limit);
+                    if cancelled.load(Ordering::Acquire) {
+                        return Err(Error::PartitionWalkOutOfRange);
+                    }
+                    let (planes, writer) =
+                        RefPlanes::with_writer(dims, u32::from(seq.color_config.subsampling_y));
+                    let mut publish = |meta: FrameMeta| {
+                        cell.fulfil(Ok(slot_payload(&fh, Arc::clone(&planes), meta, bit_depth)));
+                    };
                     decode_frame_spec_tiles(
                         &seq,
                         &fh,
                         &tiles,
                         Some(&snapshot),
                         &mut st,
-                        threads,
+                        recon_limit,
                         FrameMode::Recon {
                             writer,
                             on_meta: Some(&mut publish),
@@ -601,16 +656,22 @@ fn decode_or_defer(
                         },
                     )
                 } else {
-                    let parsed = decode_frame_spec_tiles(
-                        &seq,
-                        &fh,
-                        &tiles,
-                        Some(&snapshot),
-                        &mut st,
-                        threads,
-                        FrameMode::ParseOnly,
-                    )?;
-                    let mut parsed = parsed;
+                    let mut parsed = {
+                        parsing.enter(1);
+                        let _pg = ParseGuard(Arc::clone(&parsing));
+                        if cancelled.load(Ordering::Acquire) {
+                            return Err(Error::PartitionWalkOutOfRange);
+                        }
+                        decode_frame_spec_tiles(
+                            &seq,
+                            &fh,
+                            &tiles,
+                            Some(&snapshot),
+                            &mut st,
+                            1,
+                            FrameMode::ParseOnly,
+                        )?
+                    };
                     // The syntax walks of successive frames form the
                     // decode's serial chain (each needs its primary
                     // reference's frame-end CDFs), so a frame walks its
@@ -619,15 +680,25 @@ fn decode_or_defer(
                     // reads this one can then only hold a turn while this
                     // one holds one too, so no turn-holder ever waits on
                     // a frame stuck waiting for a turn.
-                    guard.run(&running, threads);
-                    publish(parsed.meta.take().ok_or(Error::PartitionWalkOutOfRange)?);
+                    guard.run(&running, recon_limit);
+                    if cancelled.load(Ordering::Acquire) {
+                        return Err(Error::PartitionWalkOutOfRange);
+                    }
+                    let (planes, writer) =
+                        RefPlanes::with_writer(dims, u32::from(seq.color_config.subsampling_y));
+                    cell.fulfil(Ok(slot_payload(
+                        &fh,
+                        Arc::clone(&planes),
+                        parsed.meta.take().ok_or(Error::PartitionWalkOutOfRange)?,
+                        bit_depth,
+                    )));
                     decode_frame_spec_tiles(
                         &seq,
                         &fh,
                         &tiles,
                         Some(&snapshot),
                         &mut st,
-                        threads,
+                        recon_limit,
                         FrameMode::Recon {
                             writer,
                             on_meta: None,
@@ -900,6 +971,7 @@ fn decode_frame_spec_tiles(
     mode: FrameMode<'_>,
 ) -> Result<DecodedFrameInternal, Error> {
     let parse_only = matches!(mode, FrameMode::ParseOnly);
+    let need_meta = !matches!(mode, FrameMode::Recon { on_meta: None, .. });
     let (mut writer, mut on_meta, projected_mfmvs) = match mode {
         FrameMode::Recon {
             writer,
@@ -1074,17 +1146,6 @@ fn decode_frame_spec_tiles(
 
     let mi_rows = fs.mi_rows;
     let mi_cols = fs.mi_cols;
-    let mut walker = PartitionWalker::new(
-        mi_rows,
-        mi_cols,
-        TileGeometry {
-            mi_row_start: 0,
-            mi_row_end: mi_rows,
-            mi_col_start: 0,
-            mi_col_end: mi_cols,
-        },
-    )
-    .ok_or(Error::PartitionWalkOutOfRange)?;
 
     // ---- Inter-frame state: §5.11.18 context + §7.11.3 ref pixels. ----
     // Owned buffers first (the `InterFrameContext` borrows them), then
@@ -1340,12 +1401,6 @@ fn decode_frame_spec_tiles(
         None
     };
 
-    walker.set_parse_only(parse_only);
-    walker.set_keep_residual_readouts(false);
-    if any_pending {
-        walker.set_ref_rows(Some(Arc::new(row_sources)));
-    }
-
     // §8.3.1 frame-start CDF state: `load_cdfs( ref_frame_idx[
     // primary_ref_frame ] )` when a primary reference exists (the
     // §7.20-saved frame-end state of that slot, coefficient CDFs
@@ -1421,9 +1476,6 @@ fn decode_frame_spec_tiles(
             )
         })
     };
-    if pipeline.is_some() {
-        walker.ensure_curr_frame_planes(cc.num_planes as usize, sub_x_u8, sub_y_u8);
-    }
     let t_tiles = StageClock::now();
     // r475 — tile-parallel walk. §5.11 scopes every context, every
     // neighbour availability (`is_inside` is tile-relative), the
@@ -1474,7 +1526,7 @@ fn decode_frame_spec_tiles(
             cdfs: Box<TileCdfContext>,
         }
         let next = AtomicUsize::new(0);
-        let parse_one = |t: usize| -> Result<TileMeta, Error> {
+        let parse_one = |local: &mut PartitionWalker, t: usize| -> Result<TileMeta, Error> {
             let tile_row = (t as u32) / ti.tile_cols;
             let tile_col = (t as u32) % ti.tile_cols;
             let geom = TileGeometry {
@@ -1483,19 +1535,6 @@ fn decode_frame_spec_tiles(
                 mi_col_start: ti.mi_col_starts[tile_col as usize],
                 mi_col_end: ti.mi_col_starts[tile_col as usize + 1],
             };
-            let mut local = PartitionWalker::new(
-                mi_rows,
-                mi_cols,
-                TileGeometry {
-                    mi_row_start: 0,
-                    mi_row_end: mi_rows,
-                    mi_col_start: 0,
-                    mi_col_end: mi_cols,
-                },
-            )
-            .ok_or(Error::PartitionWalkOutOfRange)?;
-            local.set_parse_only(true);
-            local.set_keep_residual_readouts(false);
             local.begin_tile(geom);
             local.set_current_q_index(i32::from(qp.base_q_idx));
             let tile = &tiles[t];
@@ -1547,12 +1586,35 @@ fn decode_frame_spec_tiles(
         std::thread::scope(|scope| {
             for _ in 0..threads.min(tiles.len()) {
                 scope.spawn(|| {
+                    let mut local = match PartitionWalker::new(
+                        mi_rows,
+                        mi_cols,
+                        TileGeometry {
+                            mi_row_start: 0,
+                            mi_row_end: mi_rows,
+                            mi_col_start: 0,
+                            mi_col_end: mi_cols,
+                        },
+                    ) {
+                        Some(mut w) => {
+                            w.set_parse_only(true);
+                            w.set_keep_residual_readouts(false);
+                            w
+                        }
+                        None => {
+                            results
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .push((0, Err(Error::PartitionWalkOutOfRange)));
+                            return;
+                        }
+                    };
                     loop {
                         let t = next.fetch_add(1, Ordering::SeqCst);
                         if t >= tiles.len() {
                             break;
                         }
-                        let out = parse_one(t);
+                        let out = parse_one(&mut local, t);
                         results
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
@@ -1605,6 +1667,26 @@ fn decode_frame_spec_tiles(
             }),
             mfmvs: Some(mfmvs),
         });
+    }
+
+    let mut walker = PartitionWalker::new(
+        mi_rows,
+        mi_cols,
+        TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: mi_rows,
+            mi_col_start: 0,
+            mi_col_end: mi_cols,
+        },
+    )
+    .ok_or(Error::PartitionWalkOutOfRange)?;
+    walker.set_parse_only(parse_only);
+    walker.set_keep_residual_readouts(false);
+    if any_pending {
+        walker.set_ref_rows(Some(Arc::new(row_sources)));
+    }
+    if pipeline.is_some() {
+        walker.ensure_curr_frame_planes(cc.num_planes as usize, sub_x_u8, sub_y_u8);
     }
 
     let tile_parallel =
@@ -1782,35 +1864,6 @@ fn decode_frame_spec_tiles(
     let end_cdfs = end_cdfs.unwrap_or(frame_start_cdfs);
     stages.tiles += t_tiles.elapsed();
 
-    // ---- §7.19 motion field motion vector storage. ----
-    // Filter the §5.11.5 `Mvs[]` / `RefFrames[]` grids down to the
-    // `MfMvs[]` / `MfRefFrames[]` payload §7.20 stores: per cell, the
-    // LAST candidate list whose reference lies in the past
-    // (`get_relative_dist( RefOrderHint[ refIdx ], OrderHint ) < 0`)
-    // and whose MV components sit within `REFMVS_LIMIT`.
-    let cells = (mi_rows as usize) * (mi_cols as usize);
-    let mut mf_ref_frames: Vec<i8> = vec![-1; cells];
-    let mut mf_mvs: Vec<i16> = vec![0; cells * 2];
-    if is_inter_frame {
-        let raw_refs = walker.ref_frames();
-        let raw_mvs = walker.mvs();
-        // §7.9.2 reads `SavedRefFrames` / `SavedMvs` only at `( 2 y8 + 1,
-        // 2 x8 + 1 )` — the odd cells — so only those are stored; the
-        // rest keep `NONE`.
-        for cell in odd_cells(mi_rows, mi_cols) {
-            if let Some((r, row, col)) = motion_field_cell(raw_refs, raw_mvs, cell, &past_refs) {
-                mf_ref_frames[cell] = r;
-                mf_mvs[cell * 2] = row;
-                mf_mvs[cell * 2 + 1] = col;
-            }
-        }
-    }
-
-    // §7.20 `SavedSegmentIds` payload — the walker's stamped
-    // `SegmentIds[][]` grid; unwritten `-1` cells clamp to `0` (the
-    // spec map is always written: `segment_id = 0` when segmentation
-    // is disabled).
-    let segment_ids: Vec<i32> = walker.segment_ids().iter().map(|&v| v.max(0)).collect();
     // ---- §7.18.3 film grain. ----
     // §5.9.30 `update_grain == 0` predicted path: `load_grain_params(
     // film_grain_params_ref_idx )` — every field except `grain_seed`
@@ -1818,15 +1871,48 @@ fn decode_frame_spec_tiles(
     // `tempGrainSeed` dance keeps the newly-read seed). A slot with
     // no saved grain state resolves to `reset_grain_params()`.
     let effective_grain = effective_grain_params(fh, refs);
-    let meta = FrameMeta {
-        mf_mvs,
-        mf_ref_frames,
-        order_hints_by_ref,
-        end_cdfs,
-        mi_rows,
-        mi_cols,
-        segment_ids,
-        grain_params: effective_grain.clone(),
+    let mut meta = if need_meta {
+        // ---- §7.19 motion field motion vector storage. ----
+        // Filter the §5.11.5 `Mvs[]` / `RefFrames[]` grids down to the
+        // `MfMvs[]` / `MfRefFrames[]` payload §7.20 stores: per cell, the
+        // LAST candidate list whose reference lies in the past
+        // (`get_relative_dist( RefOrderHint[ refIdx ], OrderHint ) < 0`)
+        // and whose MV components sit within `REFMVS_LIMIT`.
+        let cells = (mi_rows as usize) * (mi_cols as usize);
+        let mut mf_ref_frames: Vec<i8> = vec![-1; cells];
+        let mut mf_mvs: Vec<i16> = vec![0; cells * 2];
+        if is_inter_frame {
+            let raw_refs = walker.ref_frames();
+            let raw_mvs = walker.mvs();
+            // §7.9.2 reads `SavedRefFrames` / `SavedMvs` only at `( 2 y8 + 1,
+            // 2 x8 + 1 )` — the odd cells — so only those are stored; the
+            // rest keep `NONE`.
+            for cell in odd_cells(mi_rows, mi_cols) {
+                if let Some((r, row, col)) = motion_field_cell(raw_refs, raw_mvs, cell, &past_refs) {
+                    mf_ref_frames[cell] = r;
+                    mf_mvs[cell * 2] = row;
+                    mf_mvs[cell * 2 + 1] = col;
+                }
+            }
+        }
+
+        // §7.20 `SavedSegmentIds` payload — the walker's stamped
+        // `SegmentIds[][]` grid; unwritten `-1` cells clamp to `0` (the
+        // spec map is always written: `segment_id = 0` when segmentation
+        // is disabled).
+        let segment_ids: Vec<i32> = walker.segment_ids().iter().map(|&v| v.max(0)).collect();
+        Some(FrameMeta {
+            mf_mvs,
+            mf_ref_frames,
+            order_hints_by_ref,
+            end_cdfs,
+            mi_rows,
+            mi_cols,
+            segment_ids,
+            grain_params: effective_grain.clone(),
+        })
+    } else {
+        None
     };
     if parse_only {
         return Ok(DecodedFrameInternal {
@@ -1838,14 +1924,13 @@ fn decode_frame_spec_tiles(
                 bit_depth: cc.bit_depth,
             },
             ref_planes: None,
-            meta: Some(meta),
+            meta,
             mfmvs: Some(mfmvs),
         });
     }
     // r481 — the frame-parallel decode stores the slot now: a later
     // frame's syntax walk needs only this payload, its prediction
     // waits for the planes row by row.
-    let mut meta = Some(meta);
     if let Some(cb) = on_meta.as_mut()
         && let Some(m) = meta.take()
     {
@@ -1858,6 +1943,47 @@ fn decode_frame_spec_tiles(
         pipelined_planes = Some(planes);
     }
     let inloop_done = pipelined_planes.is_some();
+
+    // When `InLoopPipeline` already stored the cropped final planes into
+    // `RefPlanes`, drop the walker before narrowing (freeing `CurrFrame`
+    // and all per-mi grids immediately) and skip output narrowing on
+    // hidden frames.
+    if let Some(ref rp) = pipelined_planes
+        && (!fh.show_frame || !effective_grain.as_ref().is_some_and(|g| g.apply_grain))
+    {
+        drop(walker);
+        let plane_dims = rp.dims().to_vec();
+        let planes = if !fh.show_frame {
+            Vec::new()
+        } else {
+            let t_out = StageClock::now();
+            let max_val: u16 = ((1u32 << cc.bit_depth) - 1) as u16;
+            let num_planes = cc.num_planes as usize;
+            let mut out = Vec::with_capacity(num_planes);
+            for plane in 0..num_planes {
+                let buf = rp.readable(plane);
+                if cc.bit_depth == 8 {
+                    out.push(buf.iter().map(|&v| v.min(255) as u8).collect());
+                } else {
+                    out.push(le_bytes(buf.iter().map(|&v| v.min(max_val)), buf.len()));
+                }
+            }
+            stages.output += t_out.elapsed();
+            out
+        };
+        return Ok(DecodedFrameInternal {
+            frame: SpecFrame {
+                width: fs.upscaled_width,
+                height: fs.frame_height,
+                planes,
+                plane_dims,
+                bit_depth: cc.bit_depth,
+            },
+            ref_planes: pipelined_planes,
+            meta,
+            mfmvs: None,
+        });
+    }
 
     // ---- Take `CurrFrame[ plane ]` at its FULL mi-grid extent. ----
     // The spec's CurrFrame covers the padded `MiRows x MiCols` grid
@@ -2781,11 +2907,32 @@ impl SpecDecodeSession {
         self.stages
     }
 
+    /// Maximum shown frames a streaming caller should pipeline ahead of
+    /// consumption to keep peak working-set memory bounded.
+    #[must_use]
+    pub fn max_lookahead(&self) -> usize {
+        if self.threads <= 1 {
+            return 1;
+        }
+        let samples = self.seq.as_ref().map_or(0u64, |s| {
+            u64::from(s.max_frame_width_minus_1.saturating_add(1))
+                * u64::from(s.max_frame_height_minus_1.saturating_add(1))
+        });
+        pipeline_limits(self.threads, samples).1
+    }
+
+    /// Signal in-flight pipelined workers to stop before starting new work.
+    pub fn cancel_pending(&mut self) {
+        self.jobs.cancel();
+    }
+
     /// Drop the §7.20 reference store (a seek discontinuity) while
     /// keeping the cached sequence header — the next temporal unit
     /// must start a new coded video sequence (a KEY frame), which
     /// rebuilds every slot before anything can reference it.
     pub fn reset_references(&mut self) {
+        self.jobs.cancel();
+        self.jobs = FrameJobs::default();
         self.refs = SessionRefs::new();
     }
 
@@ -3263,4 +3410,101 @@ fn decode_temporal_unit_spec(
         return Err(Error::TileGroupInvalid);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod pipeline_tests {
+    use super::*;
+
+    #[test]
+    fn pipeline_limits_scales_with_resolution() {
+        assert_eq!(pipeline_limits(1, 3840 * 2160), (1, 1));
+        assert_eq!(pipeline_limits(0, 1920 * 1080), (1, 1));
+
+        // 1080p keeps full thread parallelism on 10-core hosts.
+        let (recon_hd, win_hd) = pipeline_limits(10, 1920 * 1080);
+        assert_eq!(recon_hd, 10);
+        assert_eq!(win_hd, 20);
+
+        // 4K scales recon concurrency down to bound peak working-set memory
+        // while keeping enough lookahead to span a 16-frame altref GOP.
+        let (recon_4k, win_4k) = pipeline_limits(10, 3840 * 2160);
+        assert_eq!(recon_4k, 4);
+        assert_eq!(win_4k, 16);
+
+        let (recon_2856, win_2856) = pipeline_limits(10, 2856 * 2160);
+        assert_eq!(recon_2856, 5);
+        assert_eq!(win_2856, 20);
+
+        // 8K clamps to 1 reconstructing frame (inline decode) with minimal lookahead.
+        assert_eq!(pipeline_limits(10, 7680 * 4320), (1, 4));
+    }
+
+    #[test]
+    fn gate_admits_in_fifo_order() {
+        let gate = Arc::new(Gate::default());
+        gate.enter(1);
+
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let mut handles = Vec::new();
+        for id in 0..4usize {
+            let g = Arc::clone(&gate);
+            let o = Arc::clone(&order);
+            let entered = Arc::new(AtomicBool::new(false));
+            let entered_clone = Arc::clone(&entered);
+            handles.push(std::thread::spawn(move || {
+                entered_clone.store(true, Ordering::Release);
+                g.enter(1);
+                o.lock().unwrap().push(id);
+                g.leave();
+            }));
+            // Wait until the waiter has claimed its ticket in `Gate::enter`.
+            while !entered.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            loop {
+                let next = g_next_ticket(&gate);
+                if next > (id as u64) + 1 {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+        }
+        gate.leave();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(*order.lock().unwrap(), vec![0, 1, 2, 3]);
+    }
+
+    fn g_next_ticket(gate: &Gate) -> u64 {
+        gate.state.lock().unwrap().next_ticket
+    }
+
+    #[test]
+    fn max_lookahead_bounds_high_resolution_streams() {
+        let mut serial = SpecDecodeSession::new();
+        assert_eq!(serial.max_lookahead(), 1);
+        serial.set_threads(1);
+        assert_eq!(serial.max_lookahead(), 1);
+
+        let mut par = SpecDecodeSession::new();
+        par.set_threads(10);
+        let mut seq_4k =
+            crate::encoder::build_intra_only_seq_yuv(3840, 2160, 8, crate::encoder::ChromaFormat::Yuv420)
+                .unwrap();
+        seq_4k.max_frame_width_minus_1 = 3839;
+        seq_4k.max_frame_height_minus_1 = 2159;
+        par.seq = Some(seq_4k);
+        let lookahead_4k = par.max_lookahead();
+        assert_eq!(lookahead_4k, 16);
+
+        let mut seq_hd =
+            crate::encoder::build_intra_only_seq_yuv(1920, 1080, 8, crate::encoder::ChromaFormat::Yuv420)
+                .unwrap();
+        seq_hd.max_frame_width_minus_1 = 1919;
+        seq_hd.max_frame_height_minus_1 = 1079;
+        par.seq = Some(seq_hd);
+        assert_eq!(par.max_lookahead(), 20);
+    }
 }
