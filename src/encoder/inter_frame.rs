@@ -6526,6 +6526,10 @@ impl PSearchCtx {
             &mut planes[..num_planes],
             mi_row as usize,
             mi_col as usize,
+            0,
+            0,
+            grid.mi_rows,
+            grid.mi_cols,
         )
     }
 }

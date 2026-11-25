@@ -16229,6 +16229,10 @@ pub(crate) struct RefRowSources {
 
 // r421: `Clone` so the encoder's search-side rate twin can price
 // candidate symbol sequences on a snapshot of the write-side mirror.
+/// One tile row's `(r0, r1, [(c0, c1, local_walker)])` batch handed to
+/// [`PartitionWalker::import_tiles_post_pass_parallel`].
+pub(crate) type TileRowBatch = (u32, u32, Vec<(u32, u32, PartitionWalker)>);
+
 #[derive(Debug, Clone)]
 pub struct PartitionWalker {
     mi_rows: u32,
@@ -16677,8 +16681,13 @@ pub struct PartitionWalker {
     /// r475 — the frame-level mi origin of a TILE-SIZED walker (the
     /// tile at the origin of its own frame): §5.11.57 `read_lr`
     /// indexes the frame's restoration-unit grid at `( r + row, c +
-    /// col )`. `(0, 0)` for a frame-scope walker.
+    /// col )`, and tile-parallel inter decode translates motion-field,
+    /// previous-segment, global-motion and reference-plane coordinates
+    /// by the same origin. `(0, 0)` for a frame-scope walker.
     lr_origin: (u32, u32),
+    /// Frame-level `(mi_rows, mi_cols)` for a tile-sized walker; equals
+    /// `(self.mi_rows, self.mi_cols)` for a frame-scope walker.
+    frame_mi_dims: (u32, u32),
     /// `CurrFrame[ plane ][ y ][ x ]` (av1-spec §7.12.3 step-3 / §7.11.x
     /// prediction kernels / §7.14 loop filter / §7.15 CDEF / §7.16
     /// upscaling / §7.17 loop restoration). Three per-plane sample
@@ -17436,6 +17445,7 @@ impl PartitionWalker {
             motion_modes,
             blocks: Vec::new(),
             lr_origin: (0, 0),
+            frame_mi_dims: (mi_rows, mi_cols),
             // §7.12.3 step-3 `CurrFrame[plane]` buffers — allocated
             // lazily on the first per-plane merge call (see
             // [`Self::ensure_curr_frame_plane`]).
@@ -17471,6 +17481,109 @@ impl PartitionWalker {
         })
     }
 
+    /// Minimal frame-scope walker for `tile_parallel` post-pass stitching:
+    /// allocates only the grids consumed by post-tile stages (`§7.14` loop
+    /// filter, `§7.15` CDEF, `§7.19` motion-field store) and skips the
+    /// per-cell pre-fill loops that `import_tiles_post_pass_parallel`
+    /// overwrites across the full frame.
+    pub(crate) fn new_for_tile_stitch(mi_rows: u32, mi_cols: u32) -> Option<Self> {
+        let area = (mi_rows as usize).checked_mul(mi_cols as usize)?;
+        let area2 = area.checked_mul(2)?;
+        let geometry = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: mi_rows,
+            mi_col_start: 0,
+            mi_col_end: mi_cols,
+        };
+        let alloc_u8 = |n: usize| -> Option<Vec<u8>> {
+            let mut v = Vec::new();
+            v.try_reserve_exact(n).ok()?;
+            v.resize(n, 0);
+            Some(v)
+        };
+        let mut mi_sizes = Vec::new();
+        mi_sizes.try_reserve_exact(area).ok()?;
+        mi_sizes.resize(area, BLOCK_INVALID);
+        let mut cdef_idx = Vec::new();
+        cdef_idx.try_reserve_exact(area).ok()?;
+        cdef_idx.resize(area, -1);
+        let mut segment_ids = Vec::new();
+        segment_ids.try_reserve_exact(area).ok()?;
+        segment_ids.resize(area, 0);
+        let mut ref_frames = Vec::new();
+        ref_frames.try_reserve_exact(area2).ok()?;
+        ref_frames.resize(area2, 0);
+        Some(Self {
+            mi_rows,
+            mi_cols,
+            geometry,
+            enable_intra_edge_filter: false,
+            parse_only: false,
+            ref_rows: None,
+            coeff_levels: Vec::new(),
+            tx_quant_scratch: Vec::new(),
+            tx_dequant_scratch: Vec::new(),
+            tx_residual_scratch: Vec::new(),
+            keep_residual_readouts: false,
+            walk_avail_u: Vec::new(),
+            walk_avail_l: Vec::new(),
+            inter_pred_scratch: [Vec::new(), Vec::new(), Vec::new()],
+            local_warp_params: Vec::new(),
+            local_warp_valid: Vec::new(),
+            mi_sizes,
+            skips: alloc_u8(area)?,
+            skip_modes: Vec::new(),
+            current_q_index: 0,
+            read_deltas_pending: false,
+            current_delta_lf: [0; FRAME_LF_COUNT],
+            delta_lfs: Vec::new(),
+            cdef_idx,
+            is_inters: alloc_u8(area)?,
+            segment_ids,
+            above_seg_pred_context: Vec::new(),
+            left_seg_pred_context: Vec::new(),
+            above_level_context: Vec::new(),
+            above_dc_context: Vec::new(),
+            left_level_context: Vec::new(),
+            left_dc_context: Vec::new(),
+            y_modes: alloc_u8(area)?,
+            uv_modes: Vec::new(),
+            tx_sizes: alloc_u8(area)?,
+            inter_tx_sizes: alloc_u8(area)?,
+            tx_types: Vec::new(),
+            ref_frames,
+            palette_sizes: Vec::new(),
+            palette_colors: Vec::new(),
+            mvs: Vec::new(),
+            comp_group_idxs: Vec::new(),
+            compound_idxs: Vec::new(),
+            interp_filters: Vec::new(),
+            compound_types: Vec::new(),
+            compound_wedge_indices: Vec::new(),
+            compound_wedge_signs: Vec::new(),
+            compound_mask_types: Vec::new(),
+            interintra_modes: Vec::new(),
+            wedge_interintras: Vec::new(),
+            interintra_wedge_indices: Vec::new(),
+            motion_modes: Vec::new(),
+            blocks: Vec::new(),
+            lr_origin: (0, 0),
+            frame_mi_dims: (mi_rows, mi_cols),
+            curr_frame: [None, None, None],
+            luma_overhang: None,
+            ref_lr_wiener: [[crate::loop_restoration::WIENER_TAPS_MID; 2]; 3],
+            ref_sgr_xqd: [crate::loop_restoration::SGRPROJ_XQD_MID; 3],
+            lr_units: [None, None, None],
+            block_decoded: Vec::new(),
+            max_luma_w: 0,
+            max_luma_h: 0,
+            current_palette_size_y: 0,
+            current_palette_size_uv: 0,
+            current_color_map_y: None,
+            current_color_map_uv: None,
+        })
+    }
+
     /// §5.11.2 `decode_tile()` loop-restoration reference reset — sets
     /// `RefLrWiener[ plane ][ pass ][ j ] = Wiener_Taps_Mid[ j ]` and
     /// `RefSgrXqd[ plane ][ pass ] = Sgrproj_Xqd_Mid[ pass ]` for every
@@ -17488,11 +17601,259 @@ impl PartitionWalker {
         self.lr_origin = (mi_row, mi_col);
     }
 
+    /// Declare this tile-sized walker's frame-level mi origin `(mi_row, mi_col)`
+    /// and the full frame's `(frame_mi_rows, frame_mi_cols)` so both intra and
+    /// inter tile-parallel walks address frame-scope state accurately.
+    pub fn set_tile_origin(
+        &mut self,
+        mi_row: u32,
+        mi_col: u32,
+        frame_mi_rows: u32,
+        frame_mi_cols: u32,
+    ) {
+        self.lr_origin = (mi_row, mi_col);
+        self.frame_mi_dims = (frame_mi_rows, frame_mi_cols);
+    }
+
+    /// Stitch the tiles of a tile-parallel decode into this frame-scope walker
+    /// in parallel by tile row, copying only the grids and `CurrFrame` planes
+    /// consumed by post-tile stages (`§7.14` loop filter, `§7.15` CDEF),
+    /// optionally extracting `§7.19` `mf_ref_frames` / `mf_mvs` and `§7.20`
+    /// `segment_ids` directly from each tile's grids in the same parallel pass,
+    /// and dropping each tile-sized walker on the worker thread that stitched it.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn import_tiles_post_pass_parallel(
+        &mut self,
+        tile_rows: Vec<TileRowBatch>,
+        num_planes: usize,
+        sub_x: u8,
+        sub_y: u8,
+        extract_meta: Option<(bool, [bool; 8])>,
+        threads: usize,
+    ) -> Option<(Vec<i8>, Vec<i16>, Vec<i32>)> {
+        let area = (self.mi_rows as usize) * (self.mi_cols as usize);
+        let any_delta_lf = tile_rows
+            .iter()
+            .any(|(_, _, row)| row.iter().any(|(_, _, w)| !w.delta_lfs.is_empty()));
+        if any_delta_lf {
+            self.ensure_delta_lfs();
+        }
+        let num_planes = num_planes.min(3);
+        for plane in 0..num_planes {
+            let (ssx, ssy) = if plane == 0 { (0, 0) } else { (sub_x, sub_y) };
+            let rows = (self.mi_rows * (MI_SIZE as u32)) >> ssy;
+            let cols = (self.mi_cols * (MI_SIZE as u32)) >> ssx;
+            self.ensure_curr_frame_plane(plane, rows, cols);
+        }
+
+        let (is_inter_meta, past_refs) = extract_meta.unwrap_or((false, [false; 8]));
+        let mut mf_ref_frames: Vec<i8> = if extract_meta.is_some() {
+            vec![-1i8; area]
+        } else {
+            Vec::new()
+        };
+        let mut mf_mvs: Vec<i16> = if extract_meta.is_some() {
+            vec![0i16; area * 2]
+        } else {
+            Vec::new()
+        };
+        let mut saved_segs: Vec<i32> = if extract_meta.is_some() {
+            vec![0i32; area]
+        } else {
+            Vec::new()
+        };
+
+        let frame_mi_cols = self.mi_cols as usize;
+        let mut mi_sizes_rest = self.mi_sizes.as_mut_slice();
+        let mut skips_rest = self.skips.as_mut_slice();
+        let mut cdef_rest = self.cdef_idx.as_mut_slice();
+        let mut is_inters_rest = self.is_inters.as_mut_slice();
+        let mut segs_rest = self.segment_ids.as_mut_slice();
+        let mut y_modes_rest = self.y_modes.as_mut_slice();
+        let mut tx_sizes_rest = self.tx_sizes.as_mut_slice();
+        let mut inter_tx_rest = self.inter_tx_sizes.as_mut_slice();
+        let mut ref_frames_rest = self.ref_frames.as_mut_slice();
+        let mut dlfs_rest = self.delta_lfs.as_mut_slice();
+        let mut mf_refs_rest = mf_ref_frames.as_mut_slice();
+        let mut mf_mvs_rest = mf_mvs.as_mut_slice();
+        let mut saved_segs_rest = saved_segs.as_mut_slice();
+
+        let [cf0, cf1, cf2] = &mut self.curr_frame;
+        let (p0_cols, mut p0_rest) = match cf0.as_mut() {
+            Some(p) if num_planes > 0 => (p.cols as usize, p.samples.as_mut_slice()),
+            _ => (0, &mut [][..]),
+        };
+        let (p1_cols, mut p1_rest) = match cf1.as_mut() {
+            Some(p) if num_planes > 1 => (p.cols as usize, p.samples.as_mut_slice()),
+            _ => (0, &mut [][..]),
+        };
+        let (p2_cols, mut p2_rest) = match cf2.as_mut() {
+            Some(p) if num_planes > 2 => (p.cols as usize, p.samples.as_mut_slice()),
+            _ => (0, &mut [][..]),
+        };
+
+        let mut jobs: Vec<Box<dyn FnOnce() + Send + '_>> = Vec::with_capacity(tile_rows.len());
+        for (r0, r1, row_tiles) in tile_rows {
+            let h4 = (r1 - r0) as usize;
+            let cells = h4 * frame_mi_cols;
+            let (mi_sizes_s, rest) = mi_sizes_rest.split_at_mut(cells);
+            mi_sizes_rest = rest;
+            let (skips_s, rest) = skips_rest.split_at_mut(cells);
+            skips_rest = rest;
+            let (cdef_s, rest) = cdef_rest.split_at_mut(cells);
+            cdef_rest = rest;
+            let (is_inters_s, rest) = is_inters_rest.split_at_mut(cells);
+            is_inters_rest = rest;
+            let (segs_s, rest) = segs_rest.split_at_mut(cells);
+            segs_rest = rest;
+            let (y_modes_s, rest) = y_modes_rest.split_at_mut(cells);
+            y_modes_rest = rest;
+            let (tx_sizes_s, rest) = tx_sizes_rest.split_at_mut(cells);
+            tx_sizes_rest = rest;
+            let (inter_tx_s, rest) = inter_tx_rest.split_at_mut(cells);
+            inter_tx_rest = rest;
+            let (ref_frames_s, rest) = ref_frames_rest.split_at_mut(cells * 2);
+            ref_frames_rest = rest;
+            let dlfs_s = if !dlfs_rest.is_empty() {
+                let (s, rest) = dlfs_rest.split_at_mut(cells * FRAME_LF_COUNT);
+                dlfs_rest = rest;
+                s
+            } else {
+                &mut [][..]
+            };
+            let (mf_refs_s, mf_mvs_s, saved_segs_s) = if extract_meta.is_some() {
+                let (mr, rest) = mf_refs_rest.split_at_mut(cells);
+                mf_refs_rest = rest;
+                let (mm, rest) = mf_mvs_rest.split_at_mut(cells * 2);
+                mf_mvs_rest = rest;
+                let (ss, rest) = saved_segs_rest.split_at_mut(cells);
+                saved_segs_rest = rest;
+                (mr, mm, ss)
+            } else {
+                (&mut [][..], &mut [][..], &mut [][..])
+            };
+
+            let y0_l = (r0 * MI_SIZE as u32) as usize;
+            let y1_l = (r1 * MI_SIZE as u32) as usize;
+            let (p0_s, rest) = p0_rest.split_at_mut(((y1_l - y0_l) * p0_cols).min(p0_rest.len()));
+            p0_rest = rest;
+            let y0_c = ((r0 * MI_SIZE as u32) >> sub_y) as usize;
+            let y1_c = ((r1 * MI_SIZE as u32) >> sub_y) as usize;
+            let (p1_s, rest) = p1_rest.split_at_mut(((y1_c - y0_c) * p1_cols).min(p1_rest.len()));
+            p1_rest = rest;
+            let (p2_s, rest) = p2_rest.split_at_mut(((y1_c - y0_c) * p2_cols).min(p2_rest.len()));
+            p2_rest = rest;
+
+            jobs.push(Box::new(move || {
+                const REFMVS_LIMIT: i32 = (1 << 12) - 1;
+                for (c0, c1, local) in row_tiles {
+                    let w4 = ((c1 - c0) as usize).min(local.mi_cols as usize);
+                    let src_cols = local.mi_cols as usize;
+                    let c0u = c0 as usize;
+                    let rh = h4.min(local.mi_rows as usize);
+                    for rr in 0..rh {
+                        let sbase = rr * src_cols;
+                        let dbase = rr * frame_mi_cols + c0u;
+                        mi_sizes_s[dbase..dbase + w4]
+                            .copy_from_slice(&local.mi_sizes[sbase..sbase + w4]);
+                        skips_s[dbase..dbase + w4]
+                            .copy_from_slice(&local.skips[sbase..sbase + w4]);
+                        cdef_s[dbase..dbase + w4]
+                            .copy_from_slice(&local.cdef_idx[sbase..sbase + w4]);
+                        is_inters_s[dbase..dbase + w4]
+                            .copy_from_slice(&local.is_inters[sbase..sbase + w4]);
+                        segs_s[dbase..dbase + w4]
+                            .copy_from_slice(&local.segment_ids[sbase..sbase + w4]);
+                        y_modes_s[dbase..dbase + w4]
+                            .copy_from_slice(&local.y_modes[sbase..sbase + w4]);
+                        tx_sizes_s[dbase..dbase + w4]
+                            .copy_from_slice(&local.tx_sizes[sbase..sbase + w4]);
+                        inter_tx_s[dbase..dbase + w4]
+                            .copy_from_slice(&local.inter_tx_sizes[sbase..sbase + w4]);
+                        ref_frames_s[dbase * 2..(dbase + w4) * 2]
+                            .copy_from_slice(&local.ref_frames[sbase * 2..(sbase + w4) * 2]);
+                        if !dlfs_s.is_empty() && !local.delta_lfs.is_empty() {
+                            dlfs_s[dbase * FRAME_LF_COUNT..(dbase + w4) * FRAME_LF_COUNT]
+                                .copy_from_slice(
+                                    &local.delta_lfs
+                                        [sbase * FRAME_LF_COUNT..(sbase + w4) * FRAME_LF_COUNT],
+                                );
+                        }
+                        if !saved_segs_s.is_empty() {
+                            let src_seg = &local.segment_ids[sbase..sbase + w4];
+                            let dst_seg = &mut saved_segs_s[dbase..dbase + w4];
+                            for i in 0..w4 {
+                                dst_seg[i] = src_seg[i].max(0);
+                            }
+                            if is_inter_meta && (((r0 as usize) + rr) & 1) == 1 {
+                                let start_cc = (c0u & 1) ^ 1;
+                                let mut cc = start_cc;
+                                while cc < w4 {
+                                    let scell = sbase + cc;
+                                    let dcell = dbase + cc;
+                                    let mut found: Option<(i8, i16, i16)> = None;
+                                    for list in 0..2usize {
+                                        let r = local.ref_frames[scell * 2 + list];
+                                        if r <= 0 || !past_refs[r as usize] {
+                                            continue;
+                                        }
+                                        let (row, col) = if local.mvs.is_empty() {
+                                            (0i16, 0i16)
+                                        } else {
+                                            (
+                                                local.mvs[(scell * 2 + list) * 2],
+                                                local.mvs[(scell * 2 + list) * 2 + 1],
+                                            )
+                                        };
+                                        if i32::from(row).abs() <= REFMVS_LIMIT
+                                            && i32::from(col).abs() <= REFMVS_LIMIT
+                                        {
+                                            found = Some((r, row, col));
+                                        }
+                                    }
+                                    if let Some((r, row, col)) = found {
+                                        mf_refs_s[dcell] = r;
+                                        mf_mvs_s[dcell * 2] = row;
+                                        mf_mvs_s[dcell * 2 + 1] = col;
+                                    }
+                                    cc += 2;
+                                }
+                            }
+                        }
+                    }
+                    let copy_plane = |dst: &mut [u16], dc: usize, sp: Option<&CurrFramePlane>, ssx: u8| {
+                        let Some(sp) = sp else {
+                            return;
+                        };
+                        if dc == 0 || dst.is_empty() {
+                            return;
+                        }
+                        let x0 = ((c0 * MI_SIZE as u32) >> ssx) as usize;
+                        let sc = sp.cols as usize;
+                        let w = sc.min(dc.saturating_sub(x0));
+                        let h = (sp.rows as usize).min(dst.len() / dc);
+                        for y in 0..h {
+                            dst[y * dc + x0..y * dc + x0 + w]
+                                .copy_from_slice(&sp.samples[y * sc..y * sc + w]);
+                        }
+                    };
+                    copy_plane(p0_s, p0_cols, local.curr_frame[0].as_ref(), 0);
+                    copy_plane(p1_s, p1_cols, local.curr_frame[1].as_ref(), sub_x);
+                    copy_plane(p2_s, p2_cols, local.curr_frame[2].as_ref(), sub_x);
+                    drop(local);
+                }
+            }));
+        }
+        crate::loop_filter::run_jobs(threads, jobs);
+        extract_meta.map(|_| (mf_ref_frames, mf_mvs, saved_segs))
+    }
+
     /// r475 — stitch a tile-sized walker's `CurrFrame[ plane ]` planes
     /// into this frame-scope walker's planes at frame mi position
     /// `(dst_row4, dst_col4)` (the planes are allocated at the frame
     /// extent on first use). Tile boundaries are superblock aligned,
     /// so the chroma rect origin is exact under any subsampling.
+    #[allow(dead_code)]
     pub(crate) fn import_curr_frame_rect_from(
         &mut self,
         src: &Self,
@@ -20234,6 +20595,10 @@ impl PartitionWalker {
                 &mut planes,
                 mi_row as usize,
                 mi_col as usize,
+                self.lr_origin.0 as usize,
+                self.lr_origin.1 as usize,
+                self.frame_mi_dims.0,
+                self.frame_mi_dims.1,
             )?;
         }
 
@@ -21863,7 +22228,7 @@ impl PartitionWalker {
         let mut needs = [0u32; 8];
         let bw4 = NUM_4X4_BLOCKS_WIDE[mi_size] as u32;
         let bh4 = NUM_4X4_BLOCKS_HIGH[mi_size] as u32;
-        let bottom = i64::from((mi_row + bh4) * MI_SIZE as u32);
+        let bottom = i64::from((mi_row + self.lr_origin.0 + bh4) * MI_SIZE as u32);
         let (r0, r1) = (mi_row.saturating_sub(1), (mi_row + bh4).min(self.mi_rows));
         let (c0, c1) = (mi_col.saturating_sub(1), (mi_col + bw4).min(self.mi_cols));
         for r in r0..r1 {
@@ -22082,7 +22447,7 @@ impl PartitionWalker {
         };
         const BAND_MI: u32 = 16;
         const SKIRT: usize = 7;
-        let table = self.lf_edge_table(
+        let table = self.lf_edge_table_parallel(
             lf_params,
             seg_params,
             delta_lf_multi,
@@ -22092,11 +22457,15 @@ impl PartitionWalker {
             subsampling_y,
             frame_width,
             frame_height,
+            threads,
         );
         let table = &table;
-        let num_planes = num_planes.min(planes.len() as u8);
-        for plane in 0..num_planes {
-            if plane > 0 && lf_params.loop_filter_level[(1 + plane) as usize] == 0 {
+        let num_planes = num_planes.min(planes.len() as u8) as usize;
+        type LfBand = (u32, u32, usize, usize);
+        type ActivePlaneBands = (u8, usize, usize, Vec<LfBand>);
+        let mut active_planes: Vec<ActivePlaneBands> = Vec::with_capacity(num_planes);
+        for (plane, pb) in planes.iter().enumerate().take(num_planes) {
+            if plane > 0 && lf_params.loop_filter_level[1 + plane] == 0 {
                 continue;
             }
             let sub_y = if plane == 0 {
@@ -22104,10 +22473,8 @@ impl PartitionWalker {
             } else {
                 u32::from(subsampling_y)
             };
-            let pb = &mut planes[plane as usize];
             let (rows, cols) = (pb.rows as usize, pb.cols as usize);
-            // Band `k`: mi rows `[16k, 16k + 16)`, plane rows `[by0, by1)`.
-            let mut bands: Vec<(u32, u32, usize, usize)> = Vec::new();
+            let mut bands: Vec<LfBand> = Vec::new();
             let mut r = 0u32;
             while r < self.mi_rows {
                 let r1 = (r + BAND_MI).min(self.mi_rows);
@@ -22118,7 +22485,17 @@ impl PartitionWalker {
                 }
                 r = r1;
             }
-            let run_phase = |pb: &mut PlaneBuffer<'_, S>, pass: u8, parity: Option<usize>| {
+            active_planes.push((plane as u8, rows, cols, bands));
+        }
+        let mut run_phase_all = |pass: u8, parity: Option<usize>| {
+            let mut jobs: Vec<Box<dyn FnOnce() + Send + '_>> = Vec::new();
+            for (plane_idx, pb) in planes.iter_mut().take(num_planes).enumerate() {
+                let Some(&(_, rows, cols, ref bands)) =
+                    active_planes.iter().find(|p| p.0 as usize == plane_idx)
+                else {
+                    continue;
+                };
+                let plane = plane_idx as u8;
                 let selected: Vec<(u32, u32, usize, usize)> = bands
                     .iter()
                     .enumerate()
@@ -22139,8 +22516,6 @@ impl PartitionWalker {
                     })
                     .collect();
                 let windows = row_windows_mut(pb.samples, cols, &ranges);
-                let mut jobs: Vec<Box<dyn FnOnce() + Send + '_>> =
-                    Vec::with_capacity(windows.len());
                 for (win, (&(mi0, mi1, _, _), &(w0, w1))) in
                     windows.into_iter().zip(selected.iter().zip(ranges.iter()))
                 {
@@ -22162,12 +22537,136 @@ impl PartitionWalker {
                     };
                     jobs.push(Box::new(f));
                 }
-                run_jobs(threads, jobs);
-            };
-            run_phase(pb, 0, None);
-            run_phase(pb, 1, Some(0));
-            run_phase(pb, 1, Some(1));
+            }
+            run_jobs(threads, jobs);
+        };
+        run_phase_all(0, None);
+        run_phase_all(1, Some(0));
+        run_phase_all(1, Some(1));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn lf_edge_table_parallel(
+        &self,
+        lf_params: &crate::uncompressed_header_tail::LoopFilterParams,
+        seg_params: &crate::uncompressed_header_tail::SegmentationParams,
+        delta_lf_multi: bool,
+        num_planes: u8,
+        bit_depth: u8,
+        subsampling_x: u8,
+        subsampling_y: u8,
+        frame_width: u32,
+        frame_height: u32,
+        threads: usize,
+    ) -> crate::loop_filter::LfEdgeTable {
+        let _ = num_planes;
+        let mut t = crate::loop_filter::LfEdgeTable::with_geometry(
+            self.mi_rows,
+            self.mi_cols,
+            bit_depth,
+            subsampling_x,
+            subsampling_y,
+            frame_width,
+            frame_height,
+            lf_params.loop_filter_level,
+            lf_params.loop_filter_sharpness,
+        );
+        let lp = Self::lf_level_params(lf_params, seg_params, delta_lf_multi);
+        if threads <= 1 || self.mi_rows < 32 {
+            self.fill_lf_edge_table(&mut t, &lp, 0, self.mi_rows);
+            return t;
         }
+        let align = 1u32 << u32::from(subsampling_y);
+        let bands = threads.clamp(1, 16) as u32;
+        let step = (self.mi_rows.div_ceil(bands).div_ceil(align) * align).max(align);
+        let mi_cols = self.mi_cols as usize;
+        let slots: [usize; 4] = core::array::from_fn(|i| lp.delta_lf_slot(i));
+        let (sx, sy) = (t.subsampling_x, t.subsampling_y);
+        let (rows0, cols0) = t.tx_dims(0);
+        let (rows1, cols1) = t.tx_dims(1);
+        let (rows2, cols2) = t.tx_dims(2);
+
+        let mut mi_size_rest = t.mi_size.as_mut_slice();
+        let mut skip_rest = t.skip_inter.as_mut_slice();
+        let mut lvl_rest = t.lvl.as_mut_slice();
+        let [tx0_vec, tx1_vec, tx2_vec] = &mut t.tx;
+        let mut tx0_rest = tx0_vec.as_mut_slice();
+        let mut tx1_rest = tx1_vec.as_mut_slice();
+        let mut tx2_rest = tx2_vec.as_mut_slice();
+
+        let mut jobs: Vec<Box<dyn FnOnce() + Send + '_>> = Vec::new();
+        let mut r0 = 0u32;
+        while r0 < self.mi_rows {
+            let r1 = (r0 + step).min(self.mi_rows);
+            let ncells = ((r1 - r0) as usize) * mi_cols;
+            let (mi_size_s, rest) = mi_size_rest.split_at_mut(ncells);
+            mi_size_rest = rest;
+            let (skip_s, rest) = skip_rest.split_at_mut(ncells);
+            skip_rest = rest;
+            let (lvl_s, rest) = lvl_rest.split_at_mut(ncells);
+            lvl_rest = rest;
+
+            let sr0_0 = (r0 as usize).min(rows0);
+            let sr1_0 = (r1 as usize).min(rows0);
+            let (tx0_s, rest) = tx0_rest.split_at_mut((sr1_0 - sr0_0) * cols0);
+            tx0_rest = rest;
+
+            let s = u32::from(sy);
+            let sr0_c = (r0 >> s) as usize;
+            let sr1_c = (r1.div_ceil(1 << s) as usize).min(rows1);
+            let (tx1_s, rest) = tx1_rest.split_at_mut((sr1_c - sr0_c) * cols1);
+            tx1_rest = rest;
+            let sr1_c2 = (r1.div_ceil(1 << s) as usize).min(rows2);
+            let (tx2_s, rest) = tx2_rest.split_at_mut((sr1_c2 - sr0_c) * cols2);
+            tx2_rest = rest;
+
+            let lp_ref = &lp;
+            jobs.push(Box::new(move || {
+                let base = (r0 as usize) * mi_cols;
+                for off in 0..ncells {
+                    let idx = base + off;
+                    mi_size_s[off] = self.mi_sizes[idx] as u8;
+                    let ref0 = self.ref_frames[idx * 2];
+                    skip_s[off] = self.skips[idx] != 0
+                        && ref0 > crate::uncompressed_header_tail::INTRA_FRAME as i8;
+                    let seg = self.segment_ids[idx];
+                    let seg = if seg < 0 { u8::MAX } else { seg as u8 };
+                    let mode = self.y_modes[idx];
+                    let r = ref0.max(0) as u8;
+                    let dl = self
+                        .delta_lfs
+                        .get(idx * FRAME_LF_COUNT..idx * FRAME_LF_COUNT + FRAME_LF_COUNT);
+                    lvl_s[off] = core::array::from_fn(|i| {
+                        let d = dl.map_or(0, |d| d[slots[i]]);
+                        lp_ref.level(seg, r, mode, d, i)
+                    });
+                }
+                for sr in sr0_0..sr1_0 {
+                    let row_off = (sr - sr0_0) * cols0;
+                    for sc in 0..cols0 {
+                        tx0_s[row_off + sc] =
+                            self.loopfilter_tx_size_at(0, sr as u32, sc as u32, sx, sy) as u8;
+                    }
+                }
+                for sr in sr0_c..sr1_c {
+                    let row_off = (sr - sr0_c) * cols1;
+                    for sc in 0..cols1 {
+                        tx1_s[row_off + sc] =
+                            self.loopfilter_tx_size_at(1, sr as u32, sc as u32, sx, sy) as u8;
+                    }
+                }
+                for sr in sr0_c..sr1_c2 {
+                    let row_off = (sr - sr0_c) * cols2;
+                    for sc in 0..cols2 {
+                        tx2_s[row_off + sc] =
+                            self.loopfilter_tx_size_at(2, sr as u32, sc as u32, sx, sy) as u8;
+                    }
+                }
+            }));
+            r0 = r1;
+        }
+        crate::loop_filter::run_jobs(threads, jobs);
+        t
     }
 
     /// r479 — one plane, one pass of §7.14 over the edge rows
@@ -33084,12 +33583,12 @@ impl PartitionWalker {
                 Some(prev) => {
                     let v = get_segment_id(
                         prev,
-                        self.mi_rows,
-                        self.mi_cols,
-                        self.mi_rows,
-                        self.mi_cols,
-                        mi_row,
-                        mi_col,
+                        self.frame_mi_dims.0,
+                        self.frame_mi_dims.1,
+                        self.frame_mi_dims.0,
+                        self.frame_mi_dims.1,
+                        mi_row + self.lr_origin.0,
+                        mi_col + self.lr_origin.1,
                         sub_size,
                     )
                     .ok_or(crate::Error::PartitionWalkOutOfRange)?;
@@ -33332,10 +33831,20 @@ impl PartitionWalker {
                     inter_block.mv,
                     &mut cands,
                 );
+                if self.lr_origin != (0, 0) {
+                    let dy = (self.lr_origin.0 as i32) * 32;
+                    let dx = (self.lr_origin.1 as i32) * 32;
+                    for c in &mut cands {
+                        c.sy = c.sy.wrapping_add(dy);
+                        c.dy = c.dy.wrapping_add(dy);
+                        c.sx = c.sx.wrapping_add(dx);
+                        c.dx = c.dx.wrapping_add(dx);
+                    }
+                }
                 let lw = crate::inter_pred::warp_estimation(
                     &cands,
-                    mi_row as i32,
-                    mi_col as i32,
+                    (mi_row + self.lr_origin.0) as i32,
+                    (mi_col + self.lr_origin.1) as i32,
                     bw4 as i32,
                     bh4 as i32,
                     [inter_block.mv[0][0] as i16, inter_block.mv[0][1] as i16],
@@ -36197,10 +36706,12 @@ impl PartitionWalker {
         let num_lists: usize = if is_compound { 2 } else { 1 };
 
         // §7.10.2.1 setup-global-mv for slot 0 (and slot 1 if compound).
+        let frame_mi_row = mi_row + self.lr_origin.0;
+        let frame_mi_col = mi_col + self.lr_origin.1;
         let mut global_mvs: [[i32; 2]; 2] = [[0, 0], [0, 0]];
         global_mvs[0] = setup_global_mv(
-            mi_row,
-            mi_col,
+            frame_mi_row,
+            frame_mi_col,
             sub_size,
             ref_frame[0],
             &gm_type,
@@ -36210,8 +36721,8 @@ impl PartitionWalker {
         );
         if is_compound {
             global_mvs[1] = setup_global_mv(
-                mi_row,
-                mi_col,
+                frame_mi_row,
+                frame_mi_col,
                 sub_size,
                 ref_frame[1],
                 &gm_type,
@@ -36472,10 +36983,20 @@ impl PartitionWalker {
         for list in 0..num_lists {
             for idx in 0..state.num_mv_found as usize {
                 let mv = state.ref_stack_mv[idx][list];
-                state.ref_stack_mv[idx][list][0] =
-                    clamp_mv_row(mv[0], row_border, self.mi_rows as i32, bh4, mi_row as i32);
-                state.ref_stack_mv[idx][list][1] =
-                    clamp_mv_col(mv[1], col_border, self.mi_cols as i32, bw4, mi_col as i32);
+                state.ref_stack_mv[idx][list][0] = clamp_mv_row(
+                    mv[0],
+                    row_border,
+                    self.frame_mi_dims.0 as i32,
+                    bh4,
+                    frame_mi_row as i32,
+                );
+                state.ref_stack_mv[idx][list][1] = clamp_mv_col(
+                    mv[1],
+                    col_border,
+                    self.frame_mi_dims.1 as i32,
+                    bw4,
+                    frame_mi_col as i32,
+                );
             }
         }
 
@@ -36524,7 +37045,8 @@ impl PartitionWalker {
         state: &mut MvStackState,
     ) {
         let bw4 = NUM_4X4_BLOCKS_WIDE[sub_size] as i32;
-        let mi_cols_remaining = (self.mi_cols as i32) - (mi_col as i32);
+        let mi_cols_remaining =
+            (self.frame_mi_dims.1 as i32) - ((mi_col + self.lr_origin.1) as i32);
         let end4 = core::cmp::min(core::cmp::min(bw4, mi_cols_remaining), 16);
         let mut delta_row = delta_row;
         let mut delta_col: i32 = 0;
@@ -36595,7 +37117,8 @@ impl PartitionWalker {
         state: &mut MvStackState,
     ) {
         let bh4 = NUM_4X4_BLOCKS_HIGH[sub_size] as i32;
-        let mi_rows_remaining = (self.mi_rows as i32) - (mi_row as i32);
+        let mi_rows_remaining =
+            (self.frame_mi_dims.0 as i32) - ((mi_row + self.lr_origin.0) as i32);
         let end4 = core::cmp::min(core::cmp::min(bh4, mi_rows_remaining), 16);
         let mut delta_row: i32 = 0;
         let mut delta_col = delta_col;
@@ -36921,8 +37444,14 @@ impl PartitionWalker {
         let h4_base = NUM_4X4_BLOCKS_HIGH[sub_size] as i32;
         let mut w4 = core::cmp::min(16, w4_base);
         let mut h4 = core::cmp::min(16, h4_base);
-        w4 = core::cmp::min(w4, (self.mi_cols as i32) - (mi_col as i32));
-        h4 = core::cmp::min(h4, (self.mi_rows as i32) - (mi_row as i32));
+        w4 = core::cmp::min(
+            w4,
+            (self.frame_mi_dims.1 as i32) - ((mi_col + self.lr_origin.1) as i32),
+        );
+        h4 = core::cmp::min(
+            h4,
+            (self.frame_mi_dims.0 as i32) - ((mi_row + self.lr_origin.0) as i32),
+        );
         let num4x4 = core::cmp::min(w4, h4);
 
         let mut ref_id_count: [usize; 2] = [0, 0];
@@ -37272,9 +37801,9 @@ impl PartitionWalker {
             return;
         }
 
-        // §7.10.2.6: x8 = mvCol >> 1; y8 = mvRow >> 1.
-        let x8 = (mv_col >> 1) as u32;
-        let y8 = (mv_row >> 1) as u32;
+        // §7.10.2.6: x8 = mvCol >> 1; y8 = mvRow >> 1 (translated to frame coords).
+        let x8 = ((mv_col + self.lr_origin.1 as i32) >> 1) as u32;
+        let y8 = ((mv_row + self.lr_origin.0 as i32) >> 1) as u32;
 
         if delta_row == 0 && delta_col == 0 {
             // §7.10.2.6 centre-cell ZeroMvContext base value (becomes
@@ -37456,9 +37985,9 @@ pub struct MotionFieldMvs {
 /// r481 — one position of the projected motion field (see
 /// [`MotionFieldMvs`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ProjectedMv {
-    mv: [i16; 2],
-    ref_offset: i8,
+pub(crate) struct ProjectedMv {
+    pub(crate) mv: [i16; 2],
+    pub(crate) ref_offset: i8,
 }
 
 impl MotionFieldMvs {
@@ -37495,6 +38024,12 @@ impl MotionFieldMvs {
     /// r481 — the §7.9.2 `refToDst` per destination reference.
     pub(crate) fn set_ref_to_dst(&mut self, ref_to_dst: [i32; 8]) {
         self.ref_to_dst = ref_to_dst;
+    }
+
+    /// Direct mutable access to the projected `(y8, x8)` buffer for
+    /// disjoint 8-row band parallel motion-field estimation.
+    pub(crate) fn projected_slice_mut(&mut self) -> &mut [ProjectedMv] {
+        &mut self.projected
     }
 
     /// r481 — record a valid §7.9.2 projection at `( y8, x8 )`: the
