@@ -569,7 +569,13 @@ fn decode_or_defer(
         .as_ref()
         .map_or(0u64, |fs| u64::from(fs.upscaled_width) * u64::from(fs.frame_height));
     let (recon_limit, window_limit) = pipeline_limits(threads, frame_samples);
-    if let Some(jobs) = jobs.filter(|_| threads > 1 && recon_limit > 1) {
+    // Multi-tile frames (`tiles.len() >= 4`, `!allow_intrabc`) saturate the
+    // persistent worker pool via tile-parallel decode + parallel in-loop
+    // filtering in a single pass, avoiding ParseOnly double-parsing, OS
+    // thread-spawn churn, pyramid condvar stalls, and multi-frame RAM bloat.
+    let use_frame_parallel =
+        threads > 1 && recon_limit > 1 && (tiles.len() < 4 || fh.allow_intrabc);
+    if let Some(jobs) = jobs.filter(|_| use_frame_parallel) {
         let mut guard = jobs.admit(window_limit)?;
         // What the frame reads, as it stands before the frame's own
         // reference update.
@@ -668,7 +674,7 @@ fn decode_or_defer(
                             &tiles,
                             Some(&snapshot),
                             &mut st,
-                            1,
+                            recon_limit.min(tiles.len()).max(1),
                             FrameMode::ParseOnly,
                         )?
                     };
@@ -971,7 +977,11 @@ fn decode_frame_spec_tiles(
     mode: FrameMode<'_>,
 ) -> Result<DecodedFrameInternal, Error> {
     let parse_only = matches!(mode, FrameMode::ParseOnly);
-    let need_meta = !matches!(mode, FrameMode::Recon { on_meta: None, .. });
+    let need_meta = match mode {
+        FrameMode::ParseOnly => true,
+        FrameMode::Recon { ref on_meta, .. } => on_meta.is_some(),
+        FrameMode::Full => fh.refresh_frame_flags != 0,
+    };
     let (mut writer, mut on_meta, projected_mfmvs) = match mode {
         FrameMode::Recon {
             writer,
@@ -1174,6 +1184,7 @@ fn decode_frame_spec_tiles(
                 seq,
                 mi_rows,
                 mi_cols,
+                threads,
             )?,
         }
     } else {
@@ -1669,151 +1680,167 @@ fn decode_frame_spec_tiles(
         });
     }
 
-    let mut walker = PartitionWalker::new(
-        mi_rows,
-        mi_cols,
-        TileGeometry {
-            mi_row_start: 0,
-            mi_row_end: mi_rows,
-            mi_col_start: 0,
-            mi_col_end: mi_cols,
-        },
-    )
-    .ok_or(Error::PartitionWalkOutOfRange)?;
-    walker.set_parse_only(parse_only);
-    walker.set_keep_residual_readouts(false);
-    if any_pending {
-        walker.set_ref_rows(Some(Arc::new(row_sources)));
+    let tile_parallel = threads > 1 && tiles.len() > 1 && !fh.allow_intrabc;
+    let mut walker = if tile_parallel && !parse_only && pipeline.is_none() {
+        PartitionWalker::new_for_tile_stitch(mi_rows, mi_cols)
+            .ok_or(Error::PartitionWalkOutOfRange)?
+    } else {
+        let mut w = PartitionWalker::new(
+            mi_rows,
+            mi_cols,
+            TileGeometry {
+                mi_row_start: 0,
+                mi_row_end: mi_rows,
+                mi_col_start: 0,
+                mi_col_end: mi_cols,
+            },
+        )
+        .ok_or(Error::PartitionWalkOutOfRange)?;
+        w.set_parse_only(parse_only);
+        w.set_keep_residual_readouts(false);
+        w
+    };
+    let row_sources_arc = any_pending.then(|| Arc::new(row_sources));
+    if let Some(ref rs) = row_sources_arc {
+        walker.set_ref_rows(Some(Arc::clone(rs)));
     }
     if pipeline.is_some() {
         walker.ensure_curr_frame_planes(cc.num_planes as usize, sub_x_u8, sub_y_u8);
     }
 
-    let tile_parallel =
-        threads > 1 && tiles.len() > 1 && fh.frame_is_intra && !fh.allow_intrabc && !is_inter_frame;
+    let mut parallel_meta: Option<(Vec<i8>, Vec<i16>, Vec<i32>)> = None;
     if tile_parallel {
-        use std::sync::atomic::{AtomicUsize, Ordering};
         let worker_count = threads.min(tiles.len());
-        let next = AtomicUsize::new(0);
         let lr_walk_ref = if lr.uses_lr { Some(&lr_walk) } else { None };
-        let decode_one =
-            |tile_num: usize| -> Result<(PartitionWalker, Box<TileCdfContext>), Error> {
-                let tile = &tiles[tile_num];
-                let tile_row = (tile_num as u32) / ti.tile_cols;
-                let tile_col = (tile_num as u32) % ti.tile_cols;
-                let (r0, r1) = (
-                    ti.mi_row_starts[tile_row as usize],
-                    ti.mi_row_starts[tile_row as usize + 1],
-                );
-                let (c0, c1) = (
-                    ti.mi_col_starts[tile_col as usize],
-                    ti.mi_col_starts[tile_col as usize + 1],
-                );
-                let (h4, w4) = (r1 - r0, c1 - c0);
-                let mut local = PartitionWalker::new(
-                    h4,
-                    w4,
-                    TileGeometry {
+        let ictx_ref = ictx.as_ref();
+        let row_sources_ref = row_sources_arc.as_ref();
+        type TileJobSlot = Mutex<Option<Result<(PartitionWalker, Box<TileCdfContext>), Error>>>;
+        let out_slots: Vec<TileJobSlot> = (0..tiles.len()).map(|_| Mutex::new(None)).collect();
+        // LPT scheduling: `ScopedBatch::run_one` pops from the back, so order
+        // ascending by tile byte length to start the heaviest tiles first.
+        let mut tile_order: Vec<usize> = (0..tiles.len()).collect();
+        tile_order.sort_by_key(|&i| tiles[i].bytes.len());
+        let mut tile_jobs: Vec<Box<dyn FnOnce() + Send + '_>> = Vec::with_capacity(tiles.len());
+        for tile_num in tile_order {
+            let slot = &out_slots[tile_num];
+            let tile = &tiles[tile_num];
+            let tile_row = (tile_num as u32) / ti.tile_cols;
+            let tile_col = (tile_num as u32) % ti.tile_cols;
+            let (r0, r1) = (
+                ti.mi_row_starts[tile_row as usize],
+                ti.mi_row_starts[tile_row as usize + 1],
+            );
+            let (c0, c1) = (
+                ti.mi_col_starts[tile_col as usize],
+                ti.mi_col_starts[tile_col as usize + 1],
+            );
+            let params_ref = &params;
+            let quant_ref = &quant;
+            let frame_start_ref = frame_start_cdfs.as_ref();
+            let disable_cdf = fh.disable_cdf_update;
+            let base_q = i32::from(qp.base_q_idx);
+            let delta_q = dq.delta_q_present;
+            tile_jobs.push(Box::new(move || {
+                let res = (|| -> Result<(PartitionWalker, Box<TileCdfContext>), Error> {
+                    let (h4, w4) = (r1 - r0, c1 - c0);
+                    let mut local = PartitionWalker::new(
+                        h4,
+                        w4,
+                        TileGeometry {
+                            mi_row_start: 0,
+                            mi_row_end: h4,
+                            mi_col_start: 0,
+                            mi_col_end: w4,
+                        },
+                    )
+                    .ok_or(Error::PartitionWalkOutOfRange)?;
+                    local.set_tile_origin(r0, c0, mi_rows, mi_cols);
+                    local.set_parse_only(parse_only);
+                    local.set_keep_residual_readouts(false);
+                    if let Some(rs) = row_sources_ref {
+                        local.set_ref_rows(Some(Arc::clone(rs)));
+                    }
+                    local.begin_tile(TileGeometry {
                         mi_row_start: 0,
                         mi_row_end: h4,
                         mi_col_start: 0,
                         mi_col_end: w4,
-                    },
+                    });
+                    local.set_current_q_index(base_q);
+                    let mut decoder =
+                        SymbolDecoder::init_symbol(&tile.bytes, tile.bytes.len(), disable_cdf)?;
+                    let mut cdfs = frame_start_ref.clone();
+                    local.decode_tile_syntax_with_lr(
+                        &mut decoder,
+                        &mut cdfs,
+                        params_ref,
+                        lr_walk_ref,
+                        ictx_ref,
+                        quant_ref,
+                        delta_q,
+                    )?;
+                    Ok((local, Box::new(cdfs)))
+                })();
+                *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(res);
+            }));
+        }
+        crate::loop_filter::run_jobs(worker_count, tile_jobs);
+        let mut by_row: Vec<crate::cdf::TileRowBatch> = (0..ti.tile_rows as usize)
+            .map(|tr| {
+                (
+                    ti.mi_row_starts[tr],
+                    ti.mi_row_starts[tr + 1],
+                    Vec::with_capacity(ti.tile_cols as usize),
                 )
+            })
+            .collect();
+        for (t, slot) in out_slots.into_iter().enumerate() {
+            let out = slot
+                .into_inner()
+                .unwrap_or_else(|e| e.into_inner())
                 .ok_or(Error::PartitionWalkOutOfRange)?;
-                local.set_lr_origin(r0, c0);
-                local.set_parse_only(parse_only);
-                local.set_keep_residual_readouts(false);
-                local.begin_tile(TileGeometry {
-                    mi_row_start: 0,
-                    mi_row_end: h4,
-                    mi_col_start: 0,
-                    mi_col_end: w4,
-                });
-                local.set_current_q_index(i32::from(qp.base_q_idx));
-                let mut decoder = SymbolDecoder::init_symbol(
-                    &tile.bytes,
-                    tile.bytes.len(),
-                    fh.disable_cdf_update,
-                )?;
-                let mut cdfs = frame_start_cdfs.as_ref().clone();
-                local.decode_tile_syntax_with_lr(
-                    &mut decoder,
-                    &mut cdfs,
-                    &params,
-                    lr_walk_ref,
-                    None,
-                    &quant,
-                    dq.delta_q_present,
-                )?;
-                Ok((local, Box::new(cdfs)))
-            };
-        let mut first_err: Option<Error> = None;
-        std::thread::scope(|scope| {
-            let (tx, rx) = std::sync::mpsc::channel();
-            for _ in 0..worker_count {
-                let tx = tx.clone();
-                let next = &next;
-                let decode_one = &decode_one;
-                scope.spawn(move || {
-                    loop {
-                        let t = next.fetch_add(1, Ordering::SeqCst);
-                        if t >= tiles.len() {
-                            break;
-                        }
-                        let out = decode_one(t);
-                        if tx.send((t, out)).is_err() {
-                            break;
-                        }
-                    }
-                });
+            let (local, cdfs) = out?;
+            let tile_row = (t as u32) / ti.tile_cols;
+            let tile_col = (t as u32) % ti.tile_cols;
+            let (r0, r1) = (
+                ti.mi_row_starts[tile_row as usize],
+                ti.mi_row_starts[tile_row as usize + 1],
+            );
+            let (c0, c1) = (
+                ti.mi_col_starts[tile_col as usize],
+                ti.mi_col_starts[tile_col as usize + 1],
+            );
+            if lr.uses_lr {
+                walker.import_lr_units_from(&local, r0, r1, c0, c1, &lr_walk);
             }
-            drop(tx);
-            for (t, out) in rx {
-                match out {
-                    Ok((local, cdfs)) => {
-                        let tile_row = (t as u32) / ti.tile_cols;
-                        let tile_col = (t as u32) % ti.tile_cols;
-                        let (r0, r1) = (
-                            ti.mi_row_starts[tile_row as usize],
-                            ti.mi_row_starts[tile_row as usize + 1],
-                        );
-                        let (c0, c1) = (
-                            ti.mi_col_starts[tile_col as usize],
-                            ti.mi_col_starts[tile_col as usize + 1],
-                        );
-                        walker.import_rect_from(
-                            &local,
-                            0,
-                            0,
-                            r0,
-                            c0,
-                            r1 - r0,
-                            c1 - c0,
-                            sub_x_u8,
-                            sub_y_u8,
-                        );
-                        if !parse_only {
-                            walker.import_curr_frame_rect_from(&local, r0, c0, sub_x_u8, sub_y_u8);
-                        }
-                        if lr.uses_lr {
-                            walker.import_lr_units_from(&local, r0, r1, c0, c1, &lr_walk);
-                        }
-                        if !fh.disable_frame_end_update_cdf && t as u32 == ti.context_update_tile_id
-                        {
-                            end_cdfs = Some(cdfs);
-                        }
-                    }
-                    Err(e) => {
-                        if first_err.is_none() {
-                            first_err = Some(e);
-                        }
-                    }
-                }
+            if !fh.disable_frame_end_update_cdf && t as u32 == ti.context_update_tile_id {
+                end_cdfs = Some(cdfs);
             }
-        });
-        if let Some(e) = first_err {
-            return Err(e);
+            if parse_only {
+                walker.import_rect_from(
+                    &local,
+                    0,
+                    0,
+                    r0,
+                    c0,
+                    r1 - r0,
+                    c1 - c0,
+                    sub_x_u8,
+                    sub_y_u8,
+                );
+            } else {
+                by_row[tile_row as usize].2.push((c0, c1, local));
+            }
+        }
+        if !parse_only {
+            parallel_meta = walker.import_tiles_post_pass_parallel(
+                by_row,
+                cc.num_planes as usize,
+                sub_x_u8,
+                sub_y_u8,
+                need_meta.then_some((is_inter_frame, past_refs)),
+                worker_count,
+            );
         }
         if let Some(p) = pipeline.as_mut() {
             p.advance(&mut walker, mi_rows)?;
@@ -1871,7 +1898,18 @@ fn decode_frame_spec_tiles(
     // `tempGrainSeed` dance keeps the newly-read seed). A slot with
     // no saved grain state resolves to `reset_grain_params()`.
     let effective_grain = effective_grain_params(fh, refs);
-    let mut meta = if need_meta {
+    let mut meta = if let Some((mf_ref_frames, mf_mvs, segment_ids)) = parallel_meta {
+        Some(FrameMeta {
+            mf_mvs,
+            mf_ref_frames,
+            order_hints_by_ref,
+            end_cdfs,
+            mi_rows,
+            mi_cols,
+            segment_ids,
+            grain_params: effective_grain.clone(),
+        })
+    } else if need_meta {
         // ---- §7.19 motion field motion vector storage. ----
         // Filter the §5.11.5 `Mvs[]` / `RefFrames[]` grids down to the
         // `MfMvs[]` / `MfRefFrames[]` payload §7.20 stores: per cell, the
@@ -2388,7 +2426,9 @@ fn decode_frame_spec_tiles(
     // is forced off — so the planes are not materialised (36 MiB at
     // 12 MP 4:2:0); the empty store reads as the never-referenced
     // placeholder if a non-conformant stream tries.
-    let store_planes = (!seq.reduced_still_picture_header || writer.is_some()) && !inloop_done;
+    let store_planes = fh.refresh_frame_flags != 0
+        && (!seq.reduced_still_picture_header || writer.is_some())
+        && !inloop_done;
     let ref_plane_dims: Vec<(u32, u32)> = plane_dims.clone();
     let max_val: u16 = ((1u32 << cc.bit_depth) - 1) as u16;
     let narrow = |buf: &[u16]| -> Vec<u8> {
@@ -2400,7 +2440,7 @@ fn decode_frame_spec_tiles(
     };
     // The §7.20 store copy of one plane: into the writer's planes
     // (frame-parallel decode, published at the end of the frame) or a
-    // fresh buffer.
+    // moved buffer (zero-copy on the no-grain path).
     let mut stored: Vec<Vec<u16>> = Vec::new();
     let mut store = |plane: usize, buf: &[u16]| {
         if !store_planes {
@@ -2424,40 +2464,58 @@ fn decode_frame_spec_tiles(
                 store(plane, b);
             }
             stages.ref_store += t_ref.elapsed();
-            let t_grain = StageClock::now();
-            let mut bufs: Vec<PlaneBuffer<'_, u16>> = Vec::with_capacity(num_planes);
-            for (buf, &(pw, ph)) in plane_bufs.iter_mut().zip(plane_dims.iter()) {
-                bufs.push(PlaneBuffer {
-                    rows: ph,
-                    cols: pw,
-                    samples: buf,
-                });
+            if !fh.show_frame {
+                Vec::new()
+            } else {
+                let t_grain = StageClock::now();
+                let mut bufs: Vec<PlaneBuffer<'_, u16>> = Vec::with_capacity(num_planes);
+                for (buf, &(pw, ph)) in plane_bufs.iter_mut().zip(plane_dims.iter()) {
+                    bufs.push(PlaneBuffer {
+                        rows: ph,
+                        cols: pw,
+                        samples: buf,
+                    });
+                }
+                film_grain_synthesis(
+                    fg,
+                    cc.bit_depth,
+                    cc.num_planes,
+                    u8::from(cc.subsampling_x),
+                    u8::from(cc.subsampling_y),
+                    cc.matrix_coefficients,
+                    &mut bufs,
+                );
+                stages.grain += t_grain.elapsed();
+                let t_out = StageClock::now();
+                let planes: Vec<Vec<u8>> = plane_bufs.iter().map(|b| narrow(b)).collect();
+                stages.output += t_out.elapsed();
+                planes
             }
-            film_grain_synthesis(
-                fg,
-                cc.bit_depth,
-                cc.num_planes,
-                u8::from(cc.subsampling_x),
-                u8::from(cc.subsampling_y),
-                cc.matrix_coefficients,
-                &mut bufs,
-            );
-            stages.grain += t_grain.elapsed();
-            let t_out = StageClock::now();
-            let planes: Vec<Vec<u8>> = plane_bufs.iter().map(|b| narrow(b)).collect();
-            stages.output += t_out.elapsed();
-            planes
         }
         _ => {
-            // r475 — no grain: one plane at a time, the `i32` plane
-            // released as soon as its `u16` store copy and output bytes
-            // exist (the peak holds one plane three ways, not all of
-            // them).
+            // r475 — no grain: move each `u16` plane straight into the
+            // §7.20 reference store (zero copy) and skip output narrowing
+            // on hidden (`!show_frame`) frames.
             let t_out = StageClock::now();
-            let mut planes: Vec<Vec<u8>> = Vec::with_capacity(num_planes);
+            let mut planes: Vec<Vec<u8>> = if fh.show_frame {
+                Vec::with_capacity(num_planes)
+            } else {
+                Vec::new()
+            };
             for (plane, buf) in plane_bufs.into_iter().enumerate() {
-                store(plane, &buf);
-                planes.push(narrow(&buf));
+                if fh.show_frame {
+                    planes.push(narrow(&buf));
+                }
+                if store_planes {
+                    if let Some(w) = writer.as_mut() {
+                        let rows = ref_plane_dims[plane].1 as usize;
+                        let dst = w.rows_mut(plane, 0, rows);
+                        let n = dst.len().min(buf.len());
+                        dst[..n].copy_from_slice(&buf[..n]);
+                    } else {
+                        stored.push(buf);
+                    }
+                }
             }
             stages.ref_store += t_ref.elapsed();
             stages.output += t_out.elapsed();
@@ -2576,8 +2634,9 @@ fn motion_field_estimation(
     seq: &SequenceHeader,
     mi_rows: u32,
     mi_cols: u32,
+    threads: usize,
 ) -> Result<MotionFieldMvs, Error> {
-    use crate::inter_pred::{MotionFieldSlot, motion_field_estimation_core};
+    use crate::inter_pred::{MotionFieldSlot, motion_field_estimation_parallel};
     let ir = fh
         .inter_refs
         .as_ref()
@@ -2604,7 +2663,7 @@ fn motion_field_estimation(
             frame_is_intra: st.frame_is_intra,
         });
     }
-    Ok(motion_field_estimation_core(
+    Ok(motion_field_estimation_parallel(
         &slots,
         &ir.ref_frame_idx,
         &order_hints,
@@ -2612,6 +2671,7 @@ fn motion_field_estimation(
         hint_bits,
         mi_rows,
         mi_cols,
+        threads,
     ))
 }
 

@@ -455,6 +455,134 @@ pub(crate) fn row_windows_mut<'a, T>(
 /// r475 — run `jobs` on up to `threads` scoped workers (a shared
 /// queue; serial when `threads <= 1`). Each job owns its disjoint
 /// slice of the picture, so the result is the serial result.
+struct ScopedBatch {
+    jobs: std::sync::Mutex<Vec<Box<dyn FnOnce() + Send + 'static>>>,
+    helpers_left: std::sync::atomic::AtomicUsize,
+    remaining: std::sync::atomic::AtomicUsize,
+    done_lock: std::sync::Mutex<()>,
+    done_cv: std::sync::Condvar,
+}
+
+impl ScopedBatch {
+    fn claim_helper(&self) -> bool {
+        let mut cur = self.helpers_left.load(std::sync::atomic::Ordering::Acquire);
+        loop {
+            if cur == 0 {
+                return false;
+            }
+            match self.helpers_left.compare_exchange_weak(
+                cur,
+                cur - 1,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(next) => cur = next,
+            }
+        }
+    }
+
+    fn run_one(&self) -> bool {
+        let job = self.jobs.lock().unwrap_or_else(|e| e.into_inner()).pop();
+        let Some(job) = job else {
+            return false;
+        };
+        struct Finish<'a>(&'a ScopedBatch);
+        impl Drop for Finish<'_> {
+            fn drop(&mut self) {
+                if self
+                    .0
+                    .remaining
+                    .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
+                    == 1
+                {
+                    let _g = self.0.done_lock.lock().unwrap_or_else(|e| e.into_inner());
+                    self.0.done_cv.notify_all();
+                }
+            }
+        }
+        let _finish = Finish(self);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+        true
+    }
+}
+
+struct WorkerPool {
+    state: std::sync::Arc<(
+        std::sync::Mutex<std::collections::VecDeque<std::sync::Arc<ScopedBatch>>>,
+        std::sync::Condvar,
+    )>,
+    spawned: std::sync::atomic::AtomicUsize,
+}
+
+impl WorkerPool {
+    fn global() -> &'static Self {
+        static POOL: std::sync::OnceLock<WorkerPool> = std::sync::OnceLock::new();
+        POOL.get_or_init(|| Self {
+            state: std::sync::Arc::new((
+                std::sync::Mutex::new(std::collections::VecDeque::new()),
+                std::sync::Condvar::new(),
+            )),
+            spawned: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    fn ensure_workers(&self, want: usize) {
+        let want = want.min(32);
+        loop {
+            let cur = self.spawned.load(std::sync::atomic::Ordering::Acquire);
+            if cur >= want {
+                return;
+            }
+            if self
+                .spawned
+                .compare_exchange(
+                    cur,
+                    cur + 1,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                let state = std::sync::Arc::clone(&self.state);
+                let _ = std::thread::Builder::new()
+                    .name("av1-worker".into())
+                    .spawn(move || {
+                        loop {
+                            let batch = {
+                                let (lock, cv) = &*state;
+                                let mut q = lock.lock().unwrap_or_else(|e| e.into_inner());
+                                loop {
+                                    let mut picked = None;
+                                    while let Some(front) = q.front() {
+                                        if front.claim_helper() {
+                                            let b = std::sync::Arc::clone(front);
+                                            if b.helpers_left
+                                                .load(std::sync::atomic::Ordering::Acquire)
+                                                == 0
+                                            {
+                                                q.pop_front();
+                                            }
+                                            picked = Some(b);
+                                            break;
+                                        } else {
+                                            q.pop_front();
+                                        }
+                                    }
+                                    if let Some(b) = picked {
+                                        break b;
+                                    }
+                                    q = cv.wait(q).unwrap_or_else(|e| e.into_inner());
+                                }
+                            };
+                            while batch.run_one() {}
+                        }
+                    });
+            }
+        }
+    }
+}
+
 pub(crate) fn run_jobs<'a>(threads: usize, jobs: Vec<Box<dyn FnOnce() + Send + 'a>>) {
     let threads = crate::platform::clamp_threads(threads);
     if threads <= 1 || jobs.len() <= 1 {
@@ -463,24 +591,39 @@ pub(crate) fn run_jobs<'a>(threads: usize, jobs: Vec<Box<dyn FnOnce() + Send + '
         }
         return;
     }
-    let queue = std::sync::Mutex::new(jobs);
-    std::thread::scope(|scope| {
-        for _ in 0..threads.min(queue.lock().map(|q| q.len()).unwrap_or(1)) {
-            let queue = &queue;
-            scope.spawn(move || {
-                loop {
-                    let job = match queue.lock() {
-                        Ok(mut q) => q.pop(),
-                        Err(_) => None,
-                    };
-                    match job {
-                        Some(job) => job(),
-                        None => break,
-                    }
-                }
-            });
-        }
+    let count = jobs.len();
+    let helpers = threads.min(count).saturating_sub(1);
+    let pool = WorkerPool::global();
+    pool.ensure_workers(helpers);
+
+    // SAFETY: `run_jobs` blocks until `batch.remaining == 0` (every job has
+    // finished running and been dropped) before returning, so no worker can
+    // access any `'a` borrow past the end of this function call.
+    let erased: Vec<Box<dyn FnOnce() + Send + 'static>> = unsafe { core::mem::transmute(jobs) };
+    let batch = std::sync::Arc::new(ScopedBatch {
+        jobs: std::sync::Mutex::new(erased),
+        helpers_left: std::sync::atomic::AtomicUsize::new(helpers),
+        remaining: std::sync::atomic::AtomicUsize::new(count),
+        done_lock: std::sync::Mutex::new(()),
+        done_cv: std::sync::Condvar::new(),
     });
+    {
+        let (lock, cv) = &*pool.state;
+        let mut q = lock.lock().unwrap_or_else(|e| e.into_inner());
+        q.push_back(std::sync::Arc::clone(&batch));
+        if helpers >= pool.spawned.load(std::sync::atomic::Ordering::Acquire) {
+            cv.notify_all();
+        } else {
+            for _ in 0..helpers {
+                cv.notify_one();
+            }
+        }
+    }
+    while batch.run_one() {}
+    let mut g = batch.done_lock.lock().unwrap_or_else(|e| e.into_inner());
+    while batch.remaining.load(std::sync::atomic::Ordering::Acquire) > 0 {
+        g = batch.done_cv.wait(g).unwrap_or_else(|e| e.into_inner());
+    }
 }
 
 /// §7.14.2 per-edge driver — av1-spec p.307-310 lines 16994-17126.
@@ -987,8 +1130,24 @@ pub fn loop_filter_rows_window_table<S: Sample>(
                 (y_w - reach, x_p, y_w + reach - 1, x_p + 3)
             };
             if lo_y >= 0 && lo_x >= 0 && hi_y < window.rows as i32 && hi_x < window.cols as i32 {
-                // A horizontal edge's four columns are contiguous in every
-                // tap row: explicit lanes where the target has them.
+                // Explicit SIMD lanes where the target has them: both passes on
+                // AArch64 NEON, horizontal pass on wasm32 SIMD128.
+                #[cfg(target_arch = "aarch64")]
+                if pass == 0
+                    && simd::edge_vertical(
+                        window,
+                        x_p,
+                        y_w,
+                        plane,
+                        limit,
+                        blimit,
+                        thresh,
+                        filter_size,
+                        t.bit_depth,
+                    )
+                {
+                    continue;
+                }
                 #[cfg(any(
                     target_arch = "aarch64",
                     all(target_arch = "wasm32", target_feature = "simd128")

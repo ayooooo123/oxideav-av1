@@ -5205,6 +5205,149 @@ pub struct RefFrameStoreEntry<'a> {
 /// out-of-range resolved `refIdx`, a `curr_plane` too small for the
 /// `(x, y, w, h)` write region, or anything [`predict_inter`] itself
 /// rejects.
+#[allow(clippy::large_enum_variant)]
+enum PredScratch {
+    Stack([u16; 4096], usize),
+    Heap(Vec<u16>),
+}
+
+impl PredScratch {
+    #[inline]
+    fn new(len: usize) -> Self {
+        if len <= 4096 {
+            Self::Stack([0u16; 4096], len)
+        } else {
+            Self::Heap(vec![0u16; len])
+        }
+    }
+
+    #[inline]
+    fn as_mut_slice(&mut self) -> &mut [u16] {
+        match self {
+            Self::Stack(buf, len) => &mut buf[..*len],
+            Self::Heap(v) => v.as_mut_slice(),
+        }
+    }
+
+    #[inline]
+    fn as_slice(&self) -> &[u16] {
+        match self {
+            Self::Stack(buf, len) => &buf[..*len],
+            Self::Heap(v) => v.as_slice(),
+        }
+    }
+}
+
+#[inline]
+fn stitch_pred_at(
+    dst_x: i32,
+    dst_y: i32,
+    w: usize,
+    h: usize,
+    pred_out: &[u16],
+    curr_plane: &mut [u16],
+    curr_stride: usize,
+) -> Result<(), crate::Error> {
+    if dst_x < 0 || dst_y < 0 {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    let (px, py) = (dst_x as usize, dst_y as usize);
+    if curr_stride == 0 || px >= curr_stride {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    let plane_rows = curr_plane.len() / curr_stride;
+    if py >= plane_rows {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    let fit_w = w.min(curr_stride - px);
+    let fit_h = h.min(plane_rows - py);
+    for i in 0..fit_h {
+        let dst = (py + i) * curr_stride + px;
+        let src = i * w;
+        curr_plane[dst..dst + fit_w].copy_from_slice(&pred_out[src..src + fit_w]);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reconstruct_inter_block_at(
+    mode_info: InterModeInfo,
+    ref_frame_idx: &[u8],
+    frame_store: &[RefFrameStoreEntry<'_>],
+    plane: u8,
+    x: i32,
+    y: i32,
+    dst_x: i32,
+    dst_y: i32,
+    w: usize,
+    h: usize,
+    bit_depth: u8,
+    subsampling_x: u8,
+    subsampling_y: u8,
+    frame_width: u32,
+    frame_height: u32,
+    interp_filter_x: u8,
+    interp_filter_y: u8,
+    curr_plane: &mut [u16],
+    curr_stride: usize,
+) -> Result<(), crate::Error> {
+    let ref_frame = mode_info.ref_frame as usize;
+    if !(crate::uncompressed_header_tail::LAST_FRAME
+        ..=crate::uncompressed_header_tail::ALTREF_FRAME)
+        .contains(&ref_frame)
+    {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    let slot = ref_frame - crate::uncompressed_header_tail::LAST_FRAME;
+    let ref_idx = *ref_frame_idx
+        .get(slot)
+        .ok_or(crate::Error::PartitionWalkOutOfRange)? as usize;
+    let entry = frame_store
+        .get(ref_idx)
+        .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+    let refs = [PredictInterRef {
+        ref_plane: entry.plane,
+        ref_stride: entry.stride,
+        ref_upscaled_width: entry.upscaled_width,
+        ref_width: entry.width,
+        ref_height: entry.height,
+        mv: mode_info.mv,
+    }];
+    let mut pred_out = PredScratch::new(w * h);
+    predict_inter(
+        plane,
+        x,
+        y,
+        w,
+        h,
+        crate::cdf::MOTION_MODE_SIMPLE,
+        false,
+        false,
+        bit_depth,
+        subsampling_x,
+        subsampling_y,
+        frame_width,
+        frame_height,
+        interp_filter_x,
+        interp_filter_y,
+        &refs,
+        None,
+        None,
+        None,
+        None,
+        pred_out.as_mut_slice(),
+    )?;
+    stitch_pred_at(
+        dst_x,
+        dst_y,
+        w,
+        h,
+        pred_out.as_slice(),
+        curr_plane,
+        curr_stride,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn reconstruct_inter_block(
     mode_info: InterModeInfo,
@@ -5225,53 +5368,17 @@ pub fn reconstruct_inter_block(
     curr_plane: &mut [u16],
     curr_stride: usize,
 ) -> Result<(), crate::Error> {
-    // ---------- §7.11.3.1 step 5 — RefFrame[0] validity ----------
-    //
-    // This driver is the inter arm: `RefFrame[0]` must be a real
-    // inter reference (`LAST_FRAME..=ALTREF_FRAME`, i.e. 1..=7).
-    // INTRA_FRAME (0) and any value past ALTREF_FRAME is a caller bug.
-    let ref_frame = mode_info.ref_frame as usize;
-    if !(crate::uncompressed_header_tail::LAST_FRAME
-        ..=crate::uncompressed_header_tail::ALTREF_FRAME)
-        .contains(&ref_frame)
-    {
-        return Err(crate::Error::PartitionWalkOutOfRange);
-    }
-
-    // ---------- §7.11.3.3 — refIdx = ref_frame_idx[ ref - LAST ] ---
-    //
-    // av1-spec p.252 line 4942 / p.274 line 14812: the small
-    // `RefFrame` index selects a `ref_frame_idx[]` slot which in turn
-    // names a `FrameStore[]` entry.
-    let slot = ref_frame - crate::uncompressed_header_tail::LAST_FRAME;
-    let ref_idx = *ref_frame_idx
-        .get(slot)
-        .ok_or(crate::Error::PartitionWalkOutOfRange)? as usize;
-    let entry = frame_store
-        .get(ref_idx)
-        .ok_or(crate::Error::PartitionWalkOutOfRange)?;
-
-    // ---------- §7.11.3.1 step 5 → PredictInterRef bundle ----------
-    let refs = [PredictInterRef {
-        ref_plane: entry.plane,
-        ref_stride: entry.stride,
-        ref_upscaled_width: entry.upscaled_width,
-        ref_width: entry.width,
-        ref_height: entry.height,
-        mv: mode_info.mv,
-    }];
-
-    // ---------- §7.11.3.1 steps 1-13 — prediction into scratch -----
-    let mut pred_out = vec![0u16; w * h];
-    predict_inter(
+    reconstruct_inter_block_at(
+        mode_info,
+        ref_frame_idx,
+        frame_store,
         plane,
+        x,
+        y,
         x,
         y,
         w,
         h,
-        crate::cdf::MOTION_MODE_SIMPLE,
-        /* is_compound */ false,
-        /* is_inter_intra */ false,
         bit_depth,
         subsampling_x,
         subsampling_y,
@@ -5279,48 +5386,9 @@ pub fn reconstruct_inter_block(
         frame_height,
         interp_filter_x,
         interp_filter_y,
-        &refs,
-        /* compound */ None,
-        /* inter_intra */ None,
-        /* warp */ None,
-        /* obmc */ None,
-        &mut pred_out,
-    )?;
-
-    // ---------- §7.11.3.1 final step — CurrFrame[plane] stitch -----
-    //
-    // av1-spec p.258 line 14402: `CurrFrame[plane][y + i][x + j] =
-    // Clip1(preds[0][i][j])`. `predict_inter` already applied the
-    // `Clip1` (single-ref final-clip arm); here we copy the resulting
-    // `w × h` block into the plane buffer at plane coords `(x, y)`.
-    if x < 0 || y < 0 {
-        return Err(crate::Error::PartitionWalkOutOfRange);
-    }
-    let (px, py) = (x as usize, y as usize);
-    // The write region must fit the supplied plane buffer.
-    // §5.11.4 allows a leaf to OVERHANG the frame's bottom / right mi
-    // edge (only its on-frame cells are grid-stamped). The §7.11.3.1
-    // prediction still runs at the FULL block geometry — the wedge /
-    // OBMC-band / small-block-filter derivations depend on
-    // `Block_{Width,Height}` — but only the rows / columns inside the
-    // plane are stitched back (r394: the previous full-fit guard
-    // rejected every bottom-edge overhanging inter block).
-    if curr_stride == 0 || px >= curr_stride {
-        return Err(crate::Error::PartitionWalkOutOfRange);
-    }
-    let plane_rows = curr_plane.len() / curr_stride;
-    if py >= plane_rows {
-        return Err(crate::Error::PartitionWalkOutOfRange);
-    }
-    let fit_w = w.min(curr_stride - px);
-    let fit_h = h.min(plane_rows - py);
-    for i in 0..fit_h {
-        let dst = (py + i) * curr_stride + px;
-        let src = i * w;
-        curr_plane[dst..dst + fit_w].copy_from_slice(&pred_out[src..src + fit_w]);
-    }
-
-    Ok(())
+        curr_plane,
+        curr_stride,
+    )
 }
 
 /// §7.11.3.1 single forward-reference **warped-motion** reconstruction —
@@ -5359,7 +5427,7 @@ pub fn reconstruct_inter_block(
 /// `refIdx`, a `curr_plane` too small for the `(x, y, w, h)` write
 /// region), plus anything [`predict_inter`]'s WARP arm itself rejects.
 #[allow(clippy::too_many_arguments)]
-pub fn reconstruct_inter_block_warp(
+fn reconstruct_inter_block_warp_at(
     mode_info: InterModeInfo,
     warp: &WarpDriverParams,
     ref_frame_idx: &[u8],
@@ -5367,6 +5435,8 @@ pub fn reconstruct_inter_block_warp(
     plane: u8,
     x: i32,
     y: i32,
+    dst_x: i32,
+    dst_y: i32,
     w: usize,
     h: usize,
     bit_depth: u8,
@@ -5408,7 +5478,7 @@ pub fn reconstruct_inter_block_warp(
     }];
 
     // ---------- §7.11.3.1 steps 1-13 — WARP prediction into scratch ---
-    let mut pred_out = vec![0u16; w * h];
+    let mut pred_out = PredScratch::new(w * h);
     predict_inter(
         plane,
         x,
@@ -5430,37 +5500,63 @@ pub fn reconstruct_inter_block_warp(
         /* inter_intra */ None,
         Some(warp),
         /* obmc */ None,
-        &mut pred_out,
+        pred_out.as_mut_slice(),
     )?;
 
-    // ---------- §7.11.3.1 final step — CurrFrame[plane] stitch -----
-    if x < 0 || y < 0 {
-        return Err(crate::Error::PartitionWalkOutOfRange);
-    }
-    let (px, py) = (x as usize, y as usize);
-    // §5.11.4 allows a leaf to OVERHANG the frame's bottom / right mi
-    // edge (only its on-frame cells are grid-stamped). The §7.11.3.1
-    // prediction still runs at the FULL block geometry — the wedge /
-    // OBMC-band / small-block-filter derivations depend on
-    // `Block_{Width,Height}` — but only the rows / columns inside the
-    // plane are stitched back (r394: the previous full-fit guard
-    // rejected every bottom-edge overhanging inter block).
-    if curr_stride == 0 || px >= curr_stride {
-        return Err(crate::Error::PartitionWalkOutOfRange);
-    }
-    let plane_rows = curr_plane.len() / curr_stride;
-    if py >= plane_rows {
-        return Err(crate::Error::PartitionWalkOutOfRange);
-    }
-    let fit_w = w.min(curr_stride - px);
-    let fit_h = h.min(plane_rows - py);
-    for i in 0..fit_h {
-        let dst = (py + i) * curr_stride + px;
-        let src = i * w;
-        curr_plane[dst..dst + fit_w].copy_from_slice(&pred_out[src..src + fit_w]);
-    }
+    stitch_pred_at(
+        dst_x,
+        dst_y,
+        w,
+        h,
+        pred_out.as_slice(),
+        curr_plane,
+        curr_stride,
+    )
+}
 
-    Ok(())
+#[allow(clippy::too_many_arguments)]
+pub fn reconstruct_inter_block_warp(
+    mode_info: InterModeInfo,
+    warp: &WarpDriverParams,
+    ref_frame_idx: &[u8],
+    frame_store: &[RefFrameStoreEntry<'_>],
+    plane: u8,
+    x: i32,
+    y: i32,
+    w: usize,
+    h: usize,
+    bit_depth: u8,
+    subsampling_x: u8,
+    subsampling_y: u8,
+    frame_width: u32,
+    frame_height: u32,
+    interp_filter_x: u8,
+    interp_filter_y: u8,
+    curr_plane: &mut [u16],
+    curr_stride: usize,
+) -> Result<(), crate::Error> {
+    reconstruct_inter_block_warp_at(
+        mode_info,
+        warp,
+        ref_frame_idx,
+        frame_store,
+        plane,
+        x,
+        y,
+        x,
+        y,
+        w,
+        h,
+        bit_depth,
+        subsampling_x,
+        subsampling_y,
+        frame_width,
+        frame_height,
+        interp_filter_x,
+        interp_filter_y,
+        curr_plane,
+        curr_stride,
+    )
 }
 
 /// §7.11.3.1 single forward-reference **OBMC** (overlapped block motion
@@ -5501,7 +5597,7 @@ pub fn reconstruct_inter_block_warp(
 /// `refIdx`, a `curr_plane` too small for the `(x, y, w, h)` write
 /// region), plus anything [`predict_inter`]'s OBMC arm itself rejects.
 #[allow(clippy::too_many_arguments)]
-pub fn reconstruct_inter_block_obmc(
+fn reconstruct_inter_block_obmc_at(
     mode_info: InterModeInfo,
     obmc: &ObmcParams<'_, '_>,
     ref_frame_idx: &[u8],
@@ -5509,6 +5605,8 @@ pub fn reconstruct_inter_block_obmc(
     plane: u8,
     x: i32,
     y: i32,
+    dst_x: i32,
+    dst_y: i32,
     w: usize,
     h: usize,
     bit_depth: u8,
@@ -5550,7 +5648,7 @@ pub fn reconstruct_inter_block_obmc(
     }];
 
     // ---------- §7.11.3.1 steps 1-13 + §7.11.3.9-10 OBMC post-step ---
-    let mut pred_out = vec![0u16; w * h];
+    let mut pred_out = PredScratch::new(w * h);
     predict_inter(
         plane,
         x,
@@ -5572,37 +5670,63 @@ pub fn reconstruct_inter_block_obmc(
         /* inter_intra */ None,
         /* warp */ None,
         Some(obmc),
-        &mut pred_out,
+        pred_out.as_mut_slice(),
     )?;
 
-    // ---------- §7.11.3.1 final step — CurrFrame[plane] stitch -----
-    if x < 0 || y < 0 {
-        return Err(crate::Error::PartitionWalkOutOfRange);
-    }
-    let (px, py) = (x as usize, y as usize);
-    // §5.11.4 allows a leaf to OVERHANG the frame's bottom / right mi
-    // edge (only its on-frame cells are grid-stamped). The §7.11.3.1
-    // prediction still runs at the FULL block geometry — the wedge /
-    // OBMC-band / small-block-filter derivations depend on
-    // `Block_{Width,Height}` — but only the rows / columns inside the
-    // plane are stitched back (r394: the previous full-fit guard
-    // rejected every bottom-edge overhanging inter block).
-    if curr_stride == 0 || px >= curr_stride {
-        return Err(crate::Error::PartitionWalkOutOfRange);
-    }
-    let plane_rows = curr_plane.len() / curr_stride;
-    if py >= plane_rows {
-        return Err(crate::Error::PartitionWalkOutOfRange);
-    }
-    let fit_w = w.min(curr_stride - px);
-    let fit_h = h.min(plane_rows - py);
-    for i in 0..fit_h {
-        let dst = (py + i) * curr_stride + px;
-        let src = i * w;
-        curr_plane[dst..dst + fit_w].copy_from_slice(&pred_out[src..src + fit_w]);
-    }
+    stitch_pred_at(
+        dst_x,
+        dst_y,
+        w,
+        h,
+        pred_out.as_slice(),
+        curr_plane,
+        curr_stride,
+    )
+}
 
-    Ok(())
+#[allow(clippy::too_many_arguments)]
+pub fn reconstruct_inter_block_obmc(
+    mode_info: InterModeInfo,
+    obmc: &ObmcParams<'_, '_>,
+    ref_frame_idx: &[u8],
+    frame_store: &[RefFrameStoreEntry<'_>],
+    plane: u8,
+    x: i32,
+    y: i32,
+    w: usize,
+    h: usize,
+    bit_depth: u8,
+    subsampling_x: u8,
+    subsampling_y: u8,
+    frame_width: u32,
+    frame_height: u32,
+    interp_filter_x: u8,
+    interp_filter_y: u8,
+    curr_plane: &mut [u16],
+    curr_stride: usize,
+) -> Result<(), crate::Error> {
+    reconstruct_inter_block_obmc_at(
+        mode_info,
+        obmc,
+        ref_frame_idx,
+        frame_store,
+        plane,
+        x,
+        y,
+        x,
+        y,
+        w,
+        h,
+        bit_depth,
+        subsampling_x,
+        subsampling_y,
+        frame_width,
+        frame_height,
+        interp_filter_x,
+        interp_filter_y,
+        curr_plane,
+        curr_stride,
+    )
 }
 
 /// §7.11.3.1 compound two-reference mode-info descriptor — the decoded
@@ -5750,7 +5874,7 @@ pub struct CompoundOrderHintContext {
 /// a `curr_plane` too small for the `(x, y, w, h)` write region, or
 /// anything [`predict_inter`] itself rejects.
 #[allow(clippy::too_many_arguments)]
-pub fn reconstruct_inter_block_compound(
+fn reconstruct_inter_block_compound_at(
     mode_info: CompoundInterModeInfo,
     order_hints: CompoundOrderHintContext,
     ref_frame_idx: &[u8],
@@ -5758,6 +5882,8 @@ pub fn reconstruct_inter_block_compound(
     plane: u8,
     x: i32,
     y: i32,
+    dst_x: i32,
+    dst_y: i32,
     w: usize,
     h: usize,
     bit_depth: u8,
@@ -5768,12 +5894,6 @@ pub fn reconstruct_inter_block_compound(
     interp_filter_x: u8,
     interp_filter_y: u8,
     diffwtd_mask: Option<&mut [u8]>,
-    // §7.11.3.1 step-7 warp context for the GLOBAL_GLOBALMV /
-    // GLOBALMV-class compound arm (`useWarp = 2` fires per refList
-    // when `GmType[ RefFrame[ refList ] ] > TRANSLATION` — §5.11.27
-    // forces `motion_mode = SIMPLE` on this block class, so the
-    // compound driver is its only route). `None` keeps the
-    // translational-only path.
     warp: Option<&WarpDriverParams>,
     curr_plane: &mut [u16],
     curr_stride: usize,
@@ -5923,7 +6043,7 @@ pub fn reconstruct_inter_block_compound(
     };
 
     // ---------- §7.11.3.1 steps 1-14 — compound prediction ----------
-    let mut pred_out = vec![0u16; w * h];
+    let mut pred_out = PredScratch::new(w * h);
     predict_inter(
         plane,
         x,
@@ -5945,43 +6065,67 @@ pub fn reconstruct_inter_block_compound(
         /* inter_intra */ None,
         warp,
         /* obmc */ None,
-        &mut pred_out,
+        pred_out.as_mut_slice(),
     )?;
 
-    // ---------- §7.11.3.1 final step — CurrFrame[plane] stitch -------
-    //
-    // av1-spec p.258 line 14402: `CurrFrame[plane][y + i][x + j] =
-    // <combined>`. `predict_inter` already applied the step-14 combine
-    // + `Clip1` into `pred_out`; here we copy the `w × h` block into the
-    // plane buffer at plane coords `(x, y)` (same stitch as the
-    // single-ref arm).
-    if x < 0 || y < 0 {
-        return Err(crate::Error::PartitionWalkOutOfRange);
-    }
-    let (px, py) = (x as usize, y as usize);
-    // §5.11.4 allows a leaf to OVERHANG the frame's bottom / right mi
-    // edge (only its on-frame cells are grid-stamped). The §7.11.3.1
-    // prediction still runs at the FULL block geometry — the wedge /
-    // OBMC-band / small-block-filter derivations depend on
-    // `Block_{Width,Height}` — but only the rows / columns inside the
-    // plane are stitched back (r394: the previous full-fit guard
-    // rejected every bottom-edge overhanging inter block).
-    if curr_stride == 0 || px >= curr_stride {
-        return Err(crate::Error::PartitionWalkOutOfRange);
-    }
-    let plane_rows = curr_plane.len() / curr_stride;
-    if py >= plane_rows {
-        return Err(crate::Error::PartitionWalkOutOfRange);
-    }
-    let fit_w = w.min(curr_stride - px);
-    let fit_h = h.min(plane_rows - py);
-    for i in 0..fit_h {
-        let dst = (py + i) * curr_stride + px;
-        let src = i * w;
-        curr_plane[dst..dst + fit_w].copy_from_slice(&pred_out[src..src + fit_w]);
-    }
+    stitch_pred_at(
+        dst_x,
+        dst_y,
+        w,
+        h,
+        pred_out.as_slice(),
+        curr_plane,
+        curr_stride,
+    )
+}
 
-    Ok(())
+#[allow(clippy::too_many_arguments)]
+pub fn reconstruct_inter_block_compound(
+    mode_info: CompoundInterModeInfo,
+    order_hints: CompoundOrderHintContext,
+    ref_frame_idx: &[u8],
+    frame_store: &[RefFrameStoreEntry<'_>],
+    plane: u8,
+    x: i32,
+    y: i32,
+    w: usize,
+    h: usize,
+    bit_depth: u8,
+    subsampling_x: u8,
+    subsampling_y: u8,
+    frame_width: u32,
+    frame_height: u32,
+    interp_filter_x: u8,
+    interp_filter_y: u8,
+    diffwtd_mask: Option<&mut [u8]>,
+    warp: Option<&WarpDriverParams>,
+    curr_plane: &mut [u16],
+    curr_stride: usize,
+) -> Result<(), crate::Error> {
+    reconstruct_inter_block_compound_at(
+        mode_info,
+        order_hints,
+        ref_frame_idx,
+        frame_store,
+        plane,
+        x,
+        y,
+        x,
+        y,
+        w,
+        h,
+        bit_depth,
+        subsampling_x,
+        subsampling_y,
+        frame_width,
+        frame_height,
+        interp_filter_x,
+        interp_filter_y,
+        diffwtd_mask,
+        warp,
+        curr_plane,
+        curr_stride,
+    )
 }
 
 /// §7.11.3.1 inter-intra mode-info descriptor — the decoded
@@ -6092,13 +6236,15 @@ pub struct InterIntraWedgeModeInfo {
 /// rejects, a `curr_plane` too small for the `(x, y, w, h)` write region,
 /// or anything [`predict_inter`] itself rejects.
 #[allow(clippy::too_many_arguments)]
-pub fn reconstruct_inter_block_interintra(
+fn reconstruct_inter_block_interintra_at(
     mode_info: InterIntraModeInfo,
     ref_frame_idx: &[u8],
     frame_store: &[RefFrameStoreEntry<'_>],
     plane: u8,
     x: i32,
     y: i32,
+    dst_x: i32,
+    dst_y: i32,
     w: usize,
     h: usize,
     bit_depth: u8,
@@ -6145,22 +6291,10 @@ pub fn reconstruct_inter_block_interintra(
         mv: mode_info.mv,
     }];
 
-    // ---------- §7.11.3.1 final-write region bounds ----------
-    //
-    // Validate the `(x, y, w, h)` write region against `curr_plane`
-    // *before* reading the intra seed out of it (the read and the
-    // write-back share the region).
-    if x < 0 || y < 0 {
+    if dst_x < 0 || dst_y < 0 {
         return Err(crate::Error::PartitionWalkOutOfRange);
     }
-    let (px, py) = (x as usize, y as usize);
-    // §5.11.4 allows a leaf to OVERHANG the frame's bottom / right mi
-    // edge (only its on-frame cells are grid-stamped). The §7.11.3.1
-    // prediction still runs at the FULL block geometry — the wedge /
-    // OBMC-band / small-block-filter derivations depend on
-    // `Block_{Width,Height}` — but only the rows / columns inside the
-    // plane are stitched back (r394: the previous full-fit guard
-    // rejected every bottom-edge overhanging inter block).
+    let (px, py) = (dst_x as usize, dst_y as usize);
     if curr_stride == 0 || px >= curr_stride {
         return Err(crate::Error::PartitionWalkOutOfRange);
     }
@@ -6171,31 +6305,16 @@ pub fn reconstruct_inter_block_interintra(
     let fit_w = w.min(curr_stride - px);
     let fit_h = h.min(plane_rows - py);
 
-    // ---------- §7.11.3.14 step — seed scratch with intra pred -------
-    //
-    // av1-spec p.284 line 15786: `pred1 = CurrFrame[plane][y+dstY]
-    // [x+dstX]` — the §7.11.3.14 body reads the in-place intra prediction
-    // as the second blend operand. We copy that `w × h` window out of
-    // `curr_plane` into the scratch buffer `predict_inter` consumes (it
-    // overwrites the scratch with the blended sample in place).
-    let mut pred_out = vec![0u16; w * h];
-    // Seed only the in-plane window (an overhanging block's off-plane
-    // rows / columns have no intra prediction to read; the §7.11.3.14
-    // blend is pointwise, so the kept samples are unaffected by the
-    // zero padding).
-    for i in 0..fit_h {
-        let src = (py + i) * curr_stride + px;
-        let dst = i * w;
-        pred_out[dst..dst + fit_w].copy_from_slice(&curr_plane[src..src + fit_w]);
+    let mut pred_out = PredScratch::new(w * h);
+    {
+        let pred_slice = pred_out.as_mut_slice();
+        for i in 0..fit_h {
+            let src = (py + i) * curr_stride + px;
+            let dst = i * w;
+            pred_slice[dst..dst + fit_w].copy_from_slice(&curr_plane[src..src + fit_w]);
+        }
     }
 
-    // ---------- §7.11.3.11 wedge-mask regeneration (wedge arm) -------
-    //
-    // av1-spec p.258 line 14386: the §7.11.3.11 wedge mask is built only
-    // at `plane == 0`, then reused (downsampled) for chroma. The caller
-    // owns the persistent `wedge_mask_buf` across the per-plane calls; we
-    // fill it on the luma call and read it (unchanged) on the chroma
-    // calls. `wedge_sign == 0` is fixed by §5.11.28 (p.79 line 4965).
     let wedge_params: Option<InterIntraParams<'_>> = match mode_info.wedge {
         None => Some(InterIntraParams {
             interintra_mode: mode_info.interintra_mode,
@@ -6211,8 +6330,6 @@ pub fn reconstruct_inter_block_interintra(
             if buf.len() < luma_w * luma_h {
                 return Err(crate::Error::PartitionWalkOutOfRange);
             }
-            // Fill the luma-grid mask only at `plane == 0`; the chroma
-            // planes reuse the buffer the caller carried over.
             if plane == 0 {
                 let n4w = crate::cdf::num_4x4_blocks_wide(wi.mi_size) as u32;
                 let n4h = crate::cdf::num_4x4_blocks_high(wi.mi_size) as u32;
@@ -6221,7 +6338,7 @@ pub fn reconstruct_inter_block_interintra(
                     n4w,
                     n4h,
                     wi.wedge_index,
-                    /* wedge_sign */ 0,
+                    0,
                     &mut buf[..luma_w * luma_h],
                 )?;
             }
@@ -6235,7 +6352,6 @@ pub fn reconstruct_inter_block_interintra(
         }
     };
 
-    // ---------- §7.11.3.1 steps 1-13 + §7.11.3.14 blend ----------
     predict_inter(
         plane,
         x,
@@ -6243,8 +6359,8 @@ pub fn reconstruct_inter_block_interintra(
         w,
         h,
         crate::cdf::MOTION_MODE_SIMPLE,
-        /* is_compound */ false,
-        /* is_inter_intra */ true,
+        false,
+        true,
         bit_depth,
         subsampling_x,
         subsampling_y,
@@ -6253,24 +6369,69 @@ pub fn reconstruct_inter_block_interintra(
         interp_filter_x,
         interp_filter_y,
         &refs,
-        /* compound */ None,
+        None,
         wedge_params,
         warp,
-        /* obmc */ None,
-        &mut pred_out,
+        None,
+        pred_out.as_mut_slice(),
     )?;
 
-    // ---------- §7.11.3.1 final step — CurrFrame[plane] stitch -----
-    //
-    // The §7.11.3.14 body wrote the blended `w × h` result into
-    // `pred_out`; copy it back into `curr_plane` at `(x, y)`.
-    for i in 0..fit_h {
-        let dst = (py + i) * curr_stride + px;
-        let src = i * w;
-        curr_plane[dst..dst + fit_w].copy_from_slice(&pred_out[src..src + fit_w]);
-    }
+    stitch_pred_at(
+        dst_x,
+        dst_y,
+        w,
+        h,
+        pred_out.as_slice(),
+        curr_plane,
+        curr_stride,
+    )
+}
 
-    Ok(())
+#[allow(clippy::too_many_arguments)]
+pub fn reconstruct_inter_block_interintra(
+    mode_info: InterIntraModeInfo,
+    ref_frame_idx: &[u8],
+    frame_store: &[RefFrameStoreEntry<'_>],
+    plane: u8,
+    x: i32,
+    y: i32,
+    w: usize,
+    h: usize,
+    bit_depth: u8,
+    subsampling_x: u8,
+    subsampling_y: u8,
+    frame_width: u32,
+    frame_height: u32,
+    interp_filter_x: u8,
+    interp_filter_y: u8,
+    wedge_mask_buf: Option<&mut [u8]>,
+    warp: Option<&WarpDriverParams>,
+    curr_plane: &mut [u16],
+    curr_stride: usize,
+) -> Result<(), crate::Error> {
+    reconstruct_inter_block_interintra_at(
+        mode_info,
+        ref_frame_idx,
+        frame_store,
+        plane,
+        x,
+        y,
+        x,
+        y,
+        w,
+        h,
+        bit_depth,
+        subsampling_x,
+        subsampling_y,
+        frame_width,
+        frame_height,
+        interp_filter_x,
+        interp_filter_y,
+        wedge_mask_buf,
+        warp,
+        curr_plane,
+        curr_stride,
+    )
 }
 
 /// One decoded §5.11.33 inter-intra leaf (`RefFrame[1] == INTRA_FRAME`,
@@ -6336,19 +6497,18 @@ pub struct InterIntraLeaf {
 /// Returns [`crate::Error::PartitionWalkOutOfRange`] for an out-of-range
 /// `MiSize`, or for anything [`reconstruct_inter_block_interintra`] itself
 /// rejects.
-pub fn reconstruct_inter_intra_block(
+fn reconstruct_inter_intra_block_at(
     leaf: &InterIntraLeaf,
     ref_frame_idx: &[u8],
     bit_depth: u8,
     warp: Option<&WarpDriverParams>,
     planes: &mut [PlaneReconContext<'_>],
+    origin_row: usize,
+    origin_col: usize,
 ) -> Result<(), crate::Error> {
     if leaf.mi_size >= crate::cdf::BLOCK_SIZES {
         return Err(crate::Error::PartitionWalkOutOfRange);
     }
-    // §7.11.3.11 persistent luma-grid wedge mask — filled by the driver at
-    // `plane == 0` and reused for chroma (av1-spec p.258 line 14386).
-    // Sized to the *luma* block; `None` on the non-wedge arm.
     let mut wedge_buf: Option<Vec<u8>> = if leaf.mode_info.wedge.is_some() {
         Some(vec![
             0u8;
@@ -6362,18 +6522,22 @@ pub fn reconstruct_inter_intra_block(
     for ctx in planes.iter_mut() {
         let sub_x = if ctx.plane > 0 { ctx.subsampling_x } else { 0 };
         let sub_y = if ctx.plane > 0 { ctx.subsampling_y } else { 0 };
-        let base_x = ((leaf.mi_col >> sub_x) * crate::cdf::MI_SIZE as u32) as i32;
-        let base_y = ((leaf.mi_row >> sub_y) * crate::cdf::MI_SIZE as u32) as i32;
+        let ref_x = (((leaf.mi_col + origin_col as u32) >> sub_x) * crate::cdf::MI_SIZE as u32) as i32;
+        let ref_y = (((leaf.mi_row + origin_row as u32) >> sub_y) * crate::cdf::MI_SIZE as u32) as i32;
+        let dst_x = ((leaf.mi_col >> sub_x) * crate::cdf::MI_SIZE as u32) as i32;
+        let dst_y = ((leaf.mi_row >> sub_y) * crate::cdf::MI_SIZE as u32) as i32;
         let pred_w = crate::cdf::block_width(leaf.mi_size) >> sub_x;
         let pred_h = crate::cdf::block_height(leaf.mi_size) >> sub_y;
 
-        reconstruct_inter_block_interintra(
+        reconstruct_inter_block_interintra_at(
             leaf.mode_info,
             ref_frame_idx,
             ctx.frame_store,
             ctx.plane,
-            base_x,
-            base_y,
+            ref_x,
+            ref_y,
+            dst_x,
+            dst_y,
             pred_w,
             pred_h,
             bit_depth,
@@ -6390,6 +6554,16 @@ pub fn reconstruct_inter_intra_block(
         )?;
     }
     Ok(())
+}
+
+pub fn reconstruct_inter_intra_block(
+    leaf: &InterIntraLeaf,
+    ref_frame_idx: &[u8],
+    bit_depth: u8,
+    warp: Option<&WarpDriverParams>,
+    planes: &mut [PlaneReconContext<'_>],
+) -> Result<(), crate::Error> {
+    reconstruct_inter_intra_block_at(leaf, ref_frame_idx, bit_depth, warp, planes, 0, 0)
 }
 
 /// §5.11.33 task-dispatcher → inter-intra reconstruction bridge — threads
@@ -6851,6 +7025,10 @@ fn obmc_dispatch_leaf(
     planes: &mut [PlaneReconContext<'_>],
     mi_row: usize,
     mi_col: usize,
+    origin_row: usize,
+    origin_col: usize,
+    frame_mi_rows: u32,
+    frame_mi_cols: u32,
     mi_size: usize,
     ref_frame0: i8,
 ) -> Result<(), crate::Error> {
@@ -6936,7 +7114,7 @@ fn obmc_dispatch_leaf(
                         // horizontal, slot 0 = vertical.
                         interp_filter_x: grid.interp_filters[cand * 2 + 1],
                         interp_filter_y: grid.interp_filters[cand * 2],
-                        axis_pos4: x4 as u16,
+                        axis_pos4: (x4 + origin_col) as u16,
                     });
                 }
                 x4 += step4;
@@ -6977,7 +7155,7 @@ fn obmc_dispatch_leaf(
                         step4: step4 as u8,
                         interp_filter_x: grid.interp_filters[cand * 2 + 1],
                         interp_filter_y: grid.interp_filters[cand * 2],
-                        axis_pos4: y4 as u16,
+                        axis_pos4: (y4 + origin_row) as u16,
                     });
                 }
                 y4 += step4;
@@ -6985,10 +7163,10 @@ fn obmc_dispatch_leaf(
         }
 
         let obmc = ObmcParams {
-            mi_row: mi_row as u32,
-            mi_col: mi_col as u32,
-            mi_cols: grid.mi_cols,
-            mi_rows: grid.mi_rows,
+            mi_row: (mi_row + origin_row) as u32,
+            mi_col: (mi_col + origin_col) as u32,
+            mi_cols: frame_mi_cols,
+            mi_rows: frame_mi_rows,
             mi_width_log2: crate::cdf::mi_width_log2(mi_size) as u8,
             mi_height_log2: crate::cdf::mi_height_log2(mi_size) as u8,
             avail_u,
@@ -6998,22 +7176,23 @@ fn obmc_dispatch_leaf(
             left_neighbours: &left,
         };
 
-        // Plane-space block origin + size (§5.11.33 lines 5135-5136 / the
-        // §7.11.3.1 `(x, y, w, h)` write region — OBMC has no
-        // `someUseIntra` split, so one call covers the whole plane block).
-        let x = ((mi_col >> sub_x) * crate::cdf::MI_SIZE) as i32;
-        let y = ((mi_row >> sub_y) * crate::cdf::MI_SIZE) as i32;
+        let ref_x = (((mi_col + origin_col) >> sub_x) * crate::cdf::MI_SIZE) as i32;
+        let ref_y = (((mi_row + origin_row) >> sub_y) * crate::cdf::MI_SIZE) as i32;
+        let dst_x = ((mi_col >> sub_x) * crate::cdf::MI_SIZE) as i32;
+        let dst_y = ((mi_row >> sub_y) * crate::cdf::MI_SIZE) as i32;
         let w = crate::cdf::block_width(mi_size) >> sub_x;
         let h = crate::cdf::block_height(mi_size) >> sub_y;
 
-        reconstruct_inter_block_obmc(
+        reconstruct_inter_block_obmc_at(
             block_mode_info,
             &obmc,
             ref_frame_idx,
             ctx.frame_store,
             p,
-            x,
-            y,
+            ref_x,
+            ref_y,
+            dst_x,
+            dst_y,
             w,
             h,
             grid.bit_depth,
@@ -7271,7 +7450,17 @@ pub fn reconstruct_inter_frame(
                 }
             }
 
-            reconstruct_inter_leaf_at(grid, ref_frame_idx, planes, mi_row, mi_col)?;
+            reconstruct_inter_leaf_at(
+                grid,
+                ref_frame_idx,
+                planes,
+                mi_row,
+                mi_col,
+                0,
+                0,
+                grid.mi_rows,
+                grid.mi_cols,
+            )?;
         }
     }
 
@@ -7295,12 +7484,17 @@ pub fn reconstruct_inter_frame(
 /// Error surface matches [`reconstruct_inter_frame`] (out-of-range
 /// `MiSize` / `RefFrame` / resolved `refIdx`, a too-small `curr`
 /// plane, …).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn reconstruct_inter_leaf_at(
     grid: &InterModeInfoGrid<'_>,
     ref_frame_idx: &[u8],
     planes: &mut [PlaneReconContext<'_>],
     mi_row: usize,
     mi_col: usize,
+    origin_row: usize,
+    origin_col: usize,
+    frame_mi_rows: u32,
+    frame_mi_cols: u32,
 ) -> Result<(), crate::Error> {
     let mi_rows = grid.mi_rows as usize;
     let mi_cols = grid.mi_cols as usize;
@@ -7425,12 +7619,14 @@ pub(crate) fn reconstruct_inter_leaf_at(
         });
         // The §5.11.33 frame-walk and the §5.11.33 task-dispatcher
         // bridge share this one per-block inter-intra driver.
-        reconstruct_inter_intra_block(
+        reconstruct_inter_intra_block_at(
             &leaf,
             ref_frame_idx,
             grid.bit_depth,
             ii_warp.as_ref(),
             planes,
+            origin_row,
+            origin_col,
         )?;
         return Ok(());
     }
@@ -7564,19 +7760,23 @@ pub(crate) fn reconstruct_inter_leaf_at(
         for ctx in planes.iter_mut() {
             let sub_x = if ctx.plane > 0 { ctx.subsampling_x } else { 0 };
             let sub_y = if ctx.plane > 0 { ctx.subsampling_y } else { 0 };
-            let base_x = ((mi_col >> sub_x) * crate::cdf::MI_SIZE) as i32;
-            let base_y = ((mi_row >> sub_y) * crate::cdf::MI_SIZE) as i32;
+            let ref_x = (((mi_col + origin_col) >> sub_x) * crate::cdf::MI_SIZE) as i32;
+            let ref_y = (((mi_row + origin_row) >> sub_y) * crate::cdf::MI_SIZE) as i32;
+            let dst_x = ((mi_col >> sub_x) * crate::cdf::MI_SIZE) as i32;
+            let dst_y = ((mi_row >> sub_y) * crate::cdf::MI_SIZE) as i32;
             let pred_w = crate::cdf::block_width(mi_size) >> sub_x;
             let pred_h = crate::cdf::block_height(mi_size) >> sub_y;
 
-            reconstruct_inter_block_compound(
+            reconstruct_inter_block_compound_at(
                 mode_info,
                 order_hints,
                 ref_frame_idx,
                 ctx.frame_store,
                 ctx.plane,
-                base_x,
-                base_y,
+                ref_x,
+                ref_y,
+                dst_x,
+                dst_y,
                 pred_w,
                 pred_h,
                 grid.bit_depth,
@@ -7709,6 +7909,10 @@ pub(crate) fn reconstruct_inter_leaf_at(
             planes,
             mi_row,
             mi_col,
+            origin_row,
+            origin_col,
+            frame_mi_rows,
+            frame_mi_cols,
             mi_size,
             ref_frame0,
         )?;
@@ -7732,6 +7936,8 @@ pub(crate) fn reconstruct_inter_leaf_at(
         // §5.11.33 lines 5135-5138: plane-space block origin and
         // the chroma-collocated candidate anchor `candRow` /
         // `candCol` (`(MiRow >> subY) << subY` etc.).
+        let ref_base_x = (((mi_col + origin_col) >> sub_x) * crate::cdf::MI_SIZE) as i32;
+        let ref_base_y = (((mi_row + origin_row) >> sub_y) * crate::cdf::MI_SIZE) as i32;
         let base_x = ((mi_col >> sub_x) * crate::cdf::MI_SIZE) as i32;
         let base_y = ((mi_row >> sub_y) * crate::cdf::MI_SIZE) as i32;
         let mut cand_row = (mi_row >> sub_y) << sub_y;
@@ -7822,12 +8028,14 @@ pub(crate) fn reconstruct_inter_leaf_at(
 
                 match leaf_warp.as_ref() {
                     Some(warp) => {
-                        reconstruct_inter_block_warp(
+                        reconstruct_inter_block_warp_at(
                             mode_info,
                             warp,
                             ref_frame_idx,
                             ctx.frame_store,
                             ctx.plane,
+                            ref_base_x + x as i32,
+                            ref_base_y + y as i32,
                             base_x + x as i32,
                             base_y + y as i32,
                             pred_w,
@@ -7844,11 +8052,13 @@ pub(crate) fn reconstruct_inter_leaf_at(
                         )?;
                     }
                     None => {
-                        reconstruct_inter_block(
+                        reconstruct_inter_block_at(
                             mode_info,
                             ref_frame_idx,
                             ctx.frame_store,
                             ctx.plane,
+                            ref_base_x + x as i32,
+                            ref_base_y + y as i32,
                             base_x + x as i32,
                             base_y + y as i32,
                             pred_w,
@@ -8064,6 +8274,192 @@ pub fn motion_field_estimation_core(
     if ref_stamp >= 0 {
         project_ref(LAST2_FRAME, -1, &mut mfmvs);
     }
+    mfmvs
+}
+
+/// Parallel §7.9 motion-field estimation: because `MAX_OFFSET_HEIGHT == 0`,
+/// projections never leave their 8-row (`y8 >> 3`) superblock band, so
+/// partitioning `0..h8` on multiples of 8 across `threads` is bit-identical
+/// to [`motion_field_estimation_core`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn motion_field_estimation_parallel(
+    slots: &[Option<MotionFieldSlot<'_>>; 8],
+    ref_frame_idx: &[u8; 7],
+    order_hints: &[i32; 8],
+    order_hint: i32,
+    hint_bits: u32,
+    mi_rows: u32,
+    mi_cols: u32,
+    threads: usize,
+) -> crate::cdf::MotionFieldMvs {
+    let h8 = (mi_rows >> 1) as i32;
+    let w8 = (mi_cols >> 1) as i32;
+    if threads <= 1 || h8 < 32 {
+        return motion_field_estimation_core(
+            slots,
+            ref_frame_idx,
+            order_hints,
+            order_hint,
+            hint_bits,
+            mi_rows,
+            mi_cols,
+        );
+    }
+    use crate::cdf::{MotionFieldMvs, ProjectedMv};
+    const MFMV_STACK_SIZE: i32 = 3;
+    const MAX_FRAME_DISTANCE: i32 = 31;
+    const MAX_OFFSET_WIDTH: i32 = 8;
+    const MAX_OFFSET_HEIGHT: i32 = 0;
+    const DIV_MULT: [i32; 32] = [
+        0, 16384, 8192, 5461, 4096, 3276, 2730, 2340, 2048, 1820, 1638, 1489, 1365, 1260, 1170,
+        1092, 1024, 963, 910, 862, 819, 780, 744, 712, 682, 655, 630, 606, 585, 564, 546, 528,
+    ];
+    const LAST_FRAME: usize = 1;
+    const LAST2_FRAME: usize = 2;
+    const GOLDEN_FRAME: usize = 4;
+    const BWDREF_FRAME: usize = 5;
+    const ALTREF2_FRAME: usize = 6;
+    const ALTREF_FRAME: usize = 7;
+
+    let mut mfmvs = MotionFieldMvs::new_invalid(mi_rows, mi_cols);
+    let ref_to_dst: [i32; 8] =
+        core::array::from_fn(|dst| get_relative_dist(order_hint, order_hints[dst], hint_bits));
+    mfmvs.set_ref_to_dst(ref_to_dst);
+
+    // Resolve the ordered list of active source references once (identical
+    // to §7.9.1 in `motion_field_estimation_core`).
+    let mut sources: Vec<(&MotionFieldSlot<'_>, i32, i32, [i32; 8])> = Vec::with_capacity(4);
+    let mut try_push = |src: usize, dst_sign: i32| -> bool {
+        let src_idx = ref_frame_idx[src - LAST_FRAME] as usize;
+        let Some(slot) = slots[src_idx].as_ref() else {
+            return false;
+        };
+        if slot.mi_rows != mi_rows || slot.mi_cols != mi_cols || slot.frame_is_intra {
+            return false;
+        }
+        let ref_to_cur = get_relative_dist(order_hints[src], order_hint, hint_bits);
+        let ref_offsets: [i32; 8] = core::array::from_fn(|r| {
+            get_relative_dist(order_hints[src], slot.saved_order_hints[r], hint_bits)
+        });
+        sources.push((slot, dst_sign, ref_to_cur, ref_offsets));
+        true
+    };
+    let last_idx = ref_frame_idx[0] as usize;
+    let cur_gold_order_hint = order_hints[GOLDEN_FRAME];
+    let last_alt_order_hint = slots[last_idx]
+        .as_ref()
+        .map_or(0, |s| s.saved_order_hints[ALTREF_FRAME]);
+    if last_alt_order_hint != cur_gold_order_hint {
+        try_push(LAST_FRAME, -1);
+    }
+    let mut ref_stamp = MFMV_STACK_SIZE - 2;
+    if get_relative_dist(order_hints[BWDREF_FRAME], order_hint, hint_bits) > 0
+        && try_push(BWDREF_FRAME, 1)
+    {
+        ref_stamp -= 1;
+    }
+    if get_relative_dist(order_hints[ALTREF2_FRAME], order_hint, hint_bits) > 0
+        && try_push(ALTREF2_FRAME, 1)
+    {
+        ref_stamp -= 1;
+    }
+    if get_relative_dist(order_hints[ALTREF_FRAME], order_hint, hint_bits) > 0
+        && ref_stamp >= 0
+        && try_push(ALTREF_FRAME, 1)
+    {
+        ref_stamp -= 1;
+    }
+    if ref_stamp >= 0 {
+        try_push(LAST2_FRAME, -1);
+    }
+    if sources.is_empty() {
+        return mfmvs;
+    }
+
+    let num_bands = threads.min((h8 as usize).div_ceil(8)).max(1);
+    let band_rows = ((((h8 as usize).div_ceil(num_bands)).div_ceil(8)) * 8) as i32;
+    let sources_ref = &sources;
+    let mut rest = mfmvs.projected_slice_mut();
+    let mut jobs: Vec<Box<dyn FnOnce() + Send + '_>> = Vec::with_capacity(num_bands);
+    let mut y0 = 0i32;
+    while y0 < h8 {
+        let y1 = (y0 + band_rows).min(h8);
+        let slice_len = ((y1 - y0) as usize) * (w8 as usize);
+        let (band, tail) = rest.split_at_mut(slice_len);
+        rest = tail;
+        jobs.push(Box::new(move || {
+            for &(slot, dst_sign, ref_to_cur, ref_offsets) in sources_ref {
+                if ref_to_cur.abs() > MAX_FRAME_DISTANCE {
+                    continue;
+                }
+                for y8 in y0..y1 {
+                    let row = (2 * y8 + 1) as usize;
+                    let row_base = row * (mi_cols as usize);
+                    for x8 in 0..w8 {
+                        let col = (2 * x8 + 1) as usize;
+                        let cell = row_base + col;
+                        let src_ref = slot.mf_ref_frames[cell];
+                        if src_ref <= 0 {
+                            continue;
+                        }
+                        let ref_offset = ref_offsets[(src_ref as usize) & 7];
+                        if ref_offset <= 0 || ref_offset > MAX_FRAME_DISTANCE {
+                            continue;
+                        }
+                        let mv0 = i32::from(slot.mf_mvs[cell * 2]);
+                        let mv1 = i32::from(slot.mf_mvs[cell * 2 + 1]);
+                        let clipped_num =
+                            (ref_to_cur * dst_sign).clamp(-MAX_FRAME_DISTANCE, MAX_FRAME_DISTANCE);
+                        let mul = clipped_num * DIV_MULT[ref_offset as usize];
+                        let proj0 = {
+                            let v = mv0 * mul;
+                            let s = if v >= 0 {
+                                (v + (1 << 13)) >> 14
+                            } else {
+                                -((-v + (1 << 13)) >> 14)
+                            };
+                            s.clamp(-(1 << 14) + 1, (1 << 14) - 1)
+                        };
+                        let proj1 = {
+                            let v = mv1 * mul;
+                            let s = if v >= 0 {
+                                (v + (1 << 13)) >> 14
+                            } else {
+                                -((-v + (1 << 13)) >> 14)
+                            };
+                            s.clamp(-(1 << 14) + 1, (1 << 14) - 1)
+                        };
+                        let project = |v8: i32, delta: i32, max8: i32, max_off8: i32| -> (i32, bool) {
+                            let base8 = (v8 >> 3) << 3;
+                            let offset8 = if delta >= 0 {
+                                delta >> 6
+                            } else {
+                                -((-delta) >> 6)
+                            };
+                            let v8 = v8 + dst_sign * offset8;
+                            let valid = !(v8 < 0
+                                || v8 >= max8
+                                || v8 < base8 - max_off8
+                                || v8 >= base8 + 8 + max_off8);
+                            (v8, valid)
+                        };
+                        let (pos_y8, vy) = project(y8, proj0, h8, MAX_OFFSET_HEIGHT);
+                        let (pos_x8, vx) = project(x8, proj1, w8, MAX_OFFSET_WIDTH);
+                        if !(vy && vx) {
+                            continue;
+                        }
+                        band[((pos_y8 - y0) as usize) * (w8 as usize) + (pos_x8 as usize)] =
+                            ProjectedMv {
+                                mv: [mv0 as i16, mv1 as i16],
+                                ref_offset: ref_offset as i8,
+                            };
+                    }
+                }
+            }
+        }));
+        y0 = y1;
+    }
+    crate::loop_filter::run_jobs(threads, jobs);
     mfmvs
 }
 
